@@ -251,3 +251,173 @@ def verify(u_signals):
     for j in range(i + 1, n_signals):
       corr = np.dot(u_signals[i], u_signals[j])
       print(f"  <e_{i+1}, e_{j+1}>: {corr: .6f}")
+
+
+
+
+
+# ---------------------
+# Version 2 of Features
+# ---------------------
+
+def make_features_from_scenario(
+  scenario_emissions,
+  historical_emissions=None,
+  agents=['CO2'],
+  n_lags=10
+):
+  """
+  Constructs features for an MLP, accounting for a separate historical period.
+
+  Features for each agent are:
+  1. Lagged emissions for the past `n_lags` years.
+  2. Cumulative emissions.
+
+  If historical_emissions are provided, the lags and cumulative sums for the
+  scenario are initialized based on the end-state of the historical period.
+  """
+  if not agents or not scenario_emissions:
+    return np.zeros((0, 0))
+
+  # Determine the length of the time series from the first agent in the current scenario
+  try:
+    N = len(scenario_emissions[agents[0]])
+  except KeyError:
+    raise ValueError(f"Agent '{agents[0]}' not found in the provided scenario emissions.")
+
+  all_agent_features = []
+
+  for agent in agents:
+    e_scenario = np.asarray(scenario_emissions.get(agent, []), float).ravel()
+    if len(e_scenario) != N:
+      raise ValueError(f"Time series for agent '{agent}' has mismatched length.")
+
+    historical_lags = np.zeros(n_lags)
+    historical_cumu_end = 0.0
+
+    if historical_emissions:
+      if agent in historical_emissions:
+        e_hist = np.asarray(historical_emissions[agent], float).ravel()
+        # Take the last n_lags values for initializing the lags
+        if len(e_hist) >= n_lags:
+          historical_lags = e_hist[-n_lags:]
+        else: # Pad with zeros if history is shorter than n_lags
+          historical_lags = np.pad(e_hist, (n_lags - len(e_hist), 0), 'constant')
+        # Calculate the total cumulative emissions from history
+        historical_cumu_end = np.sum(e_hist)
+      else:
+        print(f"Warning: Agent '{agent}' not found in historical emissions. Using zeros for context.")
+
+    # --- 1. Create Lag Features ---
+    # Combine historical lags with the scenario series to correctly create lags for the start of the scenario
+    e_combined = np.concatenate([historical_lags, e_scenario])
+
+    # Build a matrix of lags for the combined series using a sliding window.
+    # The number of rows will be N, corresponding to the scenario length.
+    X_lags = np.zeros((N, n_lags + 1))
+    for i in range(N):
+      # The window for the i-th step of the scenario starts at index i in e_combined
+      window = e_combined[i : i + n_lags + 1]
+      # The values are [e_t, e_{t-1}, ..., e_{t-n_lags}]
+      X_lags[i, :len(window)] = window[::-1]
+
+    # --- 2. Create Cumulative Emissions Feature ---
+    # Calculate cumulative sum for the current scenario and add the historical total
+    cumu_scenario = np.cumsum(e_scenario)
+    cumu_final = cumu_scenario + historical_cumu_end
+
+    # --- 3. Combine and Store Features for the Agent ---
+    agent_feature_block = np.column_stack([X_lags, cumu_final])
+    all_agent_features.append(agent_feature_block)
+
+  # Horizontally stack the feature blocks from all agents
+  final_features = np.column_stack(all_agent_features)
+  return final_features
+
+def evaluate_trainsets_vs_tests_with_history(
+  train_scenarios,
+  train_series,
+  test_scenarios,
+  test_series,
+  agents=['CO2'],
+  training_groups=None,
+  n_lags=10,
+  random_state=0,
+  historical_scenario_name='historical'
+):
+  """
+  Evaluates model performance by training on specified groups and testing on others,
+  correctly handling a separate historical emissions period.
+  """
+  if training_groups is None:
+    training_groups = {name: [name] for name in train_scenarios}
+
+  # 1. Consolidate all data and extract the historical series
+  all_scenarios = train_scenarios + test_scenarios
+  all_series = train_series + test_series
+  scenario_data_map = {name: data for name, data in zip(all_scenarios, all_series)}
+
+  historical_series = None
+  if historical_scenario_name in scenario_data_map:
+    historical_series = scenario_data_map.pop(historical_scenario_name)
+  historical_emissions = historical_series[0] if historical_series else None
+
+  # 2. Pre-compute features for all scenarios (train and test)
+  features_map = {}
+  for name, series_data in scenario_data_map.items():
+    emissions_dict, y = series_data
+    X = make_features_from_scenario(
+      emissions_dict,
+      historical_emissions=historical_emissions,
+      agents=agents,
+      n_lags=n_lags
+    )
+    y_adjusted = np.asarray(y, float)[:X.shape[0]]
+    features_map[name] = (X, y_adjusted)
+
+  # Also compute features for the historical period itself to be used in training
+  if historical_series:
+    emissions_dict, y = historical_series
+    X_hist = make_features_from_scenario(
+      emissions_dict,
+      historical_emissions=None,  # History has no preceding data
+      agents=agents,
+      n_lags=n_lags
+    )
+    y_hist = np.asarray(y, float)[:X_hist.shape[0]]
+    features_map[historical_scenario_name] = (X_hist, y_hist)
+
+  # 3. Run the main training and evaluation loop
+  error_dict, yhat_dict = {}, {}
+  for group_name, scenario_names_in_group in training_groups.items():
+    all_Xtr, all_ytr = [], []
+    for scenario_name in scenario_names_in_group:
+      if scenario_name in features_map:
+        X, y = features_map[scenario_name]
+        all_Xtr.append(X)
+        all_ytr.append(y)
+      else:
+        raise ValueError(f'Scenario {scenario_name} for training not found.')
+
+    if not all_Xtr:
+      print(f"Warning: No training data found for group '{group_name}'. Skipping.")
+      continue
+
+    Xtr_combined = np.vstack(all_Xtr)
+    ytr_combined = np.concatenate(all_ytr)
+
+    model = MLPRegressor(random_state=random_state, max_iter=500)
+    scaler = StandardScaler()
+    Xtr_scaled = scaler.fit_transform(Xtr_combined)
+    model.fit(Xtr_scaled, ytr_combined)
+
+    error_dict[group_name], yhat_dict[group_name] = {}, {}
+    for test_name in test_scenarios:
+      if test_name in features_map:
+        Xte, yte = features_map[test_name]
+        Xte_scaled = scaler.transform(Xte)
+        yhat = model.predict(Xte_scaled)
+        error_dict[group_name][test_name] = nrmse(yte, yhat)
+        yhat_dict[group_name][test_name] = yhat
+
+  return error_dict, yhat_dict
