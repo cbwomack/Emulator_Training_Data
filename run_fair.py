@@ -1,24 +1,389 @@
+# Imports
+
+## Standard
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
+## FaIR
 from fair import FAIR
 from fair.io import read_properties
 from fair.interface import fill, initialise
-from scipy.fft import ifft, rfft, rfftfreq
-import utils_TF
+
+## Misc.
+from dataclasses import dataclass
+from typing import Dict, Iterable, Tuple, Optional
+from scipy.fft import rfft, rfftfreq
+
+# ----------------------------
+# Constants and Configurations
+# ----------------------------
 
 DEFAULT_SCENARIO = 'ssp245'
 EBM_CONFIG = 'data/FaIR/4xCO2_cummins_ebm3.csv'
 VOLCANIC_FORCING = 'data/FaIR/volcanic_ERF_monthly_175001-201912.csv'
-df = pd.read_csv(EBM_CONFIG)
-DEFAULT_ESMs = df['model'].unique()
 
+SPECIES = ['CO2','CH4','N2O','Sulfur','BC','Aerosol-radiation interactions','Aerosol-cloud interactions']
+_DF_EBM = pd.read_csv(EBM_CONFIG)
+_PROPERTIES = read_properties()[1]
+DEFAULT_ESMs = _DF_EBM['model'].unique()
 
+def _ebm_config_names(models: Iterable[str]) -> list:
+    """Return list like ['ModelA_r1','ModelA_r2', ...] from the EBM table."""
+    names = []
+    for model in models:
+        sub = _DF_EBM[_DF_EBM["model"] == model]
+        for run in sub["run"]:
+            names.append(f"{model}_{run}")
+    return names
+
+def _apply_ebm_configs(f: FAIR, configs: Iterable[str], stochastic: bool=False) -> None:
+    """Fill FaIR climate_configs from the EBM CSV for all configs."""
+    seed = 1355763
+    for cfg in configs:
+        model, run = cfg.split("_")
+        cond = (_DF_EBM["model"] == model) & (_DF_EBM["run"] == run)
+
+        # ocean heat capacity & transfer (expects arrays of length 3)
+        fill(f.climate_configs["ocean_heat_capacity"], _DF_EBM.loc[cond, "C1":"C3"].values.squeeze(), config=cfg)
+        fill(f.climate_configs["ocean_heat_transfer"], _DF_EBM.loc[cond, "kappa1":"kappa3"].values.squeeze(), config=cfg)
+
+        # scalars
+        fill(f.climate_configs["deep_ocean_efficacy"],     _DF_EBM.loc[cond, "epsilon"].values[0], config=cfg)
+        fill(f.climate_configs["gamma_autocorrelation"],   _DF_EBM.loc[cond, "gamma"].values[0],   config=cfg)
+        fill(f.climate_configs["sigma_eta"],               _DF_EBM.loc[cond, "sigma_eta"].values[0], config=cfg)
+        fill(f.climate_configs["sigma_xi"],                _DF_EBM.loc[cond, "sigma_xi"].values[0],  config=cfg)
+
+        # stochastic controls
+        fill(f.climate_configs["stochastic_run"], stochastic, config=cfg)
+        fill(f.climate_configs["use_seed"], stochastic, config=cfg)
+        fill(f.climate_configs["seed"], seed, config=cfg)
+        seed += 399
+
+def _species_properties(input_mode: str) -> Dict[str, dict]:
+    """Copy baseline species properties and set CO2 input_mode."""
+    props = {s: dict(_PROPERTIES[s]) for s in SPECIES}
+    props["CO2"]["input_mode"] = input_mode
+    props["Aerosol-radiation interactions"]["input_mode"] = "calculated"
+    props["Aerosol-cloud interactions"]["input_mode"]    = "calculated"
+
+    return props
+
+# ---------------------
+# Functions to run FaIR
+# ---------------------
+
+def build_fair(
+    start: int,
+    stop: int,
+    input_mode: str = "emissions",
+    default_scenario: str = DEFAULT_SCENARIO,
+    esms: Iterable[str] = DEFAULT_ESMs,
+    scenario_name: str = "custom",
+    ) -> FAIR:
+    """
+    Create a FaIR model with EBM configs loaded and species ready for custom emissions.
+    """
+    f = FAIR(ghg_method="meinshausen2020", ch4_method="thornhill2021")
+
+    # define time and configs
+    f.define_time(start, stop + 1, 1)  # keep consistent everywhere
+    configs = _ebm_config_names(esms)
+    f.define_configs(configs)
+
+    # define species
+    props = _species_properties(input_mode)
+    f.define_species(SPECIES, props)
+
+    # pull baseline info from RCMIP using any valid scenario (for shapes/initials)
+    f.define_scenarios([default_scenario])
+    f.allocate()
+    f.fill_from_rcmip()
+    f.fill_species_configs()
+
+    # initialise state
+    initialise(f.concentration, f.species_configs["baseline_concentration"])
+    initialise(f.forcing, 0)
+    initialise(f.temperature, 0)
+    initialise(f.cumulative_emissions, 0)
+    initialise(f.airborne_emissions, 0)
+
+    # rename scenario coordinates to 'custom'
+    f.define_scenarios([scenario_name])
+    f.emissions            = f.emissions.assign_coords(scenario=f.scenarios)
+    f.cumulative_emissions = f.cumulative_emissions.assign_coords(scenario=f.scenarios)
+    f.concentration        = f.concentration.assign_coords(scenario=f.scenarios)
+    f.forcing              = f.forcing.assign_coords(scenario=f.scenarios)
+    f.temperature          = f.temperature.assign_coords(scenario=f.scenarios)
+    f.species_configs      = f.species_configs.assign_coords(scenario=f.scenarios)
+
+    f.emissions[:] = 0
+
+    # apply EBM configs
+    _apply_ebm_configs(f, configs, stochastic=False)
+
+    return f
+
+def reset_state(f: FAIR) -> None:
+    """Zero mutable state so you can re-run without re-instantiating."""
+    f.emissions[:] = 0
+    initialise(f.concentration, f.species_configs["baseline_concentration"])
+    for da in (f.forcing, f.temperature, f.cumulative_emissions, f.airborne_emissions):
+        da.loc[...] = 0
+
+def set_emissions(
+    f: FAIR,
+    years: Iterable[int],
+    emis_by_agent: Dict[str, np.ndarray],
+    ) -> None:
+    """
+    Provide per-agent emissions (length == len(years)). Missing agents default to zeros.
+    Keys may be 'SO2' or 'Sulfur'; both map to FaIR's 'Sulfur'.
+    """
+    yrs = list(years)
+    n = len(yrs)
+    ncfg = len(f.configs)
+
+    # validate lengths & build a dense dict over SPECIES
+    dense = {}
+    for a in SPECIES:
+        dense[a] = np.zeros(n)
+
+    for k, v in emis_by_agent.items():
+        v = np.asarray(v)
+        if v.shape[0] != n:
+            raise ValueError(f"Emissions for {k} has length {v.shape[0]} but years has length {n}.")
+        dense[k] = v
+
+    # write into f.emissions (timepoints × scenario × config)
+    # broadcast across configs once to avoid repeated assignments
+    tstart, tstop = min(yrs), max(yrs)
+    for specie, vec in dense.items():
+        arr = np.tile(vec, (ncfg, 1)).T[:, None, :]  # (time, 1, config)
+        f.emissions.sel(specie=specie, timepoints=slice(tstart, tstop + 1))[:] = arr
+
+def run_fair(f: FAIR, years: Iterable[int], layer: int = 0) -> Tuple[list, np.ndarray, np.ndarray, float]:
+    """
+    Run FaIR and return (t, T_ens, T_mean, ECS).
+    """
+    tmin, tmax = min(years), max(years)
+    f.run(progress=False)
+
+    ECS = float(np.round(f.ebms.ecs.mean().item(), 2))
+    t = list(range(tmin, tmax + 1))
+
+    # ensemble over configs at surface layer
+    T = f.temperature.sel(timebounds=slice(tmin, tmax)).loc[dict(layer=layer)].values[:,0,:]
+    T_mean = T.mean(axis=1)
+    return t, T, T_mean, ECS
+
+# ----------------------
+# Misc. Helper Functions
+# ----------------------
+
+def impulse_profile(n_steps: int, dt: float, magnitude: float = 1.0) -> np.ndarray:
+    v = np.zeros(n_steps)
+    v[0] = magnitude / dt   # integrates to 'magnitude'
+    return v
+
+def white_noise_profile(n_steps: int, sigma: float = 1.0, seed: Optional[int] = None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0, sigma, size=n_steps)
+
+def ensure_all_agents(d, n_steps):
+    for a in SPECIES:
+        d.setdefault(a, np.zeros(n_steps))
+    return d
+
+# -------------
+# CMIP7 Helpers
+# -------------
+
+def load_scenarioMIP_CMIP7(agents: list) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Returns dict[scenario][agent] -> emissions array
+    """
+
+    # Define CMIP7 scenarios and extensions
+    scenarios_tier1  = ['high-extension','medium-extension','medium-overshoot',
+                        'low','verylow','verylow-overshoot']
+    scenarios_tier2  = ['high-overshoot','medium-extension','medium-overshoot',
+                        'low','verylow-overshoot']
+    scenarios_all    = scenarios_tier1 + scenarios_tier2
+
+    tags_tier1 = ['H-ext','M','ML','L','VLLO-ext','VLHO']
+    tags_tier2 = ['H-ext-OS','M-ext','ML-ext','L-ext','VLHO-ext']
+    tags_all   = tags_tier1 + tags_tier2
+    data_path  = "data/FaIR/extensions_1750-2500.csv"
+    emis_df    = pd.read_csv(data_path)
+
+    # Indices for emissions dataset
+    n_col_skip = 5
+    n_years_base, n_years_ext = 127, 477
+    emis_dict_tier1, emis_dict_tier2 = {}, {}
+
+    # Historical emissions
+    n_years_hist = 274
+    emis_dict_tier1['historical'] = {}
+    for a in agents:
+        if a == 'CO2':
+            a_full = 'CO2 FFI'
+        else:
+            a_full = a
+
+        historical_emis = emis_df[(emis_df["scenario"] == scenarios_all[0]) & (emis_df["variable"] == a_full)].iloc[:, n_col_skip:n_col_skip + n_years_hist].to_numpy().reshape(-1)
+        emis_dict_tier1['historical'][a] = historical_emis
+
+    # All other scenarios
+    for scen, tag in zip(scenarios_all, tags_all):
+        if tag in tags_tier1:
+            emis_dict_tier1[tag] = {}
+        else:
+            emis_dict_tier2[tag] = {}
+
+        if 'ext' in tag:
+            n_years = n_years_ext
+        else:
+            n_years = n_years_base
+
+        for a in agents:
+            if a == 'CO2':
+                a_full = 'CO2 FFI'
+            else:
+                a_full = a
+
+            vals = emis_df[(emis_df["scenario"] == scen) & (emis_df["variable"] == a_full)].iloc[:, n_col_skip + n_years_hist:n_col_skip + n_years_hist + n_years].to_numpy().reshape(-1)
+
+            #if 'ext' not in tag:
+                #print(n_col_skip + n_years_hist + n_years)
+
+            if tag in tags_tier1:
+                emis_dict_tier1[tag][a] = vals
+            else:
+                emis_dict_tier2[tag][a] = vals
+
+    return emis_dict_tier1, emis_dict_tier2
+
+def run_cmip7_sweeps(
+    start: int, stop: int, years: Iterable[int], agents: Iterable[str], co2_only: bool=True
+    ) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    For each CMIP7 scenario, and for each agent in `agents`,
+    run FaIR with only that agent's emissions active (others zero).
+    Returns dict[scenario_tag][agent] = T_mean (GMST mean across configs).
+    """
+    emis_all = load_cmip7_extensions(n_steps=len(list(years)), co2_only=co2_only)
+    tags = list(emis_all.keys())
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+
+    # Build once per scenario, reuse via reset_state
+    for tag in tags:
+        out[tag] = {}
+        f = build_fair(start, stop)  # reuse within scenario
+        for agent in agents:
+            reset_state(f)
+            emis = {a: np.zeros(len(list(years))) for a in SPECIES}
+            key = agent if agent != "SO2" else "Sulfur"
+            emis[key] = emis_all[tag][key]
+            set_emissions(f, years, emis)
+            _, _, T_mean, _ = run_fair(f, years)
+            out[tag][agent] = T_mean
+    return out
+
+snames_short = ['historical','H-ext','H-ext-OS',
+                'M','M-ext','ML','ML-ext','L',
+                'L-ext','VLLO-ext','VLHO','VLHO-ext']
+
+colors = {
+    snames_short[0]: '#808080', # historical
+    snames_short[1]: '#800000', # H-ext
+    snames_short[2]: '#ff0000', # H-ext-OS
+    snames_short[3]: '#fc7b03', # M
+    snames_short[4]: '#fc7b03', # M-ext
+    snames_short[5]: '#d3a640', # ML
+    snames_short[6]: '#d3a640', # ML-ext
+    snames_short[7]: '#098740', # L
+    snames_short[8]: '#098740', # L-ext
+    snames_short[9]: '#0080d0', # VLLO-ext
+    snames_short[10]: '#100060', # VLHO
+    snames_short[11]: '#100060', # VLHO-ext
+}
+
+def plot_cmip7(emis_dict, agent, tier):
+    fig, ax = plt.subplots(figsize=(10,5), constrained_layout=True)
+    for tag in emis_dict.keys():
+        if tag == 'historical':
+            years = np.arange(1750, 2024)
+            ls = '-'
+        elif 'ext' not in tag:
+            years = np.arange(2024, 2151)
+            ls = '-'
+        else:
+            years = np.arange(2024, 2501)
+            ls = '--'
+        ax.plot(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
+
+    ax.legend(loc='upper right')
+    ax.set_xlabel('Year')
+    ax.set_ylabel(f'{agent} emissions')
+    ax.set_title(f'CMIP7 tier {tier} scenarios')
+
+    return
+
+"""
 def get_ebm_configs(esms):
     ebm_configs = []
     for model in esms:
         for run in df.loc[df['model']==model, 'run']:
             ebm_configs.append(f"{model}_{run}")
     return ebm_configs
+
+def get_scenario_agent(scenario, agent, esms=DEFAULT_ESMs):
+    start, stop = 1750, 2100
+
+    f = FAIR(ghg_method="meinshausen2020", ch4_method='thornhill2021')
+    f.define_time(start, stop, 1)
+    f.define_scenarios([scenario])
+
+    configs = get_ebm_configs([x.split()[0] for x in esms])
+    f.define_configs(configs)
+
+    species = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']#, 'Volcanic']
+    properties = {s: read_properties()[1][s] for s in species}
+    properties['CO2']['input_mode'] = 'emissions'
+    f.define_species(species, properties)
+
+    f.allocate()
+    f.fill_from_rcmip()
+    f.fill_species_configs()
+
+    initialise(f.concentration, f.species_configs['baseline_concentration'])
+    initialise(f.forcing, 0)
+    initialise(f.temperature, 0)
+    initialise(f.cumulative_emissions, 0)
+    initialise(f.airborne_emissions, 0)
+
+    # Load each set of energy balance model configs
+    seed = 1355763
+    for config in configs:
+        model, run = config.split('_')
+        condition = (df['model']==model) & (df['run']==run)
+        fill(f.climate_configs['ocean_heat_capacity'], df.loc[condition, 'C1':'C3'].values.squeeze(), config=config)
+        fill(f.climate_configs['ocean_heat_transfer'], df.loc[condition, 'kappa1':'kappa3'].values.squeeze(), config=config)
+        fill(f.climate_configs['deep_ocean_efficacy'], df.loc[condition, 'epsilon'].values[0], config=config)
+        fill(f.climate_configs['gamma_autocorrelation'], df.loc[condition, 'gamma'].values[0], config=config)
+        fill(f.climate_configs['sigma_eta'], df.loc[condition, 'sigma_eta'].values[0], config=config)
+        fill(f.climate_configs['sigma_xi'], df.loc[condition, 'sigma_xi'].values[0], config=config)
+        fill(f.climate_configs['stochastic_run'], False, config=config)
+        fill(f.climate_configs['use_seed'], False, config=config)
+        fill(f.climate_configs['seed'], seed, config=config)
+        seed = seed + 399
+
+    emis_ens = f.emissions.sel(timepoints=slice(start, stop)).loc[dict(scenario=scenario)].sel(specie=agent).values
+    emis_agent = np.mean(emis_ens, axis=1)
+
+    return emis_agent
+
 
 def initialise_fair(start, stop, mode='emissions', default_scenario=DEFAULT_SCENARIO, esms=DEFAULT_ESMs):
     # Instantiate FaIR model
@@ -155,6 +520,60 @@ def run_multi_agent(fair, n_steps, years, agents, emission_dict):
 
     return t, T_ens, T_mean, ECS
 
+def get_CMIP7(n_steps, co2_only=True):
+    scenarios_CMIP7 = ['high-overshoot','high-extension','verylow','verylow-overshoot','low','medium-extension','medium-overshoot']
+    scenarios_CMIP7_short = ['HO','HE','VL','VLO','L','ME','MO']
+    if co2_only:
+        forcing_names = ['CO2 FFI']
+        forcing_short = ['CO2']
+    else:
+        forcing_names = ['CO2 FFI','CH4','N2O','Sulfur','BC']
+        forcing_short = ['CO2','CH4','N2O','Sulfur','BC']
+    data_path = 'data/FaIR/extensions_1750-2500.csv'
+
+    emis_df = pd.read_csv(data_path)
+    emis_dict = {}
+
+    for i, scen in enumerate(scenarios_CMIP7):
+        scen_short = scenarios_CMIP7_short[i]
+        emis_dict[scen_short] = {}
+        for j, forcing in enumerate(forcing_names):
+            emis_dict[scen_short][forcing_short[j]] = emis_df[(emis_df['scenario'] == scen) & (emis_df['variable'] == forcing)].iloc[:, 5:5 + n_steps].to_numpy().reshape(-1)
+
+    return emis_dict
+
+def run_CMIP7(start, stop, years, n_steps, agents):
+    emis_dict = get_CMIP7(n_steps)
+    scenarios = [scen for scen in emis_dict.keys()]
+
+    nan_force = np.zeros(n_steps)
+    delT_dict = {}
+
+    for scen in scenarios:
+        delT_dict[scen] = {}
+
+        for agent in agents:
+            fair_train = initialise_fair(start, stop)
+            emis_dict_temp = {
+            'CO2':emis_dict[scen][agent] if agent == 'CO2' else nan_force,
+            'CH4':emis_dict[scen][agent] if agent == 'CH4' else nan_force,
+            'N2O':emis_dict[scen][agent] if agent == 'N2O' else nan_force,
+            'Sulfur':emis_dict[scen][agent] if agent == 'Sulfur' else nan_force,
+            'BC':emis_dict[scen][agent] if agent == 'BC' else nan_force,
+            }
+            t, T_ens, T_train, ECS = run_multi_agent(fair_train, n_steps, years, agents, emis_dict_temp)
+            delT_dict[scen][agent] = T_train
+
+    return delT_dict
+
+
+
+
+
+
+"""
+
+"""
 def generate_responses(start, stop, n_steps, years, dt, freq_s, nperseg):
 
     agents = ['CO2','CH4','N2O']
@@ -213,3 +632,4 @@ def generate_responses(start, stop, n_steps, years, dt, freq_s, nperseg):
                                                                                                                freq_s, nperseg)
 
     return response_dict
+"""
