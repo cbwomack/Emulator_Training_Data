@@ -5,6 +5,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import xarray as xr
+import os
+import pickle
+
 
 ## FaIR
 from fair import FAIR
@@ -21,25 +24,32 @@ from scipy.fft import rfft, rfftfreq
 # ----------------------------
 
 DEFAULT_SCENARIO = 'ssp245'
-EBM_CONFIG = 'data/FaIR/4xCO2_cummins_ebm3.csv'
+#EBM_CONFIG = 'data/FaIR/4xCO2_cummins_ebm3.csv'
+
+FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_calibration_minimal_1.4.1.csv'
+FAIR_SPECIES_CSV  = 'data/FaIR/species_configs_properties_1.4.1.csv'
+
 VOLCANIC_FORCING = 'data/FaIR/volcanic_ERF_monthly_175001-201912.csv'
 
 SPECIES = ['CO2','CH4','N2O','Sulfur','BC','Aerosol-radiation interactions','Aerosol-cloud interactions']
-_DF_EBM = pd.read_csv(EBM_CONFIG)
-_PROPERTIES = read_properties()[1]
-DEFAULT_ESMs = _DF_EBM['model'].unique()
+#_DF_EBM = pd.read_csv(EBM_CONFIG)
+#_PROPERTIES = read_properties()[1]
+_PROPERTIES = read_properties(filename=FAIR_SPECIES_CSV)[1]
+#DEFAULT_ESMs = _DF_EBM['model'].unique()
 
+"""
 def _ebm_config_names(models: Iterable[str]) -> list:
-    """Return list like ['ModelA_r1','ModelA_r2', ...] from the EBM table."""
+    Return list like ['ModelA_r1','ModelA_r2', ...] from the EBM table.
     names = []
     for model in models:
         sub = _DF_EBM[_DF_EBM["model"] == model]
         for run in sub["run"]:
             names.append(f"{model}_{run}")
     return names
-
+"""
+"""
 def _apply_ebm_configs(f: FAIR, configs: Iterable[str], stochastic: bool=False) -> None:
-    """Fill FaIR climate_configs from the EBM CSV for all configs."""
+    Fill FaIR climate_configs from the EBM CSV for all configs.
     seed = 1355763
     for cfg in configs:
         model, run = cfg.split("_")
@@ -60,6 +70,7 @@ def _apply_ebm_configs(f: FAIR, configs: Iterable[str], stochastic: bool=False) 
         fill(f.climate_configs["use_seed"], stochastic, config=cfg)
         fill(f.climate_configs["seed"], seed, config=cfg)
         seed += 399
+"""
 
 def _species_properties(input_mode: str) -> Dict[str, dict]:
     """Copy baseline species properties and set CO2 input_mode."""
@@ -81,7 +92,7 @@ def build_fair(
     stop: int,
     input_mode: str = "emissions",
     default_scenario: str = DEFAULT_SCENARIO,
-    esms: Iterable[str] = DEFAULT_ESMs,
+    #esms: Iterable[str] = DEFAULT_ESMs,
     scenario_name: str = "custom",
     ) -> FAIR:
     """
@@ -91,7 +102,12 @@ def build_fair(
 
     # define time and configs
     f.define_time(start, stop + 1, 1)  # keep consistent everywhere
-    configs = _ebm_config_names(esms)
+    #configs = _ebm_config_names(esms)
+    #f.define_configs(configs)
+
+    #configs = _calib_config_labels(FAIR_PARAMS_CSV)
+    df_configs = pd.read_csv(FAIR_PARAMS_CSV, index_col=0)
+    configs = df_configs.index
     f.define_configs(configs)
 
     # define species
@@ -102,7 +118,10 @@ def build_fair(
     f.define_scenarios([default_scenario])
     f.allocate()
     f.fill_from_rcmip()
-    f.fill_species_configs()
+    #f.fill_species_configs()
+
+    f.fill_species_configs(FAIR_SPECIES_CSV)
+    f.override_defaults(FAIR_PARAMS_CSV)
 
     # initialise state
     initialise(f.concentration, f.species_configs["baseline_concentration"])
@@ -110,6 +129,7 @@ def build_fair(
     initialise(f.temperature, 0)
     initialise(f.cumulative_emissions, 0)
     initialise(f.airborne_emissions, 0)
+    initialise(f.ocean_heat_content_change, 0)
 
     # rename scenario coordinates to 'custom'
     f.define_scenarios([scenario_name])
@@ -123,7 +143,7 @@ def build_fair(
     f.emissions[:] = 0
 
     # apply EBM configs
-    _apply_ebm_configs(f, configs, stochastic=False)
+    #_apply_ebm_configs(f, configs, stochastic=False)
 
     return f
 
@@ -207,111 +227,155 @@ def load_scenarioMIP_CMIP7(agents: list) -> Dict[str, Dict[str, np.ndarray]]:
     Returns dict[scenario][agent] -> emissions array
     """
 
-    # Define CMIP7 scenarios and extensions
-    scenarios_tier1  = ['high-extension','medium-extension','medium-overshoot',
-                        'low','verylow','verylow-overshoot']
-    scenarios_tier2  = ['high-overshoot','medium-extension','medium-overshoot',
-                        'low','verylow-overshoot']
-    scenarios_all    = scenarios_tier1 + scenarios_tier2
-
-    tags_tier1 = ['H-ext','M','ML','L','VLLO-ext','VLHO']
-    tags_tier2 = ['H-ext-OS','M-ext','ML-ext','L-ext','VLHO-ext']
-    tags_all   = tags_tier1 + tags_tier2
-    data_path  = "data/FaIR/extensions_1750-2500.csv"
-    emis_df    = pd.read_csv(data_path)
-
-    # Indices for emissions dataset
-    n_col_skip = 5
-    n_years_base, n_years_ext = 127, 477
-    emis_dict_tier1, emis_dict_tier2 = {}, {}
-
-    # Historical emissions
-    n_years_hist = 274
-    emis_dict_tier1['historical'], emis_dict_tier2['historical'] = {}, {}
+    # Check if this scenario is already cached
+    tag_post = ''
     for a in agents:
-        if a == 'CO2':
-            a_full = 'CO2 FFI'
-        else:
-            a_full = a
+        tag_post += '_' + a
+    filepath_tier1 = f'data/FaIR_IO/emissions/ScenarioMIP_tier1{tag_post}.pkl'
+    filepath_tier2 = f'data/FaIR_IO/emissions/ScenarioMIP_tier2{tag_post}.pkl'
 
-        historical_emis = emis_df[(emis_df["scenario"] == scenarios_all[0]) & (emis_df["variable"] == a_full)].iloc[:, n_col_skip:n_col_skip + n_years_hist].to_numpy().reshape(-1)
-        emis_dict_tier1['historical'][a] = historical_emis
-        emis_dict_tier2['historical'][a] = historical_emis
+    if os.path.exists(filepath_tier1) and os.path.exists(filepath_tier2):
+        with open(filepath_tier1, 'rb') as f:
+            emis_dict_tier1 = pickle.load(f)
+        with open(filepath_tier2, 'rb') as f:
+            emis_dict_tier2 = pickle.load(f)
 
-    # All other scenarios
-    for scen, tag in zip(scenarios_all, tags_all):
-        if tag in tags_tier1:
-            emis_dict_tier1[tag] = {}
-        else:
-            emis_dict_tier2[tag] = {}
+    else:
+        # Define CMIP7 scenarios and extensions
+        scenarios_tier1  = ['high-extension','medium-extension','medium-overshoot',
+                            'low','verylow','verylow-overshoot']
+        scenarios_tier2  = ['high-overshoot','medium-extension','medium-overshoot',
+                            'low','verylow-overshoot']
+        scenarios_all    = scenarios_tier1 + scenarios_tier2
 
-        if 'ext' in tag:
-            n_years = n_years_ext
-        else:
-            n_years = n_years_base
+        tags_tier1 = ['H-ext','M','ML','L','VLLO-ext','VLHO']
+        tags_tier2 = ['H-ext-OS','M-ext','ML-ext','L-ext','VLHO-ext']
+        tags_all   = tags_tier1 + tags_tier2
+        data_path  = "data/FaIR/extensions_1750-2500.csv"
+        emis_df    = pd.read_csv(data_path)
 
+        # Indices for emissions dataset
+        n_col_skip = 5
+        n_years_base, n_years_ext = 127, 477
+        emis_dict_tier1, emis_dict_tier2 = {}, {}
+
+        # Historical emissions
+        n_years_hist = 274 # Up to 2023
+        emis_dict_tier1['historical'], emis_dict_tier2['historical'] = {}, {}
         for a in agents:
             if a == 'CO2':
                 a_full = 'CO2 FFI'
             else:
                 a_full = a
 
-            vals = emis_df[(emis_df["scenario"] == scen) & (emis_df["variable"] == a_full)].iloc[:, n_col_skip + n_years_hist:n_col_skip + n_years_hist + n_years].to_numpy().reshape(-1)
+            historical_emis = emis_df[(emis_df["scenario"] == scenarios_all[0]) & (emis_df["variable"] == a_full)].iloc[:, n_col_skip:n_col_skip + n_years_hist].to_numpy().reshape(-1)
+            emis_dict_tier1['historical'][a] = historical_emis
+            emis_dict_tier2['historical'][a] = historical_emis
 
-            #if 'ext' not in tag:
-                #print(n_col_skip + n_years_hist + n_years)
-
+        # All other scenarios
+        for scen, tag in zip(scenarios_all, tags_all):
             if tag in tags_tier1:
-                emis_dict_tier1[tag][a] = vals
+                emis_dict_tier1[tag] = {}
             else:
-                emis_dict_tier2[tag][a] = vals
+                emis_dict_tier2[tag] = {}
+
+            if 'ext' in tag:
+                n_years = n_years_ext
+            else:
+                n_years = n_years_base
+
+            for a in agents:
+                if a == 'CO2':
+                    a_full = 'CO2 FFI'
+                else:
+                    a_full = a
+
+                vals = emis_df[(emis_df["scenario"] == scen) & (emis_df["variable"] == a_full)].iloc[:, n_col_skip + n_years_hist:n_col_skip + n_years_hist + n_years].to_numpy().reshape(-1)
+
+                if tag in tags_tier1:
+                    emis_dict_tier1[tag][a] = vals
+                else:
+                    emis_dict_tier2[tag][a] = vals
+
+        with open(filepath_tier1, 'wb') as f:
+            pickle.dump(emis_dict_tier1, f)
+        with open(filepath_tier2, 'wb') as f:
+            pickle.dump(emis_dict_tier2, f)
 
     return emis_dict_tier1, emis_dict_tier2
 
-def get_cmip7_delT(emis_dict, scenarios, agents, DECK=False):
-    delT_dict = {}
-    for scen in scenarios:
-        if not DECK:
-            if scen == 'historical':
-                start, stop = 1750, 2024
-                ind1, ind2 = start - start, stop - 1750
-            elif 'ext' not in scen:
-                start, stop = 1750, 2151
-                ind1, ind2 = 2024 - start, 2151 - start
+def get_delT(emis_dict, scenarios, agents, MIP='ScenarioMIP_tier1'):
+
+    # Check if this scenario is already cached
+    tag_post = ''
+    for a in agents:
+        tag_post += '_' + a
+    filepath = f'data/FaIR_IO/delT/{MIP}{tag_post}.pkl'
+
+    if os.path.exists(filepath):
+        with open(filepath, 'rb') as f:
+            delT_dict = pickle.load(f)
+
+    # Otherwise, generate it
+    else:
+        delT_dict = {}
+        for scen in scenarios:
+            if MIP in ['ScenarioMIP_tier1','ScenarioMIP_tier2','GeoMIP']:
+                if scen == 'historical':
+                    start, stop = 1750, 2024
+                    ind1, ind2 = start - start, stop - 1750
+                elif 'ext' not in scen:
+                    start, stop = 1750, 2151
+                    ind1, ind2 = 2024 - start, stop - start
+                else:
+                    start, stop = 1750, 2501
+                    ind1, ind2 = 2024 - start, stop - start
+            elif MIP == 'DECK':
+                if 'abrupt' in scen:
+                    start, stop = 1750, 2051
+                elif '1pct' in scen:
+                    start, stop = 1750, 1901
+                ind1, ind2 = start - start, stop - start
+            elif MIP == 'CS3':
+                if scen == 'historical':
+                    start, stop = 1750, 2006
+                    ind1, ind2 = start - start, stop - 1750
+                else:
+                    start, stop = 1750, 2151
+                    ind1, ind2 = 2006 - start, stop - start
+            elif MIP == 'noise':
+                start, stop = 1750, 2500
+                ind1, ind2 = start - start, stop - start
             else:
-                start, stop = 1750, 2501
-                ind1, ind2 = 2024 - start, stop - start
-        else:
-            if 'abrupt' in scen:
-                start, stop = 1750, 2051
-            elif '1pct' in scen:
-                start, stop = 1750, 1901
-            ind1, ind2 = start - start, stop - start
+                raise ValueError(f'Error: type {MIP} not recognized.')
 
-        years = np.arange(start, stop)
-        n_steps = len(years)
-        nan_force = np.zeros(n_steps)
+            years = np.arange(start, stop)
+            n_steps = len(years)
+            nan_force = np.zeros(n_steps)
 
-        f = build_fair(start, stop, input_mode="emissions")
-        emis = {a: nan_force for a in agents}
+            f = build_fair(start, stop, input_mode="emissions")
+            emis = {a: nan_force for a in agents}
 
-        for a in agents:
-            if scen != 'historical' and not DECK:
-                emis[a] = np.concatenate((emis_dict['historical'][a], emis_dict[scen][a]), axis=None)
-            else:
-                emis[a] = emis_dict[scen][a]
+            for a in agents:
+                if scen != 'historical' and MIP in ['ScenarioMIP_tier1','ScenarioMIP_tier2','GeoMIP','CS3']:
+                    emis[a] = np.concatenate((emis_dict['historical'][a][:ind1], emis_dict[scen][a]), axis=None)
+                else:
+                    emis[a] = emis_dict[scen][a]
 
-        reset_state(f)
-        set_emissions(f, years, emis)
-        _, T, T_mean, _ = run_fair(f, years)
-        delT_dict[scen] = T_mean[ind1:ind2]
+            reset_state(f)
+            set_emissions(f, years, emis)
+            _, T, T_mean, _ = run_fair(f, years)
+            delT_dict[scen] = T_mean[ind1:ind2]
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(delT_dict, f)
 
     return delT_dict
 
-def plot_emissions(emis_dict, agent, experiment_id, DECK=False):
-    fig, ax = plt.subplots(figsize=(10,5), constrained_layout=True)
+def plot_emissions(emis_dict, agent, experiment_id, MIP='ScenarioMIP_tier1'):
+    fig, ax = plt.subplots(figsize=(14,4), constrained_layout=True)
     for tag in emis_dict.keys():
-        if not DECK:
+        if MIP in ['ScenarioMIP_tier1','ScenarioMIP_tier2','GeoMIP']:
             if tag == 'historical':
                 years = np.arange(1750, 2024)
                 ls = '-'
@@ -321,27 +385,47 @@ def plot_emissions(emis_dict, agent, experiment_id, DECK=False):
             else:
                 years = np.arange(2024, 2501)
                 ls = '--'
-
-        elif DECK:
+        elif MIP == 'DECK':
             if 'abrupt' in tag:
                 years = np.arange(1750, 2051)
                 ls = '--'
             elif '1pct' in tag:
                 years = np.arange(1750, 1901)
                 ls = '-'
+        elif MIP == 'CS3':
+            if tag == 'historical':
+                years = np.arange(1750, 2006)
+                ls = '-'
+            else:
+                years = np.arange(2006, 2151)
+                ls = '-'
+        elif MIP == 'noise':
+            years = np.arange(1750, 2500)
+            ls = '-'
+        else:
+            raise ValueError(f'Error: type {MIP} not recognized.')
+
         ax.plot(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
 
-    ax.legend(loc='upper right')
+    units = {'CO2':'Gt',
+             'CH4':'Mt',
+             'N2O':'Mt',
+             'Sulfur':'Mt',
+             'BC':'Mt'}
+
+    ax.legend()
     ax.set_xlabel('Year')
-    ax.set_ylabel(f'{agent} emissions')
-    ax.set_title(f'CMIP7 {experiment_id} scenarios')
+    ax.set_ylabel(f'{agent} emissions ({units[agent]})')
+    ax.set_title(f'{experiment_id} scenarios')
+    ax.set_xlim([1750,2500])
+    plt.grid(True, alpha=0.3)
 
     return
 
-def plot_cmip7_delT(delT_dict, scen_to_plot, experiment_id, DECK=False):
+def plot_delT(delT_dict, scen_to_plot, experiment_id, MIP='ScenarioMIP'):
     fig, ax = plt.subplots(figsize=(10,5), constrained_layout=True)
     for tag in scen_to_plot:
-        if not DECK:
+        if MIP in ['ScenarioMIP','GeoMIP']:
             if tag == 'historical':
                 years = np.arange(1750, 2024)
                 ls = '-'
@@ -351,19 +435,32 @@ def plot_cmip7_delT(delT_dict, scen_to_plot, experiment_id, DECK=False):
             else:
                 years = np.arange(2024, 2501)
                 ls = '--'
-        else:
+        elif MIP == 'DECK':
             if 'abrupt' in tag:
                 years = np.arange(1750, 2051)
                 ls = '--'
             elif '1pct' in tag:
                 years = np.arange(1750, 1901)
                 ls = '-'
+        elif MIP == 'CS3':
+            if tag == 'historical':
+                years = np.arange(1750, 2006)
+                ls = '-'
+            else:
+                years = np.arange(2006, 2151)
+                ls = '-'
+        elif MIP == 'noise':
+            years = np.arange(1750, 2500)
+            ls = '-'
+        else:
+            raise ValueError(f'Error: type {MIP} not recognized.')
+
         ax.plot(years, delT_dict[tag], label=tag, ls=ls, lw=2, c=colors[tag])
 
-    ax.legend()#loc='upper left')
+    ax.legend()
     ax.set_xlabel('Year')
     ax.set_ylabel(r'$\overline{\Delta T}(t)$')
-    ax.set_title(f'CMIP7 {experiment_id} scenarios')
+    ax.set_title(f'{experiment_id} scenarios')
 
     return
 
@@ -459,22 +556,200 @@ def load_DECK_CMIP7(agents):
 # ------------------------
 # GeoMIP for CMIP6 Helpers
 # ------------------------
+# - Visioni et al. (2023)
+
+def find_sulfur_for_target_temp(
+    modify_year,
+    target_year,
+    hist_emissions,
+    future_baseline_emissions,
+    solved_sulfur_so_far,
+    target_temp,
+    initial_guess=50.0
+):
+    """
+    Solves for the sulfur emission in `modify_year` to hit a target temperature in `target_year`.
+    Uses an intelligent first guess and a temperature-based tolerance for faster convergence.
+    """
+    start_year = 1750
+    run_stop_year = target_year + 1
+    run_years = np.arange(start_year, run_stop_year)
+
+    modify_idx = modify_year - 2024
+    target_idx = target_year - 2024
+
+    # Initialize previous temperature with a value far from the target
+    prev_temp_result = -999.0
+
+    # Set initial search bounds. A wide range is still needed for stability.
+    min_S_guess = 100
+    max_S_guess = 1000
+    # Use the intelligent guess as the first try
+    current_S_guess = initial_guess
+
+    for i in range(20):
+        # Construct the full emissions scenario for this trial run
+        run_emissions = {}
+        for agent in future_baseline_emissions.keys():
+            hist_part = hist_emissions[agent]
+            future_part = future_baseline_emissions[agent][:target_idx + 1].copy()
+            if agent == 'Sulfur':
+                future_part[:len(solved_sulfur_so_far)] = solved_sulfur_so_far
+                future_part[modify_idx] = current_S_guess
+            run_emissions[agent] = np.concatenate([hist_part, future_part])
+
+        # Run a new FaIR instance for this trial
+        f_temp = build_fair(start_year, run_stop_year)
+        set_emissions(f_temp, run_years, run_emissions)
+        _, _, T_mean, _ = run_fair(f_temp, run_years)
+
+        temp_result = T_mean[-1]
+
+        # New stopping condition: check if temperature has converged
+        if abs(temp_result - prev_temp_result) < 1e-4:
+            break
+        prev_temp_result = temp_result
+
+        # Adjust search bounds
+        if temp_result > target_temp:
+            min_S_guess = current_S_guess
+        else:
+            max_S_guess = current_S_guess
+
+        # For the next iteration, the guess is the midpoint of the new bounds
+        current_S_guess = (min_S_guess + max_S_guess) / 2
+
+    return current_S_guess
+
+def solve_G3(emis_dict_tier1, verbose=False):
+
+    print("--- Establishing Target Temperature ---")
+    hist_start, hist_stop = 1750, 2024
+    hist_years = np.arange(hist_start, hist_stop)
+    f_hist = build_fair(hist_start, hist_stop)
+    set_emissions(f_hist, hist_years, emis_dict_tier1['historical'])
+    _, _, T_mean_hist, _ = run_fair(f_hist, hist_years)
+    target_temp = T_mean_hist[-1]
+    print(f"Target temperature from 2024 locked in: {target_temp:.4f}°C\n")
+
+    print("--- Solving for Future Sulfur Emissions ---")
+    baseline_scenario_name = 'ML'
+    hist_emissions = emis_dict_tier1['historical']
+    future_baseline_emissions = emis_dict_tier1[baseline_scenario_name]
+
+    future_start, future_stop = 2024, 2150
+    future_years = np.arange(future_start, future_stop)
+
+    calculated_S_emissions = np.zeros_like(future_baseline_emissions['Sulfur'])
+    last_solved_sulfur = hist_emissions['Sulfur'][-1]
+
+    for i, year in enumerate(future_years):
+        modify_year = year
+        target_year = year + 1
+
+        solved_sulfur_so_far = calculated_S_emissions[:i]
+
+        required_sulfur = find_sulfur_for_target_temp(
+            modify_year,
+            target_year,
+            hist_emissions,
+            future_baseline_emissions,
+            solved_sulfur_so_far,
+            target_temp,
+            initial_guess=last_solved_sulfur # Pass the previous solution as the first guess
+        )
+
+        calculated_S_emissions[i] = required_sulfur
+        last_solved_sulfur = required_sulfur # Update for the next iteration
+
+        # --- Yearly Reporting ---
+        final_stop_year = target_year + 1
+        final_run_years = np.arange(hist_start, final_stop_year)
+        final_run_emissions = {}
+        for agent in future_baseline_emissions.keys():
+            hist_part = hist_emissions[agent]
+            future_part_for_run = future_baseline_emissions[agent][:i+2].copy()
+            if agent == 'Sulfur':
+                future_part_for_run[:i+1] = calculated_S_emissions[:i+1]
+            final_run_emissions[agent] = np.concatenate([hist_part, future_part_for_run])
+
+        f_report = build_fair(hist_start, final_stop_year)
+        set_emissions(f_report, final_run_years, final_run_emissions)
+        _, _, T_mean_report, _ = run_fair(f_report, final_run_years)
+
+        if target_year % 25 == 0 and verbose:
+            print(f"Controlling Temp({target_year}) with Sulfur({modify_year}): Required S = {required_sulfur:8.4f} Tg/yr, Resulting Temp = {T_mean_report[-1]:.4f}°C")
+
+    print(f"\nFinished.")
+
+    return calculated_S_emissions
+
+def load_geoMIP_CMIP6(agents=None, emis_dict_tier1=None, verbose=False):
+
+    geoMIP_filepath = 'data/saved_emissions/emis_dict_geoMIP.pkl'
+
+    if os.path.exists(geoMIP_filepath):
+        with open(geoMIP_filepath, 'rb') as f:
+            emis_dict_geoMIP = pickle.load(f)
+
+    else:
+        emis_dict_geoMIP = {'ML-G3':{}, # Hold temperature at 2024 levels under ML
+                            'ML-G4':{}, # Inject 5 extra Tg of SO2 per year under ML until 2070
+                            'historical':{}}
+        for a in agents:
+            emis_dict_geoMIP['ML-G3'][a] = emis_dict_tier1['ML'][a].copy()
+            emis_dict_geoMIP['ML-G4'][a] = emis_dict_tier1['ML'][a].copy()
+            emis_dict_geoMIP['historical'][a] = emis_dict_tier1['historical'][a].copy()
+
+        emis_dict_geoMIP['ML-G3']['Sulfur'] = solve_G3(emis_dict_tier1, verbose=verbose)
+        emis_dict_geoMIP['ML-G4']['Sulfur'][:46] += 5
+
+        with open(geoMIP_filepath, 'wb') as f:
+            pickle.dump(emis_dict_geoMIP, f)
+
+    return emis_dict_geoMIP
 
 # ----------------------------
 # CS3 Outlook Scenario Helpers
 # ----------------------------
 
-def load_outlook_ghgs(historical_CMIP7):
-    scenarios_outlook = ['historical','AA','CT']
-    agents = ['CO2','CH4','N2O']
+def load_CS3(agents=None, emis_dict_tier1=None):
 
-    path_AA_ghgs = 'data/CS3_outlook25/ghg_AA_OUTLOOK25_rcp26_2006-2150_c100405.nc'
-    path_CT_ghgs = 'data/CS3_outlook25/ghg_CT_scenario_outlook25_2006-2150_c100901.nc'
+    CS3_filepath = 'data/saved_emissions/emis_dict_CS3.pkl'
 
-    emis_df_AA_ghgs = xr.open_dataset(path_AA_ghgs)
-    emis_df_CT_ghgs = xr.open_dataset(path_CT_ghgs)
+    if os.path.exists(CS3_filepath):
+        with open(CS3_filepath, 'rb') as f:
+            emis_dict_CS3 = pickle.load(f)
 
-    return #emis_dict_outlook
+    else:
+        filepath_AA = 'data/CS3_outlook25/edaily.e5_AA_20250717.fordata'
+        filepath_CT = 'data/CS3_outlook25/edaily.e5_CT_20250712.fordata'
+        emis_df_AA = pd.read_csv(filepath_AA, sep=r'\s+', usecols=[1,4,7,8,12])
+        emis_df_CT = pd.read_csv(filepath_CT, sep=r'\s+', usecols=[1,4,7,8,12])
+
+        fair_to_cs3 = {'CO2':'CO2:Pg',
+                       'CH4':'CH4:Pg',
+                       'N2O':'N2O:Tg',
+                       'Sulfur':'SO2:Tg',
+                       'BC':'BC:Tg'}
+
+        emis_dict_CS3 = {'AA':{}, # Accelerated Actions
+                         'CT':{}, # Current Trends
+                         'historical':{}}
+
+        for a in agents:
+            if a == 'CH4':
+                factor = 1000 # CS3 stores CH4 in Pg instead of Tg that FaIR expects
+            else:
+                factor = 1
+            emis_dict_CS3['AA'][a] = emis_df_AA[fair_to_cs3[a]].values * factor
+            emis_dict_CS3['CT'][a] = emis_df_CT[fair_to_cs3[a]].values * factor
+            emis_dict_CS3['historical'][a] = emis_dict_tier1['historical'][a].copy()[0:256]
+
+        with open(CS3_filepath, 'wb') as f:
+            pickle.dump(emis_dict_CS3, f)
+
+    return emis_dict_CS3
 
 
 
@@ -483,19 +758,20 @@ snames_short = ['historical','H-ext','H-ext-OS',
                 'L-ext','VLLO-ext','VLHO','VLHO-ext',
                 'abrupt-4xCO2','abrupt-4xCH4','abrupt-4xN2O',
                 'abrupt-4xSulfur','abrupt-4xBC','1pctCO2',
-                '1pctCH4','1pctN2O','1pctSulfur','1pctBC']
+                '1pctCH4','1pctN2O','1pctSulfur','1pctBC',
+                'AA','CT','ML-G3','ML-G4','noise']
 
 colors = {
-    snames_short[0]: '#808080', # historical
-    snames_short[1]: '#800000', # H-ext
-    snames_short[2]: '#ff0000', # H-ext-OS
-    snames_short[3]: '#fc7b03', # M
-    snames_short[4]: '#fc7b03', # M-ext
-    snames_short[5]: '#d3a640', # ML
-    snames_short[6]: '#d3a640', # ML-ext
-    snames_short[7]: '#098740', # L
-    snames_short[8]: '#098740', # L-ext
-    snames_short[9]: '#0080d0', # VLLO-ext
+    snames_short[0]:  '#808080', # historical
+    snames_short[1]:  '#800000', # H-ext
+    snames_short[2]:  '#ff0000', # H-ext-OS
+    snames_short[3]:  '#fc7b03', # M
+    snames_short[4]:  '#fc7b03', # M-ext
+    snames_short[5]:  '#d3a640', # ML
+    snames_short[6]:  '#d3a640', # ML-ext
+    snames_short[7]:  '#098740', # L
+    snames_short[8]:  '#098740', # L-ext
+    snames_short[9]:  '#0080d0', # VLLO-ext
     snames_short[10]: '#100060', # VLHO
     snames_short[11]: '#100060', # VLHO-ext
     snames_short[12]: '#800000', # abrupt-4xCO2
@@ -508,4 +784,9 @@ colors = {
     snames_short[19]: '#fc7b03', # 1pctN2O
     snames_short[20]: '#d3a640', # 1pctSulfur
     snames_short[21]: '#098740', # 1pctBC
+    snames_short[22]: '#098740', # AA
+    snames_short[23]: '#800000', # CT
+    snames_short[24]: '#d3a640', # ML-G3
+    snames_short[25]: '#fc7b03', # ML-G4
+    snames_short[26]: '#800000', # noise
 }

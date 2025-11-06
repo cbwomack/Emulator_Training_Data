@@ -1,0 +1,668 @@
+# Imports
+import random
+from tokenize import group
+import numpy as np
+import matplotlib.pyplot as plt
+
+import run_fair
+
+# Scitkit-learn
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Tensorflow and Keras
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import AdamW
+
+import seaborn as sns
+from cmcrameri import cm
+
+## Setup plots
+plt.rcParams['figure.figsize'] = [12, 4]
+plt.rcParams.update({'font.size': 16})
+plt.rcParams.update({
+  "text.usetex": True,
+  "font.family": "sans-serif",
+  "font.sans-serif": ["Helvetica Light"],
+})
+
+def plot_yhats_grid(error_dict, yhat_dict, ytrue_dict):
+  train_scenarios = sorted(error_dict.keys())
+  test_scenarios = sorted({test for train in train_scenarios for test in error_dict[train].keys()})
+  n_test = len(test_scenarios)
+  cols = int(np.ceil(np.sqrt(n_test))); rows = int(np.ceil(n_test / cols))
+  fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows), constrained_layout=True, sharex=True, sharey=True)
+
+  for i, test in enumerate(test_scenarios):
+    ax = axes[i // cols][i % cols]
+    for j, train in enumerate(train_scenarios):
+      if train == 'noise':
+        ls = '--'
+      else:
+        ls = '-'
+      ax.plot(yhat_dict[train][test], lw=1, alpha=0.8, ls=ls, label=train, c=cm.batlowKS(j))  # all yhats for this test
+    ax.plot(ytrue_dict[test], lw=2, alpha=0.8, label='True', c='k')
+    ax.legend(loc='upper left', fontsize=8)
+
+    ax.set_title(f"Test {test}")
+    ax.set_ylim([-5,10])
+
+    if i % 4 == 0:
+      ax.set_ylabel("yhat")
+    if i >= cols * (rows - 1):
+      ax.set_xlabel('t')
+
+  for k in range(n_test, rows*cols):
+    axes[k // cols][k % cols].axis('off')  # hide empties
+
+  return
+
+def rmse(y_true, y_pred):
+  y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
+  return float(np.sqrt(np.mean(np.power(np.subtract(y_true, y_pred), 2))))
+
+def nrmse(y_true, y_pred):
+  denom = max(np.max(np.abs(y_true)), 1e-12)  # normalize by largest magnitude in y_test
+  return rmse(y_true/denom, y_pred/denom)
+
+def plot_error_heatmap(error_dict, train_scenarios, test_scenarios):
+  # Build matrix with rows=test, cols=train
+  E = np.full((len(test_scenarios), len(train_scenarios)), np.nan)
+  for r, te in enumerate(test_scenarios):
+    for c, tr in enumerate(train_scenarios):
+      E[r, c] = error_dict.get(tr, {}).get(te, np.nan)
+
+  avg_error_row = np.mean(E, axis=0)
+  E_all = np.vstack([E, avg_error_row])
+  yticklabels = test_scenarios.copy() + ['Avg.']
+
+  # Plot
+  fig, ax = plt.subplots(figsize=(1.2*len(train_scenarios)+2, 1.0*len(test_scenarios)+2), constrained_layout=True)
+  sns.heatmap(E_all, ax=ax, vmin=0, vmax=1, cmap=cm.lajolla_r,
+              xticklabels=train_scenarios, yticklabels=yticklabels,
+              annot=True, fmt=".2g", cbar_kws={"label": "RMSE"})
+  ax.set_xlabel("Train scenario")
+  ax.set_ylabel("Test scenario")
+  ax.set_title("Error heatmap")
+  return
+
+def project(v, u):
+  """
+  Calculates the projection of vector v onto vector u.
+  proj_u(v) = (<v,u>/<u,u>) * u
+  """
+  # Avoid division by zero if u is the zero vector
+  u_dot_u = np.dot(u, u)
+  if u_dot_u == 0:
+    return np.zeros_like(v)
+  return (np.dot(v, u) / u_dot_u) * u
+
+def generate_uncorrelated_signals(n, signal_length=1000):
+  """
+  Generates n uncorrelated white noise signals of a specified length.
+
+  Args:
+    n (int): The number of signals to generate.
+    signal_length (int): The number of samples in each signal.
+
+  Returns:
+    tuple: A tuple containing:
+      - v_signals (np.ndarray): The original correlated white noise signals.
+      - e_signals (np.ndarray): The final uncorrelated (orthonormal) signals.
+  """
+  if n <= 0:
+    raise ValueError("Number of signals (n) must be a positive integer.")
+  if signal_length <= 0:
+    raise ValueError("Signal length must be a positive integer.")
+
+  # 1. Generate n white noise signals (v_n)
+  # Each signal is a row in the matrix
+  v_signals = np.random.randn(n, signal_length)
+  u_signals = np.zeros_like(v_signals)
+
+  # 2. Apply the Gram-Schmidt process to create uncorrelated signals (u_n)
+  for i in range(n):
+    v_i = v_signals[i]
+    u_i = v_i
+    # Subtract projections onto previous u signals
+    for j in range(i):
+      u_j = u_signals[j]
+      u_i -= project(v_i, u_j)
+
+    # Normalize and save
+    u_i -= np.mean(u_i)
+    u_i /= np.std(u_i)
+
+    u_signals[i] = u_i
+
+  return u_signals
+
+def verify(u_signals):
+  """
+  Verifies that the signals are uncorrelated and have a norm of 1
+  """
+  n_signals = u_signals.shape[0]
+
+  # Check correlation (inner product of different signals should be 0)
+  print("\nVerifying Correlation (dot products of e_i, e_j for i!=j should be close to 0.0):")
+  # Only show the upper triangle of the correlation matrix for brevity
+  for i in range(n_signals):
+    for j in range(i + 1, n_signals):
+      corr = np.dot(u_signals[i], u_signals[j])
+      print(f"  <e_{i+1}, e_{j+1}>: {corr: .6f}")
+
+
+
+
+
+# ---------------------
+# Version 2 of Features
+# ---------------------
+
+def make_features_from_scenario(
+  scenario_emissions,
+  historical_emissions=None,
+  agents=['CO2'],
+  n_lags=10
+):
+  """
+  Constructs features for an MLP, accounting for a separate historical period.
+
+  Features for each agent are:
+  1. Lagged emissions for the past `n_lags` years.
+  2. Cumulative emissions.
+
+  If historical_emissions are provided, the lags and cumulative sums for the
+  scenario are initialized based on the end-state of the historical period.
+  """
+  if not agents or not scenario_emissions:
+    return np.zeros((0, 0))
+
+  # Determine the length of the time series from the first agent in the current scenario
+  try:
+    N = len(scenario_emissions[agents[0]])
+  except KeyError:
+    raise ValueError(f"Agent '{agents[0]}' not found in the provided scenario emissions.")
+
+  all_agent_features = []
+
+  for agent in agents:
+    e_scenario = np.asarray(scenario_emissions.get(agent, []), float).ravel()
+    if len(e_scenario) != N:
+      raise ValueError(f"Time series for agent '{agent}' has mismatched length.")
+
+    historical_lags = np.zeros(n_lags)
+    historical_cumu_end = 0.0
+
+    if historical_emissions:
+      if agent in historical_emissions:
+        e_hist = np.asarray(historical_emissions[agent], float).ravel()
+        # Take the last n_lags values for initializing the lags
+        if len(e_hist) >= n_lags:
+          historical_lags = e_hist[-n_lags:]
+        else: # Pad with zeros if history is shorter than n_lags
+          historical_lags = np.pad(e_hist, (n_lags - len(e_hist), 0), 'constant')
+        # Calculate the total cumulative emissions from history
+        historical_cumu_end = np.sum(e_hist)
+      else:
+        print(f"Warning: Agent '{agent}' not found in historical emissions. Using zeros for context.")
+
+    # --- 1. Create Lag Features ---
+    # Combine historical lags with the scenario series to correctly create lags for the start of the scenario
+    e_combined = np.concatenate([historical_lags, e_scenario])
+    e_combined = np.concatenate([[0.0], e_combined]) # there's also an off-by-one error
+
+    # Build a matrix of lags for the combined series using a sliding window.
+    # The number of rows will be N, corresponding to the scenario length.
+    X_lags = np.zeros((N, n_lags + 1))
+    for i in range(N):
+      # The window for the i-th step of the scenario starts at index i in e_combined
+      window = e_combined[i : i + n_lags + 1]
+      # The values are [e_t, e_{t-1}, ..., e_{t-n_lags}]
+      X_lags[i, :len(window)] = window[::-1]
+
+    # --- 2. Create Cumulative Emissions Feature ---
+    # Calculate cumulative sum for the current scenario and add the historical total
+    cumu_scenario = np.cumsum(e_scenario)
+    cumu_final = cumu_scenario + historical_cumu_end
+    cumu_final = np.roll(cumu_final, 1)
+    cumu_final[0] = historical_cumu_end
+
+    # --- 3. Combine and Store Features for the Agent ---
+    agent_feature_block = np.column_stack([X_lags, cumu_final])
+    all_agent_features.append(agent_feature_block)
+
+  # Horizontally stack the feature blocks from all agents
+  final_features = np.column_stack(all_agent_features)
+  return final_features
+
+def evaluate_trainsets_vs_tests_with_history(
+  train_scenarios,
+  train_series,
+  test_scenarios,
+  test_series,
+  agents=['CO2'],
+  training_groups=None,
+  n_lags=10,
+  random_state=0,
+  historical_scenario_name='historical'
+):
+  """
+  Evaluates model performance by training on specified groups and testing on others,
+  correctly handling a separate historical emissions period.
+  """
+  if training_groups is None:
+    training_groups = {name: [name] for name in train_scenarios}
+
+  # 1. Consolidate all data and extract the historical series
+  train_data_map = {name: data for name, data in zip(train_scenarios, train_series)}
+  test_data_map = {name: data for name, data in zip(test_scenarios, test_series)}
+
+  historical_series_train, historical_series_test = None, None
+  if historical_scenario_name in train_data_map:
+    historical_series_train = train_data_map.pop(historical_scenario_name)
+  historical_emissions_train = historical_series_train[0] if historical_series_train else None
+
+  if historical_scenario_name in test_data_map:
+    historical_series_test = test_data_map.pop(historical_scenario_name)
+  historical_emissions_test = historical_series_test[0] if historical_series_test else None
+
+  # 2. Pre-compute features for all scenarios (train and test)
+  features_map_train, features_map_test = {}, {}
+
+  # Populate train features
+  for name, series_data in train_data_map.items():
+    emissions_dict, y, needs_history = series_data
+    hist_to_use = historical_emissions_train if needs_history else None
+
+    X = make_features_from_scenario(
+      emissions_dict,
+      historical_emissions=hist_to_use,
+      agents=agents,
+      n_lags=n_lags
+    )
+    y_adjusted = np.asarray(y, float)[:X.shape[0]]
+    features_map_train[name] = (X, y_adjusted)
+
+  # Add historical emissions to train features
+  if historical_emissions_train:
+    emissions_dict, y, needs_history = historical_series_train
+    X_hist = make_features_from_scenario(
+      emissions_dict,
+      historical_emissions=None,  # History has no preceding data
+      agents=agents,
+      n_lags=n_lags
+    )
+    y_hist = np.asarray(y, float)[:X_hist.shape[0]]
+    features_map_train[historical_scenario_name] = (X_hist, y_hist)
+
+  # Populate test features
+  for name, series_data in test_data_map.items():
+    emissions_dict, y, needs_history = series_data
+    hist_to_use = historical_emissions_test if needs_history else None
+
+    X = make_features_from_scenario(
+      emissions_dict,
+      historical_emissions=hist_to_use,
+      agents=agents,
+      n_lags=n_lags
+    )
+    y_adjusted = np.asarray(y, float)[:X.shape[0]]
+    features_map_test[name] = (X, y_adjusted)
+
+  # Add historical emissions to test features
+  if historical_emissions_test:
+    emissions_dict, y, needs_history = historical_series_test
+    X_hist = make_features_from_scenario(
+      emissions_dict,
+      historical_emissions=None,  # History has no preceding data
+      agents=agents,
+      n_lags=n_lags
+    )
+    y_hist = np.asarray(y, float)[:X_hist.shape[0]]
+    features_map_test[historical_scenario_name] = (X_hist, y_hist)
+
+  # 3. Run the main training and evaluation loop
+  error_dict, yhat_dict = {}, {}
+  for group_name, scenario_names_in_group in training_groups.items():
+    all_Xtr, all_ytr = [], []
+    for scenario_name in scenario_names_in_group:
+      if scenario_name in features_map_train:
+        X, y = features_map_train[scenario_name]
+        all_Xtr.append(X)
+        all_ytr.append(y)
+      else:
+        raise ValueError(f'Scenario {scenario_name} for training not found.')
+
+    if not all_Xtr:
+      print(f"Warning: No training data found for group '{group_name}'. Skipping.")
+      continue
+
+    Xtr_combined = np.vstack(all_Xtr)
+    ytr_combined = np.concatenate(all_ytr)
+
+    model = MLPRegressor(hidden_layer_sizes=(16,16,16,16), random_state=random_state, max_iter=500)
+    scaler = StandardScaler()
+    Xtr_scaled = scaler.fit_transform(Xtr_combined)
+    model.fit(Xtr_scaled, ytr_combined)
+
+    error_dict[group_name], yhat_dict[group_name] = {}, {}
+    for test_name in test_scenarios:
+      if test_name in features_map_test:
+        Xte, yte = features_map_test[test_name]
+        Xte_scaled = scaler.transform(Xte)
+        yhat = model.predict(Xte_scaled)
+        error_dict[group_name][test_name] = rmse(yte, yhat)
+        yhat_dict[group_name][test_name] = yhat
+
+  return error_dict, yhat_dict
+
+def evaluate_LSTM(
+  train_scenarios,
+  train_series,
+  test_scenarios,
+  test_series,
+  agents=['CO2'],
+  training_groups=None,
+  n_lags=0,
+  random_state=0,
+  historical_scenario_name='historical',
+  lstm_size=16,
+  dense_size=32,
+  dropout_rate=0.1,
+  l2_penalty=0.001
+):
+  """
+  Evaluates an LSTM model's performance by training on specified groups and
+  testing on others, handling a separate historical emissions period.
+  This function is a direct replacement for the MLP version.
+  """
+  tf.random.set_seed(random_state)
+  np.random.seed(random_state)
+
+  if training_groups is None:
+    training_groups = {name: [name] for name in train_scenarios}
+
+  # 1. Consolidate all data and extract the historical series
+  train_data_map = {name: data for name, data in zip(train_scenarios, train_series)}
+  test_data_map = {name: data for name, data in zip(test_scenarios, test_series)}
+
+  historical_series_train, historical_series_test = None, None
+  if historical_scenario_name in train_data_map:
+    historical_series_train = train_data_map.pop(historical_scenario_name)
+  historical_emissions_train = historical_series_train[0] if historical_series_train else None
+
+  if historical_scenario_name in test_data_map:
+    historical_series_test = test_data_map.pop(historical_scenario_name)
+  historical_emissions_test = historical_series_test[0] if historical_series_test else None
+
+  # 2. Pre-compute features for all scenarios (train and test)
+  features_map_train, features_map_test = {}, {}
+
+  # Populate train features
+  for name, series_data in train_data_map.items():
+    emissions_dict, y, needs_history = series_data
+    hist_to_use = historical_emissions_train if needs_history else None
+    X = make_features_from_scenario(emissions_dict, historical_emissions=hist_to_use, agents=agents, n_lags=n_lags)
+    y_adjusted = np.asarray(y, float)[:X.shape[0]]
+    features_map_train[name] = (X, y_adjusted)
+
+  # Add historical emissions to train features
+  if historical_emissions_train:
+    emissions_dict, y, needs_history = historical_series_train
+    X_hist = make_features_from_scenario(emissions_dict, historical_emissions=None, agents=agents, n_lags=n_lags)
+    y_hist = np.asarray(y, float)[:X_hist.shape[0]]
+    features_map_train[historical_scenario_name] = (X_hist, y_hist)
+
+  # Populate test features
+  for name, series_data in test_data_map.items():
+    emissions_dict, y, needs_history = series_data
+    hist_to_use = historical_emissions_test if needs_history else None
+    X = make_features_from_scenario(emissions_dict, historical_emissions=hist_to_use, agents=agents, n_lags=n_lags)
+    y_adjusted = np.asarray(y, float)[:X.shape[0]]
+    features_map_test[name] = (X, y_adjusted)
+
+  # Add historical emissions to test features
+  if historical_emissions_test:
+    emissions_dict, y, needs_history = historical_series_test
+    X_hist = make_features_from_scenario(emissions_dict, historical_emissions=None, agents=agents, n_lags=n_lags)
+    y_hist = np.asarray(y, float)[:X_hist.shape[0]]
+    features_map_test[historical_scenario_name] = (X_hist, y_hist)
+
+  # 3. Run the main training and evaluation loop
+  error_dict, yhat_dict = {}, {}
+  for group_name, scenario_names_in_group in training_groups.items():
+    all_Xtr, all_ytr = [], []
+    for scenario_name in scenario_names_in_group:
+      if scenario_name in features_map_train:
+        X, y = features_map_train[scenario_name]
+        all_Xtr.append(X)
+        all_ytr.append(y)
+      else:
+        raise ValueError(f'Scenario {scenario_name} for training not found.')
+
+    if not all_Xtr:
+      print(f"Warning: No training data found for group '{group_name}'. Skipping.")
+      continue
+
+    Xtr_combined = np.vstack(all_Xtr)
+    ytr_combined = np.concatenate(all_ytr)
+
+    scaler = StandardScaler()
+    Xtr_scaled = scaler.fit_transform(Xtr_combined)
+
+    # Reshape data for LSTM: [samples, timesteps, features]
+    # Here, we treat each year's feature set as a sequence of length 1.
+    batch_size = 32
+    n_epochs = 100
+    min_training_samples = 750 # Length of input time series from optimal scenario
+    standard_steps_per_epoch = int(np.ceil(min_training_samples / batch_size))
+    total_gradient_steps = n_epochs * standard_steps_per_epoch
+
+    n_features = Xtr_scaled.shape[1]
+    Xtr_reshaped = Xtr_scaled.reshape((Xtr_scaled.shape[0], 1, n_features))
+
+    # Define the LSTM model (includes dropout and weight decay)
+    """
+    model = Sequential([
+      Input(shape=(1, n_features)),
+      LSTM(lstm_size,
+           activation='relu'),
+      Dropout(dropout_rate),
+      Dense(dense_size,
+            activation='relu'),
+      Dropout(dropout_rate),
+      Dense(1)
+    ])
+
+    # Add weight decay (figure out where to add this)
+    model.compile(optimizer=AdamW(weight_decay=l2_penalty), loss='mean_squared_error')
+
+    # Fit the model (no. gradient steps inconsistent between CMIP7 and optimal scenario)
+    # want same number of gradient steps regardless
+
+    train_dataset = tf.data.Dataset.from_tensor_slices((Xtr_reshaped, ytr_combined))
+    train_dataset = train_dataset.shuffle(buffer_size=Xtr_reshaped.shape[0])
+    train_dataset = train_dataset.batch(batch_size)
+    train_dataset = train_dataset.repeat()
+
+    model.fit(train_dataset,
+              epochs=100,
+              batch_size=batch_size,
+              steps_per_epoch=standard_steps_per_epoch,
+              verbose=0)
+    """
+    model = create_stateful_model(
+    batch_size=batch_size,
+    n_features=n_features,
+    lstm_size=lstm_size,
+    dense_size=dense_size,
+    dropout_rate=dropout_rate,
+    l2_penalty=l2_penalty
+  )
+
+    burn_in_length = 100
+    burn_in_dataset, train_dataset, steps_per_epoch_actual = prepare_stateful_data(
+      Xtr_reshaped,
+      ytr_combined,
+      batch_size,
+      burn_in_length
+  )
+
+    steps_per_epoch_actual = max(1, steps_per_epoch_actual)
+    n_epochs_to_run = max(1, total_gradient_steps // steps_per_epoch_actual)
+
+    for _ in range(n_epochs_to_run):
+      for scenario_name in scenario_names_in_group:
+        Xs, ys = features_map_train[scenario_name]
+        Xs_scaled = scaler.transform(Xs)
+        Xs_reshaped = Xs_scaled.reshape((Xs_scaled.shape[0], 1, n_features))
+
+        # Build per-scenario datasets
+        burn_in_ds, train_ds, _ = prepare_stateful_data(
+          Xs_reshaped, ys, batch_size=batch_size, burn_in_length=burn_in_length
+        )
+
+        reset_rnn_states(model)
+        if burn_in_ds is not None:
+          model.predict(burn_in_ds, verbose=0)
+
+        # Train one epoch on this scenario only
+        model.fit(train_ds, epochs=1, verbose=0)
+
+    infer_model = create_stateless_clone(
+      model,
+      n_features=n_features,
+      lstm_size=lstm_size,
+      dense_size=dense_size,
+      dropout_rate=dropout_rate,
+      l2_penalty=l2_penalty
+    )
+
+    error_dict[group_name], yhat_dict[group_name] = {}, {}
+    for test_name in test_scenarios:
+      if test_name in features_map_test:
+        Xte, yte = features_map_test[test_name]
+        if Xte.shape[0] == 0: continue # Skip empty test sets
+
+        Xte_scaled = scaler.transform(Xte)
+        # Reshape test data for LSTM prediction
+        Xte_reshaped = Xte_scaled.reshape((Xte_scaled.shape[0], 1, n_features))
+
+        yhat = infer_model.predict(Xte_reshaped, verbose=0).reshape(-1)
+
+        error_dict[group_name][test_name] = rmse(yte, yhat)
+        yhat_dict[group_name][test_name] = yhat
+
+  return error_dict, yhat_dict
+
+def create_stateful_model(batch_size, n_features, lstm_size, dense_size, dropout_rate, l2_penalty):
+  """
+  Creates a stateful LSTM model.
+  Note the 'batch_input_shape' and 'stateful=True'.
+  """
+  model = Sequential([
+    Input(batch_shape=(batch_size, 1, n_features)),
+
+    LSTM(lstm_size,
+          activation='relu',
+          stateful=True,
+          kernel_regularizer=l2(l2_penalty)),
+
+    Dropout(dropout_rate),
+    Dense(dense_size,
+          activation='relu',
+          kernel_regularizer=l2(l2_penalty)),
+    Dropout(dropout_rate),
+    Dense(1,
+          kernel_regularizer=l2(l2_penalty))
+  ])
+
+  model.compile(optimizer=AdamW(weight_decay=l2_penalty), loss='mean_squared_error')
+  return model
+
+def create_stateless_clone(stateful_model, n_features, lstm_size, dense_size, dropout_rate, l2_penalty):
+  # Build the same architecture but stateful=False and flexible batch size
+  clone = Sequential([
+    Input(shape=(1, n_features)),
+    LSTM(
+      lstm_size,
+      activation='relu',
+      stateful=False,
+      kernel_regularizer=l2(l2_penalty)
+    ),
+    Dropout(dropout_rate),
+    Dense(
+      dense_size,
+      activation='relu',
+      kernel_regularizer=l2(l2_penalty)
+    ),
+    Dropout(dropout_rate),
+    Dense(
+      1,
+      kernel_regularizer=l2(l2_penalty)
+    )
+  ])
+  clone.compile(optimizer=AdamW(learning_rate=1e-3, weight_decay=l2_penalty), loss='mean_squared_error')
+  clone.set_weights(stateful_model.get_weights())
+  return clone
+
+def prepare_stateful_data(Xtr_full, ytr_full, batch_size, burn_in_length):
+  """
+  Prepares data for a stateful model.
+  - No shuffling.
+  - Data is split into burn-in and training.
+  - Ensures all data fits into clean batches.
+  """
+  # 1. Ensure data length is a multiple of batch_size
+  total_samples = len(Xtr_full)
+  total_length = (total_samples // batch_size) * batch_size
+
+  Xtr = Xtr_full[:total_length]
+  ytr = ytr_full[:total_length]
+
+  # 2. Determine burn-in and training split, also aligned to batch_size
+  burn_in_samples = (burn_in_length // batch_size) * batch_size
+
+  # Ensure we have at least one batch for burn-in and one for training
+  if burn_in_samples == 0:
+    print("Warning: burn_in_length is smaller than batch_size. No burn-in will be performed.")
+    burn_in_samples = 0
+
+  train_samples_start = burn_in_samples
+
+  if train_samples_start >= len(Xtr):
+    raise ValueError("Burn-in length is larger than the entire dataset.")
+
+  # 3. Create the final datasets
+  # X_burn needs no labels, as we're just warming up the state.
+  X_burn = Xtr[:train_samples_start]
+
+  X_train = Xtr[train_samples_start:]
+  y_train = ytr[train_samples_start:]
+
+  # 4. Create tf.data.Dataset objects
+  # NO .shuffle(), NO .repeat()
+
+  burn_in_ds = None
+  if burn_in_samples > 0:
+    burn_in_ds = tf.data.Dataset.from_tensor_slices(X_burn)
+    burn_in_ds = burn_in_ds.batch(batch_size) # drop_remainder=True is default for batch()
+                                              # but we already aligned the data.
+
+  train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+  train_ds = train_ds.batch(batch_size)
+
+  steps_per_epoch_actual = len(X_train) // batch_size
+
+  return burn_in_ds, train_ds, steps_per_epoch_actual
+
+def reset_rnn_states(model):
+  for layer in model.layers:
+    if hasattr(layer, "reset_states"):
+      layer.reset_states()
