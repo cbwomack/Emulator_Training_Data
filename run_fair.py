@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple, Optional
 from scipy.fft import rfft, rfftfreq
 
+#from pathlib import Path
+
 # ----------------------------
 # Constants and Configurations
 # ----------------------------
@@ -26,7 +28,7 @@ from scipy.fft import rfft, rfftfreq
 DEFAULT_SCENARIO = 'ssp245'
 #EBM_CONFIG = 'data/FaIR/4xCO2_cummins_ebm3.csv'
 
-FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_calibration_minimal_1.4.1.csv'
+FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_median.csv'
 FAIR_SPECIES_CSV  = 'data/FaIR/species_configs_properties_1.4.1.csv'
 
 VOLCANIC_FORCING = 'data/FaIR/volcanic_ERF_monthly_175001-201912.csv'
@@ -36,6 +38,29 @@ SPECIES = ['CO2','CH4','N2O','Sulfur','BC','Aerosol-radiation interactions','Aer
 #_PROPERTIES = read_properties()[1]
 _PROPERTIES = read_properties(filename=FAIR_SPECIES_CSV)[1]
 #DEFAULT_ESMs = _DF_EBM['model'].unique()
+
+"""
+FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_1.4.1.csv'
+FAIR_PARAMS_MEAN  = 'data/FaIR/calibrated_constrained_parameters_median.csv'
+
+df = pd.read_csv(FAIR_PARAMS_CSV, index_col=0)
+DO_NOT_AVG = {'stochastic_run', 'use_seed', 'seed'}
+drop_cols = [c for c in df.columns if c in DO_NOT_AVG or df[c].dtype == bool]
+df_num = df.drop(columns=drop_cols, errors='ignore')
+
+mean_row = df_num.median(axis=0, numeric_only=True)
+mean_row = mean_row.to_dict()
+mean_row.update({
+    'stochastic_run': False,
+    'use_seed': False,
+    'seed': 0,
+})
+
+df_mean = pd.DataFrame([mean_row], index=['mean'])
+df_mean = df_mean.reindex(columns=df.columns, fill_value=np.nan)
+Path(FAIR_PARAMS_MEAN).parent.mkdir(parents=True, exist_ok=True)
+df_mean.to_csv(FAIR_PARAMS_MEAN)
+"""
 
 """
 def _ebm_config_names(models: Iterable[str]) -> list:
@@ -343,8 +368,8 @@ def get_delT(emis_dict, scenarios, agents, MIP='ScenarioMIP_tier1'):
                 else:
                     start, stop = 1750, 2151
                     ind1, ind2 = 2006 - start, stop - start
-            elif MIP == 'noise':
-                start, stop = 1750, 2500
+            elif MIP == 'Optimal':
+                start, stop = 1750, 2501
                 ind1, ind2 = start - start, stop - start
             else:
                 raise ValueError(f'Error: type {MIP} not recognized.')
@@ -399,13 +424,16 @@ def plot_emissions(emis_dict, agent, experiment_id, MIP='ScenarioMIP_tier1'):
             else:
                 years = np.arange(2006, 2151)
                 ls = '-'
-        elif MIP == 'noise':
-            years = np.arange(1750, 2500)
+        elif MIP == 'Optimal':
+            years = np.arange(1750, 2501)
             ls = '-'
         else:
             raise ValueError(f'Error: type {MIP} not recognized.')
 
-        ax.plot(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
+        if MIP == 'DECK':
+            ax.semilogy(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
+        else:
+            ax.plot(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
 
     units = {'CO2':'Gt',
              'CH4':'Mt',
@@ -417,7 +445,7 @@ def plot_emissions(emis_dict, agent, experiment_id, MIP='ScenarioMIP_tier1'):
     ax.set_xlabel('Year')
     ax.set_ylabel(f'{agent} emissions ({units[agent]})')
     ax.set_title(f'{experiment_id} scenarios')
-    ax.set_xlim([1750,2500])
+    #ax.set_xlim([1750,2500])
     plt.grid(True, alpha=0.3)
 
     return
@@ -449,8 +477,8 @@ def plot_delT(delT_dict, scen_to_plot, experiment_id, MIP='ScenarioMIP'):
             else:
                 years = np.arange(2006, 2151)
                 ls = '-'
-        elif MIP == 'noise':
-            years = np.arange(1750, 2500)
+        elif MIP == 'Optimal':
+            years = np.arange(1750, 2501)
             ls = '-'
         else:
             raise ValueError(f'Error: type {MIP} not recognized.')
@@ -759,7 +787,10 @@ snames_short = ['historical','H-ext','H-ext-OS',
                 'abrupt-4xCO2','abrupt-4xCH4','abrupt-4xN2O',
                 'abrupt-4xSulfur','abrupt-4xBC','1pctCO2',
                 '1pctCH4','1pctN2O','1pctSulfur','1pctBC',
-                'AA','CT','ML-G3','ML-G4','noise']
+                'AA','CT','ML-G3','ML-G4',
+                'opt_constant_tier1','opt_constant_tier2','opt_constant_DECK','opt_constant_all',
+                'opt_ramp_tier1','opt_ramp_tier2','opt_ramp_DECK','opt_ramp_all',
+                'opt_gaussian_tier1','opt_gaussian_tier2','opt_gaussian_DECK','opt_gaussian_all']
 
 colors = {
     snames_short[0]:  '#808080', # historical
@@ -788,5 +819,17 @@ colors = {
     snames_short[23]: '#800000', # CT
     snames_short[24]: '#d3a640', # ML-G3
     snames_short[25]: '#fc7b03', # ML-G4
-    snames_short[26]: '#800000', # noise
+
+    snames_short[26]: '#800000', # opt_const_tier1
+    snames_short[27]: '#ff0000',
+    snames_short[28]: '#fc7b03',
+    snames_short[29]: '#d3a640',
+    snames_short[30]: '#800000', # opt_ramp_tier1
+    snames_short[31]: '#ff0000',
+    snames_short[32]: '#fc7b03',
+    snames_short[33]: '#d3a640',
+    snames_short[34]: '#800000', # opt_gaussian_tier1
+    snames_short[35]: '#ff0000',
+    snames_short[36]: '#fc7b03',
+    snames_short[37]: '#d3a640',
 }

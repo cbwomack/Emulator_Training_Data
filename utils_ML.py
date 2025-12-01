@@ -17,10 +17,13 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Input
 from tensorflow.keras.layers import Dropout
 from tensorflow.keras.regularizers import l2
-from tensorflow.keras.optimizers import AdamW
+from tensorflow.keras.optimizers import AdamW, SGD
 
 import seaborn as sns
 from cmcrameri import cm
+
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 ## Setup plots
 plt.rcParams['figure.figsize'] = [12, 4]
@@ -38,8 +41,10 @@ def plot_yhats_grid(error_dict, yhat_dict, ytrue_dict):
   cols = int(np.ceil(np.sqrt(n_test))); rows = int(np.ceil(n_test / cols))
   fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows), constrained_layout=True, sharex=True, sharey=True)
 
+  axes_flat = np.atleast_1d(axes).flatten()
+
   for i, test in enumerate(test_scenarios):
-    ax = axes[i // cols][i % cols]
+    ax = axes_flat[i]
     for j, train in enumerate(train_scenarios):
       if train == 'noise':
         ls = '--'
@@ -47,18 +52,21 @@ def plot_yhats_grid(error_dict, yhat_dict, ytrue_dict):
         ls = '-'
       ax.plot(yhat_dict[train][test], lw=1, alpha=0.8, ls=ls, label=train, c=cm.batlowKS(j))  # all yhats for this test
     ax.plot(ytrue_dict[test], lw=2, alpha=0.8, label='True', c='k')
-    ax.legend(loc='upper left', fontsize=8)
+    ax.legend(loc='best', fontsize=8, ncols=2)
 
     ax.set_title(f"Test {test}")
     ax.set_ylim([-5,10])
 
-    if i % 4 == 0:
+    row = i // cols
+    col = i % cols
+
+    if col == 0:
       ax.set_ylabel("yhat")
-    if i >= cols * (rows - 1):
+    if row == rows - 1:
       ax.set_xlabel('t')
 
   for k in range(n_test, rows*cols):
-    axes[k // cols][k % cols].axis('off')  # hide empties
+    axes_flat[k].axis('off')  # hide empties
 
   return
 
@@ -165,81 +173,128 @@ def verify(u_signals):
 # ---------------------
 
 def make_features_from_scenario(
-  scenario_emissions,
-  historical_emissions=None,
-  agents=['CO2'],
-  n_lags=10
+    scenario_emissions,
+    historical_emissions=None,
+    agents=['CO2'],
+    ema_windows_years=(5.0, 30.0),
+    dt_years=1.0
 ):
   """
-  Constructs features for an MLP, accounting for a separate historical period.
+  Constructs causal features for an LSTM/MLP using NumPy, replicating the 
+  logic of 'make_features_emissions_generic' (JAX version).
 
-  Features for each agent are:
-  1. Lagged emissions for the past `n_lags` years.
-  2. Cumulative emissions.
+  For each agent, it creates 4 features:
+  1. E_prev: Previous year's emissions.
+  2. EMA_short_prev: Short-term EMA (approx 5y) up to t-1.
+  3. EMA_long_prev: Long-term EMA (approx 30y) up to t-1.
+  4. CumE_prev: Cumulative emissions up to t-1.
 
-  If historical_emissions are provided, the lags and cumulative sums for the
-  scenario are initialized based on the end-state of the historical period.
+  Args:
+      scenario_emissions (dict): Dict of {agent: [values...]} for the future/test period.
+      historical_emissions (dict): Dict of {agent: [values...]} for the history.
+      agents (list): List of agent names to process.
+      ema_windows_years (tuple): (short_window, long_window) for EMA calculation.
+      dt_years (float): Time step size (default 1.0).
+
+  Returns:
+      np.ndarray: Feature matrix of shape (N_scenario_steps, 4 * len(agents)).
   """
   if not agents or not scenario_emissions:
     return np.zeros((0, 0))
 
-  # Determine the length of the time series from the first agent in the current scenario
+  # 1. Determine N (length of the scenario/simulation period)
   try:
     N = len(scenario_emissions[agents[0]])
   except KeyError:
-    raise ValueError(f"Agent '{agents[0]}' not found in the provided scenario emissions.")
+    raise ValueError(f"Agent '{agents[0]}' not found in scenario emissions.")
+
+  # 2. Pre-compute Alpha values for EMA
+  # Formula: alpha = 1 - exp(-dt / window)
+  w_short, w_long = ema_windows_years
+  alpha_short = 1.0 - np.exp(-dt_years / w_short)
+  alpha_long = 1.0 - np.exp(-dt_years / w_long)
 
   all_agent_features = []
 
   for agent in agents:
+    # --- Fetch Data ---
     e_scenario = np.asarray(scenario_emissions.get(agent, []), float).ravel()
     if len(e_scenario) != N:
       raise ValueError(f"Time series for agent '{agent}' has mismatched length.")
 
-    historical_lags = np.zeros(n_lags)
-    historical_cumu_end = 0.0
+    e_hist = np.array([])
+    if historical_emissions and agent in historical_emissions:
+      e_hist = np.asarray(historical_emissions[agent], float).ravel()
 
-    if historical_emissions:
-      if agent in historical_emissions:
-        e_hist = np.asarray(historical_emissions[agent], float).ravel()
-        # Take the last n_lags values for initializing the lags
-        if len(e_hist) >= n_lags:
-          historical_lags = e_hist[-n_lags:]
-        else: # Pad with zeros if history is shorter than n_lags
-          historical_lags = np.pad(e_hist, (n_lags - len(e_hist), 0), 'constant')
-        # Calculate the total cumulative emissions from history
-        historical_cumu_end = np.sum(e_hist)
-      else:
-        print(f"Warning: Agent '{agent}' not found in historical emissions. Using zeros for context.")
+    # --- Concatenate History + Scenario ---
+    # We compute features on the full timeline to ensure continuity of EMAs
+    e_combined = np.concatenate([e_hist, e_scenario])
 
-    # --- 1. Create Lag Features ---
-    # Combine historical lags with the scenario series to correctly create lags for the start of the scenario
-    e_combined = np.concatenate([historical_lags, e_scenario])
-    e_combined = np.concatenate([[0.0], e_combined]) # there's also an off-by-one error
+    # --- Helper: Causal Shift ---
+    # We want features at time 't' to depend only on data up to 't-1'.
+    # Strategy: Compute statistics on the full array, then shift right by 1.
+    # 1. Compute metrics (Cumulative, EMA) on e_combined
+    # 2. Prepend a 0.0 (the state before any data exists)
+    # 3. Slice out the portion corresponding to the scenario start.
 
-    # Build a matrix of lags for the combined series using a sliding window.
-    # The number of rows will be N, corresponding to the scenario length.
-    X_lags = np.zeros((N, n_lags + 1))
-    for i in range(N):
-      # The window for the i-th step of the scenario starts at index i in e_combined
-      window = e_combined[i : i + n_lags + 1]
-      # The values are [e_t, e_{t-1}, ..., e_{t-n_lags}]
-      X_lags[i, :len(window)] = window[::-1]
+    # A. Cumulative Emissions
+    cumu_combined = np.cumsum(e_combined)
 
-    # --- 2. Create Cumulative Emissions Feature ---
-    # Calculate cumulative sum for the current scenario and add the historical total
-    cumu_scenario = np.cumsum(e_scenario)
-    cumu_final = cumu_scenario + historical_cumu_end
-    cumu_final = np.roll(cumu_final, 1)
-    cumu_final[0] = historical_cumu_end
+    # B. Exponential Moving Averages (EMAs)
+    ema_short_combined = _numpy_ema(e_combined, alpha_short)
+    ema_long_combined = _numpy_ema(e_combined, alpha_long)
 
-    # --- 3. Combine and Store Features for the Agent ---
-    agent_feature_block = np.column_stack([X_lags, cumu_final])
-    all_agent_features.append(agent_feature_block)
+    # --- Align Features (Shift by 1 for causality) ---
+    # Create the "Previous" arrays by prepending 0 and dropping the last element.
+    # If e_combined is [e0, e1, e2], prev is [0, e0, e1].
 
-  # Horizontally stack the feature blocks from all agents
+    # 1. Previous Emissions
+    e_prev_full = np.concatenate(([0.0], e_combined[:-1]))
+
+    # 2. Previous Cumulative
+    cumu_prev_full = np.concatenate(([0.0], cumu_combined[:-1]))
+
+    # 3. Previous EMAs
+    ema_short_prev_full = np.concatenate(([0.0], ema_short_combined[:-1]))
+    ema_long_prev_full = np.concatenate(([0.0], ema_long_combined[:-1]))
+
+    # --- Slice to Scenario Period ---
+    # The scenario starts after len(e_hist) samples.
+    start_idx = len(e_hist)
+
+    # Slice the relevant rows corresponding to the scenario timesteps
+    agent_feats = np.column_stack([
+        e_prev_full[start_idx : start_idx + N],          # Feature 1: Lag 1
+        ema_short_prev_full[start_idx : start_idx + N],  # Feature 2: EMA Short
+        ema_long_prev_full[start_idx : start_idx + N],   # Feature 3: EMA Long
+        cumu_prev_full[start_idx : start_idx + N]        # Feature 4: Cumulative
+    ])
+
+    all_agent_features.append(agent_feats)
+
+  # Stack all agents horizontally
   final_features = np.column_stack(all_agent_features)
   return final_features
+
+def _numpy_ema(x, alpha):
+  """
+  Calculates the Exponential Moving Average (EMA) using a pure Python loop.
+  Matches JAX logic: y_t = (1-alpha)*y_{t-1} + alpha*x_t.
+  Initialization: y[0] = alpha * x[0].
+  """
+  y = np.zeros_like(x)
+  if len(x) == 0:
+    return y
+
+  curr = alpha * x[0]
+  y[0] = curr
+
+  # Simple loop (performant enough for typical climate time series lengths)
+  for i in range(1, len(x)):
+    curr = (1.0 - alpha) * curr + alpha * x[i]
+    y[i] = curr
+
+  return y
 
 def evaluate_trainsets_vs_tests_with_history(
   train_scenarios,
@@ -248,7 +303,6 @@ def evaluate_trainsets_vs_tests_with_history(
   test_series,
   agents=['CO2'],
   training_groups=None,
-  n_lags=10,
   random_state=0,
   historical_scenario_name='historical'
 ):
@@ -284,7 +338,6 @@ def evaluate_trainsets_vs_tests_with_history(
       emissions_dict,
       historical_emissions=hist_to_use,
       agents=agents,
-      n_lags=n_lags
     )
     y_adjusted = np.asarray(y, float)[:X.shape[0]]
     features_map_train[name] = (X, y_adjusted)
@@ -296,7 +349,6 @@ def evaluate_trainsets_vs_tests_with_history(
       emissions_dict,
       historical_emissions=None,  # History has no preceding data
       agents=agents,
-      n_lags=n_lags
     )
     y_hist = np.asarray(y, float)[:X_hist.shape[0]]
     features_map_train[historical_scenario_name] = (X_hist, y_hist)
@@ -310,7 +362,6 @@ def evaluate_trainsets_vs_tests_with_history(
       emissions_dict,
       historical_emissions=hist_to_use,
       agents=agents,
-      n_lags=n_lags
     )
     y_adjusted = np.asarray(y, float)[:X.shape[0]]
     features_map_test[name] = (X, y_adjusted)
@@ -322,7 +373,6 @@ def evaluate_trainsets_vs_tests_with_history(
       emissions_dict,
       historical_emissions=None,  # History has no preceding data
       agents=agents,
-      n_lags=n_lags
     )
     y_hist = np.asarray(y, float)[:X_hist.shape[0]]
     features_map_test[historical_scenario_name] = (X_hist, y_hist)
@@ -369,7 +419,6 @@ def evaluate_LSTM(
   test_series,
   agents=['CO2'],
   training_groups=None,
-  n_lags=0,
   random_state=0,
   historical_scenario_name='historical',
   lstm_size=16,
@@ -408,14 +457,14 @@ def evaluate_LSTM(
   for name, series_data in train_data_map.items():
     emissions_dict, y, needs_history = series_data
     hist_to_use = historical_emissions_train if needs_history else None
-    X = make_features_from_scenario(emissions_dict, historical_emissions=hist_to_use, agents=agents, n_lags=n_lags)
+    X = make_features_from_scenario(emissions_dict, historical_emissions=hist_to_use, agents=agents)
     y_adjusted = np.asarray(y, float)[:X.shape[0]]
     features_map_train[name] = (X, y_adjusted)
 
   # Add historical emissions to train features
   if historical_emissions_train:
     emissions_dict, y, needs_history = historical_series_train
-    X_hist = make_features_from_scenario(emissions_dict, historical_emissions=None, agents=agents, n_lags=n_lags)
+    X_hist = make_features_from_scenario(emissions_dict, historical_emissions=None, agents=agents)
     y_hist = np.asarray(y, float)[:X_hist.shape[0]]
     features_map_train[historical_scenario_name] = (X_hist, y_hist)
 
@@ -423,14 +472,14 @@ def evaluate_LSTM(
   for name, series_data in test_data_map.items():
     emissions_dict, y, needs_history = series_data
     hist_to_use = historical_emissions_test if needs_history else None
-    X = make_features_from_scenario(emissions_dict, historical_emissions=hist_to_use, agents=agents, n_lags=n_lags)
+    X = make_features_from_scenario(emissions_dict, historical_emissions=hist_to_use, agents=agents)
     y_adjusted = np.asarray(y, float)[:X.shape[0]]
     features_map_test[name] = (X, y_adjusted)
 
   # Add historical emissions to test features
   if historical_emissions_test:
     emissions_dict, y, needs_history = historical_series_test
-    X_hist = make_features_from_scenario(emissions_dict, historical_emissions=None, agents=agents, n_lags=n_lags)
+    X_hist = make_features_from_scenario(emissions_dict, historical_emissions=None, agents=agents)
     y_hist = np.asarray(y, float)[:X_hist.shape[0]]
     features_map_test[historical_scenario_name] = (X_hist, y_hist)
 
@@ -458,14 +507,20 @@ def evaluate_LSTM(
 
     # Reshape data for LSTM: [samples, timesteps, features]
     # Here, we treat each year's feature set as a sequence of length 1.
-    batch_size = 32
-    min_training_samples = 750 # Length of input time series from optimal scenario
-    standard_steps_per_epoch = int(np.ceil(min_training_samples / batch_size))
-
+    #batch_size = 32
+    batch_size = Xtr_scaled.shape[0]
     n_features = Xtr_scaled.shape[1]
     Xtr_reshaped = Xtr_scaled.reshape((Xtr_scaled.shape[0], 1, n_features))
 
     # Define the LSTM model (includes dropout and weight decay)
+    model = Sequential([
+      Input(shape=(1, n_features)),
+      LSTM(lstm_size,
+           kernel_regularizer=l2(l2_penalty)),
+      Dense(1,
+            kernel_regularizer=l2(l2_penalty))
+    ])
+    """
     model = Sequential([
       Input(shape=(1, n_features)),
       LSTM(lstm_size,
@@ -477,24 +532,49 @@ def evaluate_LSTM(
       Dropout(dropout_rate),
       Dense(1,
             kernel_regularizer=l2(l2_penalty))
-    ])
+    ])"""
 
-    # Add weight decay (figure out where to add this)
-    model.compile(optimizer=AdamW(weight_decay=l2_penalty), loss='mean_squared_error')
+    X_tensor = tf.convert_to_tensor(Xtr_reshaped, dtype=tf.float32)
+    y_tensor = tf.convert_to_tensor(ytr_combined, dtype=tf.float32)
+    opt = SGD(learning_rate=5e-2)
 
-    # Fit the model (no. gradient steps inconsistent between CMIP7 and optimal scenario)
-    # want same number of gradient steps regardless
+    @tf.function(jit_compile=True)
+    def train_loop(X, y, steps):
+      for i in tf.range(steps):
+        with tf.GradientTape() as tape:
+          y_pred = model(X, training=True)
+          loss = tf.reduce_mean(tf.square(y - y_pred))
+          if model.losses:
+            loss += tf.add_n(model.losses)
+
+        grads = tape.gradient(loss, model.trainable_variables)
+        opt.apply_gradients(zip(grads, model.trainable_variables))
+      return loss
+
+    train_loop(X_tensor, y_tensor, steps=400)
+
+    #model.compile(optimizer=AdamW(weight_decay=l2_penalty), loss='mean_squared_error')
+    #model.compile(optimizer=SGD(learning_rate=5e-2), loss='mean_squared_error')
+    """
+    total_gradient_steps = 400
+    training_epochs = 100
+    steps_per_epoch = total_gradient_steps // training_epochs
 
     train_dataset = tf.data.Dataset.from_tensor_slices((Xtr_reshaped, ytr_combined))
     train_dataset = train_dataset.shuffle(buffer_size=Xtr_reshaped.shape[0])
     train_dataset = train_dataset.batch(batch_size)
     train_dataset = train_dataset.repeat()
 
+    training_epochs = 400
+
     model.fit(train_dataset,
-              epochs=100,
+              epochs=training_epochs,
               batch_size=batch_size,
-              steps_per_epoch=standard_steps_per_epoch,
+              #steps_per_epoch=steps_per_epoch,
+              shuffle=False,
               verbose=0)
+
+    """
 
     error_dict[group_name], yhat_dict[group_name] = {}, {}
     for test_name in test_scenarios:
