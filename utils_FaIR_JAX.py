@@ -1,9 +1,12 @@
 # -------
 # Imports
 # -------
+from distutils.command.build import build
 import matplotlib.pyplot as plt
 import run_fair
 import pickle
+
+import numpy as np
 
 # JAX
 import jax
@@ -310,7 +313,13 @@ def simulate_temp(
   if params is None:
     params = DEFAULT_PARAMS
 
-  years  = jnp.asarray(years, dtype=jnp.float32)
+  years_np  = np.asarray(years, dtype=jnp.float32)
+  start = years_np[0]
+  end   = years_np[-1]
+  # Fine time grid
+  nsteps = int(np.floor((end - start) / dt) + 1)
+  tvec = start + jnp.arange(nsteps + 1, dtype=jnp.float32) * dt  # inclusive end
+
   emissions_by_agent = jnp.asarray(emissions_by_agent, dtype=jnp.float32)
 
   if emissions_by_agent.ndim != 2:
@@ -319,12 +328,6 @@ def simulate_temp(
   n_agents, T_em = emissions_by_agent.shape
   if T_em != years.shape[0]:
     raise ValueError("Time dimension of emissions must match `years` length")
-
-  # Fine time grid
-  start = years[0]
-  end   = years[-1]
-  nsteps = jnp.int32(jnp.floor((end - start) / dt) + 1)
-  tvec = start + jnp.arange(nsteps + 1, dtype=jnp.float32) * dt  # inclusive end
 
   # Initial states
   cpool0  = jnp.zeros((4,), dtype=jnp.float32) # carbon pool (ppm)
@@ -605,7 +608,7 @@ def generate_calib_data(agents):
 
   return emis_dict_calib_FaIR, emis_dict_calib_JAX, delT_dict_calib_FaIR, delT_dict_calib_JAX
 
-def generate_JAX_data(agents):
+def generate_JAX_data(agents, CS3=False, DAMIP=False, GeoMIP=False):
 
   emis_dict_tier1_FaIR, emis_dict_tier2_FaIR = run_fair.load_scenarioMIP_CMIP7(agents)
   emis_dict_DECK_FaIR = run_fair.load_DECK_CMIP7(agents)
@@ -628,7 +631,34 @@ def generate_JAX_data(agents):
   emis_dict_JAX = get_emissions(emis_dict_DECK_subset, agents)
   emis_dict_DECK_JAX = build_emissions_by_agent(emis_dict_JAX)
 
-  return emis_dict_tier1_JAX, emis_dict_tier2_JAX, emis_dict_DECK_JAX
+  emis_dicts = [emis_dict_tier1_JAX, emis_dict_tier2_JAX, emis_dict_DECK_JAX]
+
+  if CS3:
+    emis_dict_JAX = run_fair.load_CS3(agents=agents, emis_dict_tier1=emis_dict_DECK_FaIR)
+
+    for scen in emis_dict_JAX:
+        for a in emis_dict_JAX[scen]:
+            if a not in agents:
+                emis_dict_JAX[scen][a] = emis_dict_JAX[scen][a] * 0
+
+    emis_dict_CS3_JAX = build_emissions_by_agent(emis_dict_JAX)
+    emis_dicts.append(emis_dict_CS3_JAX)
+
+  if DAMIP:
+    M_GHG = jnp.concat([emis_dict_tier1_FaIR['historical'], emis_dict_tier1_FaIR['M']], axis=1)
+    M_GHG[3:, :] = 0
+    M_AER = jnp.concat([emis_dict_tier1_FaIR['historical'], emis_dict_tier1_FaIR['M']], axis=1)
+    M_AER[0:3, :] = 0
+    emis_dict_DAMIP = {'M_GHG':M_GHG, 'M_AER':M_AER}
+    emis_dicts.append(emis_dict_DAMIP)
+
+  if GeoMIP:
+    path_Geo = 'data/GeoMIP/emis_G6sulfur.pickle'
+    with open(path_Geo, "rb") as f:
+        emis_dict_Geo = pickle.load(f)
+    emis_dicts.append(emis_dict_Geo)
+
+  return emis_dicts
 
 # ----------------------------------
 # Calibrate model parameters to FaIR
@@ -874,3 +904,74 @@ def calibrate_inverse(filepath, emis_dict_JAX, delT_dict_FaIR, theta0, dt, n_ste
   theta_opt = theta
   print("Final loss_avg:", float(loss_value))
   return params_from_theta(theta_opt), loss_value
+
+
+def solve_sulfur_inverse(
+    emissions_H_jax,    # (5, T) array: Full emissions for Scenario H
+    target_temp_M,      # (T,) array: Target GMST from Scenario M
+    years,              # (T,) array: Year coordinates
+    params=DEFAULT_PARAMS,
+    learning_rate=0.1,
+    n_steps=2000,
+    reg_weight=0.1      # Regularization weight to prevent jagged emissions
+):
+    """
+    Solves for sulfur emissions that force the model to match target_temp_M,
+    given background emissions from Scenario H.
+    """
+
+    # 1. Initialization
+    # We start with the Sulfur emissions from H as our initial guess.
+    # We want to optimize only the sulfur row (index 3).
+    sulfur_initial_guess = emissions_H_jax[idx_Sulfur]
+
+    # We define the optimizer
+    optimizer = optax.adam(learning_rate=learning_rate)
+    opt_state = optimizer.init(sulfur_initial_guess)
+
+    # 2. Define the Loss Function
+    def inverse_loss_fn(sulfur_profile):
+        # Construct the full emissions matrix
+        # Take H emissions, but swap out the Sulfur row with our optimization variable
+        emissions_current = emissions_H_jax.at[idx_Sulfur].set(sulfur_profile)
+
+        # Run the forward model
+        res = simulate_temp(years, emissions_current, params=params)
+        T_pred = res["GMST"]
+
+        # A. Primary Loss: Mean Squared Error on Temperature
+        mse_loss = jnp.mean((T_pred - target_temp_M)**2)
+
+        # B. Regularization (Crucial for inverse problems)
+        # Without this, the solver might produce physically unrealistic,
+        # highly oscillating emissions to fit numerical noise.
+        # We penalize large changes in emissions (first-order difference).
+        diff = jnp.diff(sulfur_profile)
+        smoothness_penalty = jnp.mean(diff**2)
+
+        return mse_loss + (reg_weight * smoothness_penalty)
+
+    # 3. Optimization Loop
+    @jax.jit
+    def step(sulfur_params, opt_state):
+        loss, grads = jax.value_and_grad(inverse_loss_fn)(sulfur_params)
+        updates, opt_state = optimizer.update(grads, opt_state, sulfur_params)
+        new_sulfur = optax.apply_updates(sulfur_params, updates)
+        return new_sulfur, opt_state, loss
+
+    current_sulfur = sulfur_initial_guess
+
+    print(f"Starting Inverse Solve (Target: M Temp, Background: H Emis)...")
+    for i in range(n_steps):
+        current_sulfur, opt_state, loss_val = step(current_sulfur, opt_state)
+
+        if i % 200 == 0:
+            print(f"Step {i}: Loss = {loss_val:.6f}")
+
+    print(f"Final Loss: {loss_val:.6f}")
+
+    final_emissions = emissions_H_jax.at[idx_Sulfur].set(current_sulfur)
+    final_res = simulate_temp(years, final_emissions, params=params)
+    final_T_pred = final_res["GMST"]
+
+    return current_sulfur, final_T_pred

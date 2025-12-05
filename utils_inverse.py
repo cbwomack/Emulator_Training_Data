@@ -455,6 +455,7 @@ def mse(pred, y):
     pred = pred.astype(y.dtype)
     return jnp.mean((pred - y)**2)
 
+"""
 def train_unrolled_lstm(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
     # Ensure feature/target dtypes match params
     pdt = params0["W"].dtype
@@ -476,7 +477,7 @@ def train_unrolled_lstm(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
 
     (paramsK, opt_stateK), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
     return paramsK, losses
-
+"""
 _tree_map    = _jtree.map
 def train_unrolled_lstm_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
     pdt = params0["W"].dtype
@@ -489,38 +490,41 @@ def train_unrolled_lstm_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2
     )
     opt_state = optimizer.init(params0)
 
-    def step(carry, i):
+    def step(carry, _):
         params, opt_state = carry
+
         def loss_fn(p):
             yhat = lstm_forward(p, Xtr)
             return jnp.mean((yhat - ytr)**2)
+
         loss, grads = jax.value_and_grad(loss_fn)(params)
         grads = _tree_map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=1e6, neginf=-1e6), grads)
         updates, opt_state = optimizer.update(grads, opt_state, params=params)
         params = optax.apply_updates(params, updates)
+
         return (params, opt_state), loss
 
-    (paramsK, opt_stateK), losses = jax.lax.scan(step, (params0, opt_state), xs=jnp.arange(K), length=K)
+    (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=jnp.arange(K), length=K)
     return paramsK, losses
 
 def eval_on_tests_lstm(params, test_scaled_list):
     if not test_scaled_list:
         return jnp.array(0.0, dtype=jnp.float32)
+
     errs = [mse(lstm_forward(params, X), y) for (X, y, _) in test_scaled_list]
+
     return jnp.mean(jnp.stack(errs))
 
 def plot_lstm_predictions(params, Xs, y, metric="RMSE", title_prefix="LSTM fit"):
     yhat = lstm_forward(params, Xs)
     loss_val = float(jnp.sqrt(jnp.mean((yhat - y)**2))) if metric.upper()=="RMSE" else float(jnp.mean((yhat - y)**2))
 
-    import numpy as np, matplotlib.pyplot as plt
     plt.figure(figsize=(8,3))
     plt.plot(np.asarray(y),    label="truth", alpha=0.8)
     plt.plot(np.asarray(yhat), label="pred",  alpha=0.8)
     plt.legend(); plt.xlabel("time step"); plt.ylabel("target")
     plt.title(f"{title_prefix} - {metric.upper()}: {loss_val:.4f}")
     plt.tight_layout(); plt.show()
-
 
 def freeze_inactive_agents(emis_dict, active=("CO2",), agents=AGENTS_DEFAULT):
     out = {}
@@ -905,9 +909,9 @@ def avg_scaled_rmse_over_tests(params, test_list, eps: float = 1e-8):
 def make_inverse_objective_single_train(
     params0,
     test_dataset_all,
-    K_inner=50,
-    lr_inner=5e-4,
-    wd_inner=1e-4,
+    K_inner=400,
+    lr_inner=5e-2,
+    wd_inner=1e-2,
     agents=AGENTS_DEFAULT,
     active_agents=("CO2",),
     inactive_mode="zeros",
@@ -962,6 +966,7 @@ def save_inverse_ckpt(path, state):
         "U_traj": [_tree_to_numpy(u) for u in state["U_traj"]],
         "errors": np.asarray(state["errors"]),
         "opt_state": _tree_to_numpy(state["opt_state"]),
+        "paramsK_k": _tree_to_numpy(state['paramsK_k']),
         "step_count": int(state["step_count"]),
         "time_weights": _tree_to_numpy(state.get("time_weights", None)),
         "meta": state.get("meta", {}),
@@ -1220,6 +1225,7 @@ def optimize_emissions_inverse(
                 "opt_state": opt_state,
                 "step_count": updates_done,
                 "time_weights": time_weights,
+                "paramsK_k": _tree_to_numpy(paramsK_k),
                 "meta": dict(
                     step_size=step_size, momentum=momentum, nesterov=nesterov,
                     K_inner=K_inner, lr_inner=lr_inner, wd_inner=wd_inner, T=T,
@@ -1233,6 +1239,9 @@ def optimize_emissions_inverse(
             }
             save_inverse_ckpt(checkpoint_path, state)
 
+    if remaining == 0:
+        paramsK_k = 0
+
     # final snapshot
     if checkpoint_path:
         state = {
@@ -1241,6 +1250,7 @@ def optimize_emissions_inverse(
             "opt_state": opt_state,
             "step_count": updates_done,
             "time_weights": time_weights,
+            "paramsK_k": _tree_to_numpy(paramsK_k),
             "meta": dict(
                 step_size=step_size, momentum=momentum, nesterov=nesterov,
                 K_inner=K_inner, lr_inner=lr_inner, wd_inner=wd_inner, T=T,
@@ -1258,6 +1268,7 @@ def optimize_emissions_inverse(
         "U_traj": U_traj,                              # list of {agent: (T,)}
         "errors": jnp.asarray(errors, jnp.float32),    # avg RMSE per update (includes initial)
         "updates_done": updates_done,
+        "paramsK_k": _tree_to_numpy(paramsK_k),
         "checkpoint_path": checkpoint_path,
         "preds_traj": preds_traj,                      # host predictions by scenario per snapshot
         "train_temp_traj": train_temp_traj,            # host training temperatures per snapshot
@@ -1662,3 +1673,95 @@ def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AG
       print(f"||grad {key}||:", float(jnp.linalg.norm(g[key])))
 
   return
+
+def evaluate_optimal_emulator(
+    training_paths: list[str],
+    test_sets: dict,
+    params0: dict=None,
+    agents=AGENTS_DEFAULT,
+    active_agents=None,
+    inactive_mode="zeros",
+    historical_name="historical",
+    key=jax.random.PRNGKey(0),
+    hidden=32,
+    K=400,
+    lr=5e-2,
+    weight_decay=1e-2,
+):
+    """
+    Loads optimized emissions, converts them to a stacked array, trains a new emulator,
+    and evaluates against test sets.
+    """
+    results_out = {}
+
+    # Ensure active_agents is iterable; default to all if None
+    if active_agents is None:
+        active_agents = tuple(agents)
+
+    for path in training_paths:
+        # 1) Load dataset
+        with open(path, "rb") as f:
+            raw = pickle.load(f)
+
+        # Extract final optimized emissions (dict)
+        U_traj = [_tree_to_jnp(u) for u in raw["U_traj"]]
+        U_final_dict = U_traj[-1]
+
+        # 2) Mask inactive agents (returns dict)
+        U_eff_dict = _apply_active_mask_to_emis(U_final_dict, active_agents, inactive_mode)
+
+        # 3) Stack into array (N_agents, T) for build_train
+        #    Use the first agent's length to determine T
+        T = U_eff_dict[agents[0]].shape[0]
+        U_eff_array = _stack_emissions(agents, U_eff_dict, T)
+
+        # 4) Build training data using the stacked array
+        train_updated = build_train(
+            U_eff_array,
+            agents=agents,
+            ema_windows_years=(5.0, 30.0),
+            dtype=jnp.float32,
+            years_hist=None,
+            emis_hist_dict=None,
+        )
+
+        # Scale stats on updated train
+        train_s, _, stats = split_and_scale(train_updated, [])
+
+        # Flatten training tensors
+        Xtr = jnp.concatenate([X for (X, _, _) in train_s], axis=0).astype(jnp.float32)
+        ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
+
+        # 5) Inner Training
+        k1, k2 = jax.random.split(key)
+        in_dim = int(Xtr.shape[1])
+        #params0 = init_lstm_params(key, in_dim=in_dim, hidden=hidden, out_dim=1)
+
+        paramsK, _ = train_unrolled_lstm_sgd(
+            params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay
+        )
+
+        #paramsK = _tree_to_jnp(raw["paramsK_k"])
+
+        # 6) Evaluate on all test sets
+        path_res = {"params": paramsK, "stats": stats, "metrics": {}}
+
+        for test_name, emis_dict_test in test_sets.items():
+            test_raw = build_dataset_from_runfair_dict(
+                emis_dict_test, historical_name=historical_name
+            )
+            test_s_scaled = _apply_stats_to_test(test_raw, stats)
+
+            scen_errors = {}
+            for (Xte, yte, scen_name) in test_s_scaled:
+                yhat = lstm_forward(paramsK, Xte)
+                rmse = float(_scaled_rmse(jnp.asarray(yhat), jnp.asarray(yte)))
+                scen_errors[scen_name] = rmse
+
+            mean_err = np.mean(list(scen_errors.values())) if scen_errors else float("nan")
+            path_res["metrics"][test_name] = scen_errors
+            path_res["metrics"][test_name]['mean'] = float(mean_err)
+
+        results_out[path] = path_res
+
+    return results_out
