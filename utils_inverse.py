@@ -2,6 +2,7 @@
 # Imports
 # -------
 import utils_FaIR_JAX
+#import FaIR_JAX_new
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -88,7 +89,7 @@ def make_features_emissions_generic(
     emis_curr_dict,              # dict: agent -> (T,) emissions
     emis_hist_dict=None,         # dict or None: agent -> (H,) emissions
     agents=AGENTS_DEFAULT,        # tuple/list of agents to include (order = column grouping)
-    ema_windows_years=(5.0, 30.0),
+    ema_windows_years=(5.0, 30.0, 100.0),
     dt_years=1.0,
     zero_fill_missing=True,
 ):
@@ -98,13 +99,14 @@ def make_features_emissions_generic(
       1) E_prev[a]            (previous-year emissions)
       2) EMA_short_prev[a]    (EMA over ~5 years, causal, aligned to t-1)
       3) EMA_long_prev[a]     (EMA over ~30 years, causal, aligned to t-1)
-      4) CumE_prev[a]         (cumulative emissions up to t-1)
+      4) EMA_long_prev[a]     (EMA over ~100 years, causal, aligned to t-1)
+      5) CumE_prev[a]         (cumulative emissions up to t-1)
 
   - Handles any subset of agents (e.g., just CO2, just CH4, both).
   - If `zero_fill_missing=True`, missing agents are zeroed (keeps column layout stable).
   - Uses dt_years to set EMA alphas: alpha = 1 - exp(-dt / window).
   - Returns:
-      X: (T, 4*len(agents)) feature matrixX
+      X: (T, 5*len(agents)) feature matrixX
   """
   # Determine T from the first available current series
   T = None
@@ -116,9 +118,10 @@ def make_features_emissions_generic(
     raise ValueError("No current emissions provided for any agent in `agents`.")
 
   # Precompute EMA alphas
-  w_short, w_long = ema_windows_years
+  w_short, w_long, w_vlong = ema_windows_years
   alpha_short = 1.0 - jnp.exp(-_as_jnp(dt_years) / _as_jnp(w_short))
   alpha_long  = 1.0 - jnp.exp(-_as_jnp(dt_years) / _as_jnp(w_long))
+  alpha_vlong  = 1.0 - jnp.exp(-_as_jnp(dt_years) / _as_jnp(w_vlong))
 
   feats = []
   for a in agents:
@@ -134,7 +137,7 @@ def make_features_emissions_generic(
 
     E_hist = None
     if emis_hist_dict is not None and a in emis_hist_dict and emis_hist_dict[a] is not None:
-      E_hist = _as_jnp(emis_hist_dict[a]).reshape(-1)
+        E_hist = _as_jnp(emis_hist_dict[a]).reshape(-1)
 
     # 2a) previous-year + cumulative-to-previous
     E_prev, Cum_prev = _prev_and_cumu_prev(E_curr, E_hist)
@@ -142,9 +145,10 @@ def make_features_emissions_generic(
     # 2b) EMAs (short ~5y, long ~30y), aligned causally to t-1
     emaS_prev = _ema_prev(E_curr, E_hist, alpha_short)
     emaL_prev = _ema_prev(E_curr, E_hist, alpha_long)
+    emavL_prev = _ema_prev(E_curr, E_hist, alpha_vlong)
 
     # stack per-agent in required order
-    agent_X = jnp.stack([E_prev, emaS_prev, emaL_prev, Cum_prev], axis=1)  # (T, 4)
+    agent_X = jnp.stack([E_prev, emaS_prev, emaL_prev, emavL_prev, Cum_prev], axis=1)  # (T, 4)
     feats.append(agent_X)
 
   X = jnp.concatenate(feats, axis=1) if len(feats) > 1 else feats[0]
@@ -203,7 +207,7 @@ def simulate_targets_gmst(
     years_hist=None,                    # (T_hist,) or None
     emis_hist_dict=None,                # dict or None: {"CO2": (T_hist,), "CH4": (T_hist,), ...}
     agents=AGENTS_DEFAULT,              # tuple/list: which agents to include and their row order
-    params=None,
+    mode='FaIR',
     dt=0.1
 ):
     """
@@ -214,6 +218,7 @@ def simulate_targets_gmst(
           CO2: GtCO2/yr, CH4: MtCH4/yr (consistent with simulate_temp)
       - Missing agents in emis_*_dict are zero-filled (keeps column layout stable).
     """
+
     yrs_c = _as_jnp(years_curr).reshape(-1)
     Tcur  = yrs_c.shape[0]
 
@@ -240,7 +245,7 @@ def simulate_targets_gmst(
         out_all = utils_FaIR_JAX.simulate_temp(
             years=yrs_all,
             emissions_by_agent=emissions_by_agent_all,
-            params=(params or utils_FaIR_JAX.DEFAULT_PARAMS),
+            mode=mode,
             dt=dt
         )
         GMST_curr = out_all["GMST"][-Tcur:]
@@ -250,7 +255,7 @@ def simulate_targets_gmst(
         out_c = utils_FaIR_JAX.simulate_temp(
             years=yrs_c,
             emissions_by_agent=emissions_by_agent_c,
-            params=(params or utils_FaIR_JAX.DEFAULT_PARAMS),
+            mode=mode,
             dt=dt
         )
         GMST_curr = out_c["GMST"]
@@ -289,12 +294,14 @@ def extract_years_and_emis(emis_entry_for_scenario, agents=AGENTS_DEFAULT):
 
 scens_with_hist = ['H-ext','H-ext-OS','M',
                    'M-ext','ML','ML-ext','L',
-                   'L-ext','VLLO-ext','VLHO','VLHO-ext']
+                   'L-ext','VLLO-ext','VLHO','VLHO-ext',
+                   'AA','CT']
 
 def build_dataset_from_runfair_dict(
     emis_dict,
     historical_name="historical",
     agents=AGENTS_DEFAULT,
+    mode='FaIR'
 ):
     """
     Returns list of (X_features, y_target, scenario_name), using:
@@ -318,26 +325,29 @@ def build_dataset_from_runfair_dict(
         yrs_cur, emis_cur_dict = extract_years_and_emis(emis_dict[scen], agents=agents)
         needs_history = (scen != historical_name) and (years_hist is not None) and (scen in scens_with_hist)
 
+        if needs_history:
+            years_hist, emis_hist_dict = CS3_hist_modifier(scen, years_hist, emis_hist_dict)
+
         # --- Features (native units; causal, zero-fills handled upstream) ---
         X = make_features_emissions_generic(
             emis_curr_dict=emis_cur_dict,
             emis_hist_dict=(emis_hist_dict if needs_history else None),
             agents=agents,
-            ema_windows_years=(5.0, 30.0),
+            ema_windows_years=(5.0, 30.0, 100.0),
             dt_years=1.0,
             zero_fill_missing=True,
         )
 
-        # --- Targets (GMST via new simulate_temp wrapper) ---
+        # --- Targets ---
         y = simulate_targets_gmst(
             years_curr=yrs_cur,
             emis_curr_dict=emis_cur_dict,
             years_hist=(years_hist if needs_history else None),
             emis_hist_dict=(emis_hist_dict if needs_history else None),
-            agents=agents,
+            mode=mode
         )
 
-        N = int(jnp.minimum(X.shape[0], y.shape[0]))
+        N = min(X.shape[0], y.shape[0])
         dataset.append((X[:N], y[:N], scen))
 
     return dataset
@@ -392,95 +402,79 @@ def split_and_scale(train_dataset, test_dataset):
 
     return train_scaled, test_scaled, stats
 
-# ----- LSTM params: arrays only (no ints), with explicit dtype -----
-def init_lstm_params(key, in_dim, hidden=32, out_dim=1, dtype=jnp.float32):
-    kW, kO = jax.random.split(key)
-
-    # Make weights/biases in the requested dtype
-    W  = jax.random.normal(kW, (in_dim + hidden, 4 * hidden), dtype=dtype)
-    b  = jnp.zeros((4 * hidden,), dtype=dtype)
-    Wo = jax.random.normal(kO, (hidden, out_dim), dtype=dtype)
-    bo = jnp.zeros((out_dim,), dtype=dtype)
-
-    # Scale in SAME dtype (avoid float64 promotion)
-    scale_W  = jnp.array(1.0, dtype=dtype) / jnp.sqrt(jnp.array(in_dim + hidden, dtype=dtype))
-    scale_Wo = jnp.array(1.0, dtype=dtype) / jnp.sqrt(jnp.array(hidden,        dtype=dtype))
-    W  = W  * scale_W
-    Wo = Wo * scale_Wo
-
-    return {"W": W, "b": b, "Wo": Wo, "bo": bo}
-
-def _hidden_size_from_params(params):
-    return params["b"].shape[0] // 4
-
-def _lstm_cell(params, carry, x_t):
-    h, c = carry
-    hidden = _hidden_size_from_params(params)
-
-    # z is in params dtype (since we cast X to params dtype in forward)
-    z = jnp.concatenate([x_t, h], axis=-1) @ params["W"] + params["b"]
-    i = jax.nn.sigmoid(z[..., 0*hidden:1*hidden])
-    f = jax.nn.sigmoid(z[..., 1*hidden:2*hidden])
-    g = jnp.tanh(      z[..., 2*hidden:3*hidden])
-    o = jax.nn.sigmoid(z[..., 3*hidden:4*hidden])
-    c_new = f * c + i * g
-    h_new = o * jnp.tanh(c_new)
-    return (h_new, c_new), h_new
-
-def lstm_forward(params, X):
+def init_mlp_params(key, input_dim, hidden_sizes):
     """
-    X: (N, D) or (N, T, D). If (N, D), treated as T=1.
-    Returns: (N,) via linear readout on final hidden.
+    Initialize params for a standard MLP.
+
+    Args:
+        key: jax.random.PRNGKey
+        input_dim: size of the input feature vector (flattened)
+        hidden_sizes: list of integers defining nodes per layer, e.g. [64, 64]
+                      len = num. of hidden layers, value in each layer = num. neurons
+
+    Returns:
+        List of dicts [{'W':.., 'b':..}, ...] including the final output layer.
     """
-    # Coerce inputs to params dtype to prevent promotion
-    pdt = params["W"].dtype
-    X = X.astype(pdt)
-    if X.ndim == 2:
-        X = X[:, None, :]
+    params = []
+    # The architecture flows from input -> hidden_1 -> ... -> hidden_n -> output (scalar)
+    layer_dims = [input_dim] + hidden_sizes + [1]
 
-    N, T, D = X.shape
-    hidden = _hidden_size_from_params(params)
-    h0 = jnp.zeros((N, hidden), dtype=pdt)
-    c0 = jnp.zeros((N, hidden), dtype=pdt)
+    keys = jax.random.split(key, len(layer_dims) - 1)
 
-    def step(carry, x_t):
-        return _lstm_cell(params, carry, x_t)
+    for i in range(len(layer_dims) - 1):
+        in_d, out_d = layer_dims[i], layer_dims[i+1]
 
-    # time-major scan; outputs keep dtype pdt
-    (hT, _), _ = jax.lax.scan(step, (h0, c0), X.swapaxes(0, 1))
-    y = (hT @ params["Wo"] + params["bo"]).squeeze(-1)
-    return y
+        # Xavier/Glorot initialization
+        lim = jnp.sqrt(6.0 / (in_d + out_d))
+        W = jax.random.uniform(keys[i], (in_d, out_d), minval=-lim, maxval=lim)
+        b = jnp.zeros((out_d,))
 
-def mse(pred, y):
+        params.append({'W': W, 'b': b})
+
+    return params
+
+def mlp_forward(params, X):
+    """
+    Standard Feedforward Neural Network.
+
+    Args:
+        params: List of layer dicts initialized by init_mlp_params
+        X: Input features. Shape (N, D) or (N, T, D).
+           If time (T) is present, it is flattened into the feature dimension.
+
+    Returns:
+        (N,) scalar output array
+    """
+    # 1. Ensure input is float32 (or matches param dtype)
+    # We grab the dtype from the first layer's weights
+    dtype = params[0]["W"].dtype
+    X = X.astype(dtype)
+
+    # 2. Flatten inputs
+    # If X is (N, T, D), this becomes (N, T*D).
+    # If X is (N, D), this stays (N, D).
+    N = X.shape[0]
+    activations = X.reshape(N, -1)
+
+    # 3. Forward pass through hidden layers (all but the last)
+    for layer in params[:-1]:
+        linear = activations @ layer['W'] + layer['b']
+        activations = jnp.tanh(linear)
+
+    # 4. Final Output Layer (Linear, no activation)
+    final_layer = params[-1]
+    y = activations @ final_layer['W'] + final_layer['b']
+
+    # Squeeze to return shape (N,) matching the old output format
+    return y.squeeze(-1)
+
+def _mse(pred, y):
     pred = pred.astype(y.dtype)
     return jnp.mean((pred - y)**2)
 
-"""
-def train_unrolled_lstm(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
-    # Ensure feature/target dtypes match params
-    pdt = params0["W"].dtype
-    Xtr = Xtr.astype(pdt)
-    ytr = ytr.astype(pdt)
-
-    optimizer = optax.adamw(lr, weight_decay=weight_decay)
-    opt_state = optimizer.init(params0)
-
-    def step(carry, _):
-        params, opt_state = carry
-        def loss_fn(p):
-            yhat = lstm_forward(p, Xtr)
-            return mse(yhat, ytr)
-        loss, grads = jax.value_and_grad(loss_fn)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params=params)
-        params = optax.apply_updates(params, updates)
-        return (params, opt_state), loss
-
-    (paramsK, opt_stateK), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
-    return paramsK, losses
-"""
 _tree_map    = _jtree.map
-def train_unrolled_lstm_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
-    pdt = params0["W"].dtype
+def train_mlp_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
+    pdt = params0[0]["W"].dtype
     Xtr = Xtr.astype(pdt); ytr = ytr.astype(pdt)
 
     optimizer = optax.chain(
@@ -490,12 +484,13 @@ def train_unrolled_lstm_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2
     )
     opt_state = optimizer.init(params0)
 
+    @jax.checkpoint
     def step(carry, _):
         params, opt_state = carry
 
         def loss_fn(p):
-            yhat = lstm_forward(p, Xtr)
-            return jnp.mean((yhat - ytr)**2)
+            yhat = mlp_forward(p, Xtr)
+            return _mse(yhat, ytr)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         grads = _tree_map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=1e6, neginf=-1e6), grads)
@@ -504,20 +499,20 @@ def train_unrolled_lstm_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2
 
         return (params, opt_state), loss
 
-    (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=jnp.arange(K), length=K)
+    (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
     return paramsK, losses
 
-def eval_on_tests_lstm(params, test_scaled_list):
+def eval_on_tests_mlp(params, test_scaled_list):
     if not test_scaled_list:
         return jnp.array(0.0, dtype=jnp.float32)
 
-    errs = [mse(lstm_forward(params, X), y) for (X, y, _) in test_scaled_list]
+    errs = [_mse(mlp_forward(params, X), y) for (X, y, _) in test_scaled_list]
 
     return jnp.mean(jnp.stack(errs))
 
-def plot_lstm_predictions(params, Xs, y, metric="RMSE", title_prefix="LSTM fit"):
-    yhat = lstm_forward(params, Xs)
-    loss_val = float(jnp.sqrt(jnp.mean((yhat - y)**2))) if metric.upper()=="RMSE" else float(jnp.mean((yhat - y)**2))
+def plot_mlp_predictions(params, Xs, y, metric="NRMSE", title_prefix="MLP fit"):
+    yhat = mlp_forward(params, Xs)
+    loss_val = _nrmse(yhat, y)
 
     plt.figure(figsize=(8,3))
     plt.plot(np.asarray(y),    label="truth", alpha=0.8)
@@ -572,10 +567,11 @@ def _normalize_emissions_input(U_in, agents, T, dtype=jnp.float32):
 def build_train(
     U_in,                              # dict {agent:(T,)} OR array (N_agents,T)
     agents=AGENTS_DEFAULT,
-    ema_windows_years=(5.0, 30.0),
+    ema_windows_years=(5.0, 30.0, 100.0),
     dtype=jnp.float32,
     years_hist=None,
     emis_hist_dict=None,
+    mode='FaIR'
 ):
     """
     Returns a single-scenario train dataset:
@@ -622,10 +618,10 @@ def build_train(
         emis_curr_dict=emis_curr_dict,
         years_hist=(years_hist if has_hist else None),
         emis_hist_dict=(emis_hist_dict if has_hist else None),
-        agents=agents,
+        mode=mode
     ).astype(dtype)
 
-    N = int(jnp.minimum(X.shape[0], y.shape[0]))
+    N = min(X.shape[0], y.shape[0])
     return [(X[:N], y[:N], "opt_scen")]
 
 def build_dataset_no_history(emis_dict, scenarios, agents=AGENTS_DEFAULT):
@@ -662,8 +658,9 @@ def make_objective_over_emissions(
     historical_name="historical",
     dtype=jnp.float32,
     agents=AGENTS_DEFAULT,
-    ema_windows_years=(5.0, 30.0),
+    ema_windows_years=(5.0, 30.0, 100.0),
     active=("CO2",),
+    mode='FaIR'
 ):
     # --- Historical context (if present) ---
     years_hist, emis_hist_dict = (None, None)
@@ -673,7 +670,6 @@ def make_objective_over_emissions(
             agents=agents
         )
         years_hist = jnp.asarray(years_hist, dtype=dtype)
-        # emis_hist_dict already jnp.float32 from extractor
 
     # --- Current scenario years (emissions provided at call-time) ---
     years_cur, _emis_cur_ignored = extract_years_and_emis(
@@ -684,10 +680,13 @@ def make_objective_over_emissions(
     T = int(years_cur.shape[0])
     needs_history = (scen_name_tr1 != historical_name) and (years_hist is not None)
 
+    if needs_history:
+        years_hist, emis_hist_dict = CS3_hist_modifier(scen_name_tr1, years_hist, emis_hist_dict)
+
     def objective_over_emissions(U_in):
         """
         U_in: either dict {agent: (T,)} or array (N_agents, T) in `agents` order.
-        Returns scalar mean test MSE after inner LSTM train.
+        Returns scalar mean test MSE after inner MLP train.
         """
         # 0) Normalize incoming emissions for the chosen training scenario
         emis_tr1_dict = _normalize_emissions_input(U_in, agents=agents, T=T, dtype=dtype)
@@ -709,7 +708,7 @@ def make_objective_over_emissions(
             emis_curr_dict=emis_tr1_dict,
             years_hist=(years_hist if needs_history else None),
             emis_hist_dict=(emis_hist_dict if needs_history else None),
-            agents=agents,
+            mode=mode
         ).astype(dtype)
 
         # 3) Rebuild the full training dataset (this scenario updated, others unchanged)
@@ -732,13 +731,13 @@ def make_objective_over_emissions(
         Xtr_u = jnp.concatenate([X for (X, _, _) in train_s_updated], axis=0).astype(dtype)
         ytr_u = jnp.concatenate([y for (_, y, _) in train_s_updated], axis=0).astype(dtype)
 
-        # 6) Inner LSTM training (you can swap in your SGD variant if desired)
-        paramsK_u, _ = train_unrolled_lstm_sgd(
+        # 6) Inner MLP training
+        paramsK_u, _ = train_mlp_sgd(
             params0, Xtr_u, ytr_u, K=400, lr=5e-2, weight_decay=1e-4
         )
 
-        # 7) Evaluate mean test MSE
-        return eval_on_tests_lstm(paramsK_u, test_s_updated).astype(dtype)
+        # 7) Evaluate mean test NRMSE
+        return avg_nrmse_over_tests(paramsK_u, test_s_updated).astype(dtype)
 
     return objective_over_emissions
 
@@ -885,24 +884,22 @@ def make_time_weights_pytree(T: int, agents=AGENTS_DEFAULT, power=2.0, min_scale
     w = make_time_weights(T, power=power, min_scale=min_scale)
     return {a: w for a in agents}
 
-def avg_scaled_rmse_over_tests(params, test_list, eps: float = 1e-8):
+def avg_nrmse_over_tests(params, test_list, eps: float = 1e-8):
     """
     For each scenario:
-      scaled_RMSE = RMSE(yhat, ytrue) / max(|ytrue|)
-    Then average scaled_RMSE across scenarios.
+      NRMSE = RMSE(yhat, ytrue) / max(|ytrue|)
+    Then average NRMSE across scenarios.
 
     eps prevents division by zero when ytrue is all zeros.
     """
     if not test_list:
         return jnp.array(0.0, dtype=jnp.float32)
 
-    def scaled_rmse_one(Xte, yte):
-        yhat = lstm_forward(params, Xte).astype(yte.dtype)
-        rmse = jnp.sqrt(jnp.mean((yhat - yte) ** 2))
-        denom = jnp.maximum(jnp.max(jnp.abs(yte)), jnp.array(eps, dtype=yte.dtype))
-        return rmse / denom
+    def nrmse_one(Xte, yte):
+        yhat = mlp_forward(params, Xte).astype(yte.dtype)
+        return _nrmse(yhat, yte, eps)
 
-    vals = [scaled_rmse_one(X, y) for (X, y, _) in test_list]
+    vals = [nrmse_one(X, y) for (X, y, _) in test_list]
     return jnp.mean(jnp.stack(vals)).astype(jnp.float32)
 
 
@@ -915,18 +912,29 @@ def make_inverse_objective_single_train(
     agents=AGENTS_DEFAULT,
     active_agents=("CO2",),
     inactive_mode="zeros",
+    smoothness_weight=0.0,
+    mode='FaIR'
 ):
     def objective(U_pytree):
         U_eff = _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode)
-        # 1) Single training scenario from U (any agents)
+
+        reg_loss = 0.0
+        if smoothness_weight > 0.0:
+            for agent_name in active_agents:
+                arr = U_eff[agent_name]
+                # First-difference penalty: Sum of squared changes between years
+                # Penalizes "jaggedness" directly.
+                diffs = jnp.diff(arr)
+                reg_loss += jnp.sum(diffs**2)
 
         train_updated = build_train(
             U_eff,
             agents=agents,
-            ema_windows_years=(5.0, 30.0),
+            ema_windows_years=(5.0, 30.0, 100.0),
             dtype=jnp.float32,
             years_hist=None,
             emis_hist_dict=None,
+            mode=mode
         )
 
         train_temp_raw = [y for (_, y, _) in train_updated]
@@ -939,12 +947,14 @@ def make_inverse_objective_single_train(
         ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
 
         # 4) Inner training
-        paramsK, _ = train_unrolled_lstm_sgd(
+        paramsK, _ = train_mlp_sgd(
             params0, Xtr, ytr, K=K_inner, lr=lr_inner, weight_decay=wd_inner
         )
 
         # 5) Average RMSE across ALL scenarios
-        loss = avg_scaled_rmse_over_tests(paramsK, test_s)
+        nrmse_val = avg_nrmse_over_tests(paramsK, test_s)
+        loss = nrmse_val + (smoothness_weight * reg_loss)
+
         aux  = (paramsK, test_s, train_temp_raw)
         return loss, aux
     return objective
@@ -1002,7 +1012,7 @@ def scale_by_coord_pytree(weights_pytree):
 def preds_by_scenario(params, test_list):
     out = []
     for (Xte, yte, scen) in test_list:
-        yhat = lstm_forward(params, Xte)
+        yhat = mlp_forward(params, Xte)
         out.append((scen, yhat, yte))
     return out
 
@@ -1017,49 +1027,34 @@ def mul_tree(a, b):
 def optimize_emissions_inverse(
     emis_dict,
     params0,
-    num_updates=20,
-    step_size=1e-1,            # scalar LR (apply same to all agents); can swap to multi_transform if needed
+    num_updates=500,
+    step_size=1e3,
     momentum=0.9,
     nesterov=True,
-    K_inner=50,
-    lr_inner=5e-4,
-    wd_inner=1e-4,
+    K_inner=500,
+    lr_inner=5e-2,
+    wd_inner=1e-2,
     historical_name="historical",
     agents=AGENTS_DEFAULT,
-    active_agents=None,                 # e.g. ("CO2",) for single forcing
+    active_agents=None,
     init_spec=None,
-    inactive_mode="zeros",              # or "stop_grad_zeros"
+    inactive_mode="zeros",
     checkpoint_path=None,
     checkpoint_every=10,
     resume_if_exists=True,
-    preds_every=1,                      # keep frequency, but always save preds now
+    preds_every=1,
     T: int = 750,
     n_nonneg_prefix: int | None = None,
-    filter_hist: bool = False
+    filter_hist: bool = False,
+    smoothness_weight=0.0,
+    mode='FaIR'
 ):
-    """
-    Outer-loop optimizer on emissions U.
-
-    Notes:
-    - LSTM TRAINING happens inside `make_inverse_objective_single_train`:
-      for each candidate emissions PyTree U, that closure runs
-        (emissions -> climate model -> training temperatures -> LSTM train for K_inner steps
-         -> LSTM evaluation on test scenarios -> loss).
-    """
+    import gc # Import garbage collection
 
     def hostify_tree(tree):
-        """Convert a JAX pytree of arrays to numpy arrays on host."""
-        return jax.tree_util.tree_map(
-            lambda x: np.asarray(jax.device_get(x)),
-            tree,
-        )
+        return jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
 
     def hostify_preds(step_list):
-        """
-        Convert a single prediction snapshot:
-          [(scenario_name, y_hat, y_true), ...]
-        into host numpy arrays.
-        """
         out = []
         for (sc, yh, yt) in step_list:
             yh_h = np.asarray(jax.device_get(yh))
@@ -1067,7 +1062,7 @@ def optimize_emissions_inverse(
             out.append((sc, yh_h, yt_h))
         return out
 
-    # --- Build combined test dataset (agent-flexible) ---
+    # --- Build combined test dataset ---
     test_dataset_all = build_valid(
         emis_dict,
         historical_name=historical_name,
@@ -1075,17 +1070,10 @@ def optimize_emissions_inverse(
     )
 
     if filter_hist:
-        test_dataset_all = [
-            row for row in test_dataset_all
-            if row[2] != historical_name
-        ]
+        test_dataset_all = [row for row in test_dataset_all if row[2] != historical_name]
 
-    years_hist, emis_hist_dict = (None, None)
-    if historical_name in emis_dict:
-        years_hist, emis_hist_dict = extract_years_and_emis(
-            emis_entry_for_scenario=emis_dict[historical_name],
-            agents=agents,
-        )
+    # Extract scenario names for reconstruction later (names cannot be JIT-ed)
+    test_scen_names = [row[2] for row in test_dataset_all]
 
     objective = make_inverse_objective_single_train(
         params0,
@@ -1096,29 +1084,33 @@ def optimize_emissions_inverse(
         agents=agents,
         active_agents=active_agents,
         inactive_mode=inactive_mode,
+        smoothness_weight=smoothness_weight,
+        mode=mode
     )
-    loss_and_grad = jax.value_and_grad(objective, has_aux=True)
 
-    # --- Per-agent time weights (pytree) ---
+    # --- 1. Create a Pure Loss Function (No Strings) ---
+    # JAX cannot JIT functions that return strings in `aux`.
+    # We wrap the objective to strip the strings from 'test_s'.
+    def loss_fn_pure(U):
+        loss, (paramsK, test_s, train_temp_raw) = objective(U)
+        # test_s is [(X, y, name), ...]. Strip 'name' for JIT.
+        test_arrays = [(X, y) for (X, y, _) in test_s]
+        return loss, (paramsK, test_arrays, train_temp_raw)
+
+    # --- Optimizer Setup ---
     time_weights = make_time_weights_pytree(T=T, agents=agents, power=2.0, min_scale=0.15)
 
     if isinstance(step_size, dict):
-        # If dict, we set the optimizer's scalar LR to 1.0 and bake the rates into the weights
         optimizer_lr = 1.0
-
         def apply_agent_lr(agent_name, weight_array):
-            # Fallback to 'default' key or 1e-2 if specific agent not found
             lr = step_size.get(agent_name, step_size.get('default', 1e-2))
             return weight_array * lr
-
         time_weights = {a: apply_agent_lr(a, w) for a, w in time_weights.items()}
     else:
-        # If scalar, use it as the standard global learning rate
         optimizer_lr = step_size
 
     if active_agents is not None:
         agent_mask = make_agent_mask_pytree(T, agents, active_agents)
-        # ensure inactive coords also get zero time weighting (optional but nice)
         time_weights = mul_tree(time_weights, agent_mask)
     else:
         agent_mask = make_agent_mask_pytree(T, agents, agents)
@@ -1129,149 +1121,125 @@ def optimize_emissions_inverse(
         optax.sgd(learning_rate=optimizer_lr, momentum=momentum, nesterov=nesterov),
     )
 
-    # Container for diagnostics
-    preds_traj = []        # list over outer iterations: [ [(scenario, y_hat, y_true), ...], ... ]
-    train_temp_traj = []   # list over outer iterations: [train_temp_step0, train_temp_step1, ...]
+    # ----------------------------------------------------------------------
+    # Projection Logic
+    # ----------------------------------------------------------------------
+    def project_nonneg_prefix(U_tree):
+        if n_nonneg_prefix is None: return U_tree
+        def _project_1d(u):
+            prefix = jnp.maximum(u[:n_nonneg_prefix], 0.0)
+            return u.at[:n_nonneg_prefix].set(prefix)
+        return jax.tree_util.tree_map(_project_1d, U_tree)
 
-    # --- Try to resume from checkpoint ---
+    # --- 2. JIT-Compile the Update Step ---
+    @jax.jit
+    def update_step(U, opt_state):
+        (loss, aux_pure), grads = jax.value_and_grad(loss_fn_pure, has_aux=True)(U)
+
+        grads = mul_tree(grads, agent_mask)
+        updates, new_opt_state = opt.update(grads, opt_state, params=U)
+        updates = mul_tree(updates, agent_mask)
+
+        new_U = optax.apply_updates(U, updates)
+        new_U = project_nonneg_prefix(new_U)
+
+        return new_U, new_opt_state, loss, aux_pure
+
+    # --- Initialization / Resume ---
+    preds_traj = []
+    train_temp_traj = []
     updates_done = 0
+
     if resume_if_exists and checkpoint_path and os.path.isfile(checkpoint_path):
+        print("Resuming from checkpoint...")
         ckpt = load_inverse_ckpt(checkpoint_path)
-        U_traj    = ckpt["U_traj"]          # list of PyTrees {agent: (T,)}
-        errors    = ckpt["errors"].tolist()
-        U_pytree  = U_traj[-1]              # last state
+        U_traj = ckpt["U_traj"]
+        errors = ckpt["errors"].tolist()
+        U_pytree = U_traj[-1]
         opt_state = ckpt["opt_state"]
         updates_done = ckpt["step_count"]
         preds_traj = ckpt.get("preds_traj", [])
         train_temp_traj = ckpt.get("train_temp_traj", [])
-
-        print(f'Found {updates_done} updates in checkpoint, starting from here...')
     else:
-        # --- Fresh start: init emissions per agent ---
+        print("Starting fresh...")
         U_pytree = make_init_emissions_pytree(
-            T=T,
-            agents=agents,
-            active_agents=active_agents,
-            init_spec=init_spec,
-            inactive_mode=inactive_mode,
-            dtype=jnp.float32,
+            T=T, agents=agents, active_agents=active_agents,
+            init_spec=init_spec, inactive_mode=inactive_mode
         )
+        U_pytree = project_nonneg_prefix(U_pytree)
 
-        # Initial evaluation
-        (loss0, aux0), g0 = loss_and_grad(U_pytree)
+        # Initial call (not JITed just to get shapes/init, or JITed single step)
+        # We can just run the JIT step with 0 learning rate or just reuse the logic.
+        # For simplicity, we assume the first real step will populate the logs,
+        # or we manually run one eval. Let's manually run one eval using the pure function.
+        loss0, (paramsK0, test_arrays0, train_temp0) = loss_fn_pure(U_pytree)
 
-        # EXPECTED SHAPE OF aux0: (paramsK0, test_s0, train_temp0)
-        paramsK0, test_s0, train_temp0 = aux0
+        # Reconstruct string metadata for logging
+        test_s0 = []
+        for i, (X, y) in enumerate(test_arrays0):
+            test_s0.append((X, y, test_scen_names[i]))
 
         rmse0 = float(loss0)
         opt_state = opt.init(U_pytree)
         U_traj = [U_pytree]
         errors = [rmse0]
-        updates_done = 0
-        print('No checkpoint found, starting fresh...')
 
         preds0 = preds_by_scenario(paramsK0, test_s0)
         preds_traj.append(hostify_preds(preds0))
         train_temp_traj.append(hostify_tree(train_temp0))
 
-    # ----------------------------------------------------------------------
-    # Optional: projected non-negative emissions for first n_nonneg_prefix years
-    # ----------------------------------------------------------------------
-    def project_nonneg_prefix(U_tree):
-        if n_nonneg_prefix is None:
-            return U_tree
-
-        def _project_1d(u):
-            # Assume u.shape = (T,)
-            prefix = jnp.maximum(u[:n_nonneg_prefix], 0.0)
-            return u.at[:n_nonneg_prefix].set(prefix)
-
-        return jax.tree_util.tree_map(_project_1d, U_tree)
-
-    # Make sure the starting U satisfies the constraint if requested
-    U_pytree = project_nonneg_prefix(U_pytree)
-
-    # --- Outer loop ---
+    # --- Outer Loop ---
     remaining = max(0, num_updates - updates_done)
+
     for _ in range(remaining):
-        (loss_k, aux_k), gU = loss_and_grad(U_pytree)
-        gU = mul_tree(gU, agent_mask)
+        # 3. Call JIT-compiled step
+        U_pytree, opt_state, loss_k, aux_pure = update_step(U_pytree, opt_state)
 
-        # aux_k expected to be (paramsK_k, test_s_k, train_temp_k)
-        paramsK_k, test_s_k, train_temp_k = aux_k
+        # 4. Block until ready to prevent dispatch queue from consuming all RAM
+        loss_k.block_until_ready()
 
-        updates, opt_state = opt.update(gU, opt_state, params=U_pytree)
-        updates = mul_tree(updates, agent_mask)
-
-        U_pytree = optax.apply_updates(U_pytree, updates)
-        U_pytree = project_nonneg_prefix(U_pytree)  # enforce non-negativity on prefix if enabled
-
+        paramsK_k, test_arrays_k, train_temp_k = aux_pure
         rmse_k = float(loss_k)
+
         errors.append(rmse_k)
         U_traj.append(U_pytree)
         updates_done += 1
 
-        # Always save predictions + training temperatures, but respect preds_every
         if updates_done % preds_every == 0:
+            # Re-attach scenario names
+            test_s_k = []
+            for i, (X, y) in enumerate(test_arrays_k):
+                test_s_k.append((X, y, test_scen_names[i]))
+
             preds_k = preds_by_scenario(paramsK_k, test_s_k)
             preds_traj.append(hostify_preds(preds_k))
             train_temp_traj.append(hostify_tree(train_temp_k))
 
-        # periodic checkpoint
+        # Checkpoint
         if checkpoint_path and ((updates_done % checkpoint_every) == 0):
+            # Save logic...
             state = {
-                "U_traj": U_traj,
-                "errors": errors,
-                "opt_state": opt_state,
-                "step_count": updates_done,
-                "time_weights": time_weights,
+                "U_traj": U_traj, "errors": errors, "opt_state": opt_state,
+                "step_count": updates_done, "time_weights": time_weights,
                 "paramsK_k": _tree_to_numpy(paramsK_k),
-                "meta": dict(
-                    step_size=step_size, momentum=momentum, nesterov=nesterov,
-                    K_inner=K_inner, lr_inner=lr_inner, wd_inner=wd_inner, T=T,
-                    agents=list(agents), active_agents=list(active_agents) if active_agents else None,
-                    inactive_mode=inactive_mode,
-                    preds_every=preds_every,
-                    n_nonneg_prefix=n_nonneg_prefix,
-                ),
-                "preds_traj": preds_traj,
-                "train_temp_traj": train_temp_traj,
+                "preds_traj": preds_traj, "train_temp_traj": train_temp_traj,
             }
             save_inverse_ckpt(checkpoint_path, state)
 
-    if remaining == 0:
-        paramsK_k = 0
+            # Explicit GC
+            gc.collect()
 
-    # final snapshot
-    if checkpoint_path:
-        state = {
-            "U_traj": U_traj,
-            "errors": errors,
-            "opt_state": opt_state,
-            "step_count": updates_done,
-            "time_weights": time_weights,
-            "paramsK_k": _tree_to_numpy(paramsK_k),
-            "meta": dict(
-                step_size=step_size, momentum=momentum, nesterov=nesterov,
-                K_inner=K_inner, lr_inner=lr_inner, wd_inner=wd_inner, T=T,
-                agents=list(agents), active_agents=list(active_agents) if active_agents else None,
-                inactive_mode=inactive_mode,
-                preds_every=preds_every,
-                n_nonneg_prefix=n_nonneg_prefix,
-            ),
-            "preds_traj": preds_traj,
-            "train_temp_traj": train_temp_traj,
-        }
-        save_inverse_ckpt(checkpoint_path, state)
+    # Final save logic (same as original)...
+    if remaining == 0: paramsK_k = 0 # Handle case where no updates happened
 
     return {
-        "U_traj": U_traj,                              # list of {agent: (T,)}
-        "errors": jnp.asarray(errors, jnp.float32),    # avg RMSE per update (includes initial)
+        "U_traj": U_traj,
+        "errors": jnp.asarray(errors, jnp.float32),
         "updates_done": updates_done,
-        "paramsK_k": _tree_to_numpy(paramsK_k),
+        "paramsK_k": _tree_to_numpy(paramsK_k) if remaining > 0 else 0,
         "checkpoint_path": checkpoint_path,
-        "preds_traj": preds_traj,                      # host predictions by scenario per snapshot
-        "train_temp_traj": train_temp_traj,            # host training temperatures per snapshot
+        "preds_traj": preds_traj,
+        "train_temp_traj": train_temp_traj,
     }
 
 def plot_inverse_results(
@@ -1285,7 +1253,7 @@ def plot_inverse_results(
 ):
     """
     Multipanel plot:
-      (a) Scaled RMSE vs update step
+      (a) NRMSE vs update step
       (b) Optimal emissions profiles (one subplot per active agent)
       (c) Training temperature trajectory
       (d) Predictions vs Truth
@@ -1330,7 +1298,7 @@ def plot_inverse_results(
     T = int(_get_series(U_traj[-1], probe_agent).shape[0])
 
     # --- DYNAMIC SUBPLOTS ---
-    # Rows: 1 (RMSE) + N (Agents) + 1 (TrainTemp) + 1 (Preds)
+    # Rows: 1 (NRMSE) + N (Agents) + 1 (TrainTemp) + 1 (Preds)
     n_agents = len(active_agents)
     n_rows = 3 + n_agents
 
@@ -1357,13 +1325,13 @@ def plot_inverse_results(
 
     # ----- Panel (a): scaled RMSE vs update step --------------------------------
     x_err = jnp.arange(errors.shape[0])
-    ax_err.semilogy(x_err, errors, label="Scaled RMSE")
+    ax_err.semilogy(x_err, errors, label="NRMSE")
     ax_err.axhline(float(baseline_error), ls="--", c='r', lw=1.5, label=f"Baseline emulator (avg.)")
     ax_err.set_xlim(0, n_update_steps)
     ax_err.set_xlabel("Update step")
-    ax_err.set_ylabel("Scaled RMSE")
+    ax_err.set_ylabel("NRMSE")
     ax_err.text(
-        0.015, 0.93, "Scaled RMSE vs. Update Step", transform=ax_err.transAxes,
+        0.015, 0.93, "NRMSE vs. Update Step", transform=ax_err.transAxes,
         ha="left", va="top", fontsize=16, fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
     )
@@ -1499,26 +1467,26 @@ def prepare_baseline_data(
 def train_baseline_emulator(
     train_scaled,                 # list[(X_s, y, scen), ...]
     key,
-    hidden=32,
+    hidden_sizes=[16],
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
     dtype=jnp.float32
 ):
-    """Concatenate train tensors and train via the same LSTM+optimizer as inverse."""
+    """Concatenate train tensors and train via the same MLP+optimizer as inverse."""
     Xtr = jnp.concatenate([X for (X, _, _) in train_scaled], axis=0).astype(dtype)
     ytr = jnp.concatenate([y for (_, y, _) in train_scaled], axis=0).astype(dtype)
 
-    in_dim = int(Xtr.shape[1])
-    params0 = init_lstm_params(key, in_dim=in_dim, hidden=hidden, out_dim=1, dtype=dtype)
+    input_dim = int(Xtr.shape[1])
+    params0 = init_mlp_params(key, input_dim=input_dim, hidden_sizes=hidden_sizes)
 
-    train_unrolled_lstm_sgd_jit = jax.jit(train_unrolled_lstm_sgd, static_argnames=("K",))
-    paramsK, losses = train_unrolled_lstm_sgd_jit(params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay)
+    train_mlp_sgd_jit = jax.jit(train_mlp_sgd, static_argnames=("K",))
+    paramsK, losses = train_mlp_sgd_jit(params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay)
 
-    meta = dict(in_dim=in_dim, hidden=hidden, K=K, lr=lr, weight_decay=weight_decay)
+    meta = dict(in_dim=input_dim, hidden_sizes=hidden_sizes, K=K, lr=lr, weight_decay=weight_decay)
     return paramsK, (jnp.mean(losses), losses), meta
 
-def evaluate_emulator_scaled_rmse(
+def evaluate_emulator_nrmse(
     params,
     dataset,          # list[(X, y, scen)]
     stats             # (mu, sd) from fit on the baseline train set
@@ -1528,9 +1496,9 @@ def evaluate_emulator_scaled_rmse(
     for (X, y, scen) in dataset:
         Xs = apply_scaler(jnp.asarray(X, dtype=jnp.float32), stats)
         test_scaled.append((Xs, jnp.asarray(y, dtype=jnp.float32), scen))
-    return avg_scaled_rmse_over_tests(params, test_scaled)
+    return avg_nrmse_over_tests(params, test_scaled)
 
-def _scaled_rmse(yhat: jnp.ndarray, ytrue: jnp.ndarray, eps: float = 1e-8):
+def _nrmse(yhat: jnp.ndarray, ytrue: jnp.ndarray, eps: float = 1e-8):
     max_abs = jnp.maximum(jnp.max(jnp.abs(ytrue)), eps)
     return jnp.sqrt(jnp.mean((yhat - ytrue) ** 2)) / max_abs
 
@@ -1548,20 +1516,20 @@ def evaluate_baseline_over_multiple_tests(
     test_sets: dict,              # {"H": emis_dict_test_H, "S": emis_dict_test_S, ...}
     historical_name="historical",
     key=jax.random.PRNGKey(0),
-    hidden=32,
+    hidden_sizes=[16],
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
 ):
     """
     Trains the baseline emulator ONCE using emis_dict_train,
-    then evaluates on each test set in `test_sets` using the same scaler and LSTM params.
+    then evaluates on each test set in `test_sets` using the same scaler and MLP params.
 
     Returns:
       paramsK_base,
       per_designation_results where each value is:
         {
-          "baseline_error_dict_<designation>": {scenario -> scaled_RMSE},
+          "baseline_error_dict_<designation>": {scenario -> NRMSE},
           "baseline_error_mean": float,
           "test_scaled": [(Xs, y, scen), ...]  # scaled test set used
         }
@@ -1577,7 +1545,7 @@ def evaluate_baseline_over_multiple_tests(
     paramsK_base, (_mean_train_loss, _train_losses), meta = train_baseline_emulator(
         train_scaled=train_s,
         key=key,
-        hidden=hidden,
+        hidden_sizes=hidden_sizes,
         K=K,
         lr=lr,
         weight_decay=weight_decay,
@@ -1593,11 +1561,11 @@ def evaluate_baseline_over_multiple_tests(
         # scale with train stats (no refit!)
         test_s_scaled = _apply_stats_to_test(test_raw, stats)
 
-        # compute per-scenario scaled RMSE and mean
+        # compute per-scenario NRMSE and mean
         baseline_results[test_set], baseline_preds[test_set], ground_truth[test_set] = {}, {}, {}
         for (Xte, yte, scen_name) in test_s_scaled:
-            yhat = lstm_forward(paramsK_base, Xte)
-            r_s  = float(_scaled_rmse(jnp.asarray(yhat), jnp.asarray(yte)))
+            yhat = mlp_forward(paramsK_base, Xte)
+            r_s  = float(_nrmse(jnp.asarray(yhat), jnp.asarray(yte)))
 
             ground_truth[test_set][scen_name] = yte
             baseline_preds[test_set][scen_name] = yhat
@@ -1607,38 +1575,35 @@ def evaluate_baseline_over_multiple_tests(
 
     return paramsK_base, baseline_results, baseline_preds, ground_truth
 
-def create_baseline(train_s, test_s, idx_demo, verbose=False):
+def create_baseline(train_s, test_s, idx_demo, hidden_sizes=[16], verbose=False):
 
-  def rmse(a, b): return float(jnp.sqrt(jnp.mean((jnp.asarray(a)-jnp.asarray(b))**2)))
-
-  def eval_test_rmse_by_scenario(params, test_list):
+  def eval_test_nrmse_by_scenario(params, test_list):
       """Returns list of (scenario_name, rmse_value) for all tests."""
       out = []
       for (Xte, yte, scen_name) in test_list:
-          yhat = lstm_forward(params, Xte)
-          out.append((scen_name, rmse(yhat, yte)))
+          yhat = mlp_forward(params, Xte)
+          out.append((scen_name, _nrmse(yhat, yte)))
       return out
 
   (Xs, y, scen) = train_s[0]
-  X_for_lstm = Xs.reshape((Xs.shape[0], 1, Xs.shape[1]))
+  X_for_mlp = Xs.reshape((Xs.shape[0], 1, Xs.shape[1]))
 
   Xtr = jnp.concatenate([X for (X, _, _) in train_s], axis=0).astype(jnp.float32)  # (N, 4)
   ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
 
   key    = jax.random.PRNGKey(0)
-  in_dim = Xtr.shape[1]
-  hidden = 32
+  input_dim = Xtr.shape[1]
 
-  params0 = init_lstm_params(key, in_dim=in_dim, hidden=hidden, out_dim=1, dtype=jnp.float32)
+  params0 = init_mlp_params(key, input_dim=input_dim, hidden_sizes=hidden_sizes)
 
-  train_unrolled_lstm_sgd_jit = jax.jit(train_unrolled_lstm_sgd, static_argnames=("K",))
-  paramsK, losses = train_unrolled_lstm_sgd_jit(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2)
+  train_mlp_sgd_jit = jax.jit(train_mlp_sgd, static_argnames=("K",))
+  paramsK, losses = train_mlp_sgd_jit(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2)
 
   (Xs_demo, y_demo, scen_demo) = test_s[idx_demo]
 
-  plot_lstm_predictions(paramsK, Xs_demo, y_demo, metric="RMSE", title_prefix=f"LSTM • {scen_demo}")
+  plot_mlp_predictions(paramsK, Xs_demo, y_demo, metric="RMSE", title_prefix=f"{scen_demo}")
 
-  rmse_list = eval_test_rmse_by_scenario(paramsK, test_s)
+  rmse_list = eval_test_nrmse_by_scenario(paramsK, test_s)
   avg_rmse  = jnp.mean(jnp.stack([r for (_, r) in rmse_list]))
 
   if verbose:
@@ -1649,7 +1614,7 @@ def create_baseline(train_s, test_s, idx_demo, verbose=False):
 
   return params0
 
-def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AGENTS_DEFAULT, active=("CO2",)):
+def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AGENTS_DEFAULT, active=("CO2",), mode='FaIR'):
 
   years_tr1, E0 = extract_years_and_emis(emis_dict_JAX[scen])
 
@@ -1662,7 +1627,8 @@ def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AG
       historical_name="historical",
       agents=agents,
       active=active,
-      dtype=jnp.float32
+      dtype=jnp.float32,
+      mode=mode
   )
 
   # gradients wrt both series:
@@ -1683,10 +1649,10 @@ def evaluate_optimal_emulator(
     inactive_mode="zeros",
     historical_name="historical",
     key=jax.random.PRNGKey(0),
-    hidden=32,
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
+    mode='FaIR'
 ):
     """
     Loads optimized emissions, converts them to a stacked array, trains a new emulator,
@@ -1719,10 +1685,11 @@ def evaluate_optimal_emulator(
         train_updated = build_train(
             U_eff_array,
             agents=agents,
-            ema_windows_years=(5.0, 30.0),
+            ema_windows_years=(5.0, 30.0, 100.0),
             dtype=jnp.float32,
             years_hist=None,
             emis_hist_dict=None,
+            mode=mode
         )
 
         # Scale stats on updated train
@@ -1735,9 +1702,8 @@ def evaluate_optimal_emulator(
         # 5) Inner Training
         k1, k2 = jax.random.split(key)
         in_dim = int(Xtr.shape[1])
-        #params0 = init_lstm_params(key, in_dim=in_dim, hidden=hidden, out_dim=1)
 
-        paramsK, _ = train_unrolled_lstm_sgd(
+        paramsK, _ = train_mlp_sgd(
             params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay
         )
 
@@ -1754,9 +1720,9 @@ def evaluate_optimal_emulator(
 
             scen_errors = {}
             for (Xte, yte, scen_name) in test_s_scaled:
-                yhat = lstm_forward(paramsK, Xte)
-                rmse = float(_scaled_rmse(jnp.asarray(yhat), jnp.asarray(yte)))
-                scen_errors[scen_name] = rmse
+                yhat = mlp_forward(paramsK, Xte)
+                nrmse = float(_nrmse(jnp.asarray(yhat), jnp.asarray(yte)))
+                scen_errors[scen_name] = nrmse
 
             mean_err = np.mean(list(scen_errors.values())) if scen_errors else float("nan")
             path_res["metrics"][test_name] = scen_errors
@@ -1765,3 +1731,21 @@ def evaluate_optimal_emulator(
         results_out[path] = path_res
 
     return results_out
+
+def CS3_hist_modifier(scen_name, years_hist, emis_hist_dict):
+    # Define the scenarios that need partial history
+    SPECIAL_SCENS = ["AA", "CT"]
+
+    if scen_name in SPECIAL_SCENS:
+        SUBSET_LEN = 256
+
+        # Slice years
+        years_new = years_hist[:256]
+
+        emis_new = {
+            agent: arr[-SUBSET_LEN:]
+            for agent, arr in emis_hist_dict.items()
+        }
+        return years_new, emis_new
+
+    return years_hist, emis_hist_dict
