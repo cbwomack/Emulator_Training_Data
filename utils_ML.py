@@ -180,7 +180,7 @@ def make_features_from_scenario(
     dt_years=1.0
 ):
   """
-  Constructs causal features for an LSTM/MLP using NumPy, replicating the 
+  Constructs causal features for an LSTM/MLP using NumPy, replicating the
   logic of 'make_features_emissions_generic' (JAX version).
 
   For each agent, it creates 4 features:
