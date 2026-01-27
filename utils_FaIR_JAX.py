@@ -1,7 +1,6 @@
 # -------
 # Imports
 # -------
-from distutils.command.build import build
 import matplotlib.pyplot as plt
 import run_fair
 import pickle
@@ -54,12 +53,14 @@ FAIR_PARAMS = {
   "f2_BC": 0.0315142, # aerosol-radiation interaction
   "f1_aci": -0.8848617, # aerosol-cloud interaction
   "C0_SO2": 24.358507, # SO2 shape parameter
-  "f2_aci": -0.00948581 # aerosol-cloud interaction
+  "f2_aci": -0.00948581, # aerosol-cloud interaction
+
+  "C0_PI": 278.0 # Preindustrial CO2 [ppm]
 }
 
 MESM_PARAMS = {
-  "a": jnp.array([0.04880637, 0.0576544 , 0.1491729 , 0.74436635]), # Carbon reservoir fractions [-]
-  "tau": jnp.array([2.7822150e+05, 1.3658392e+02, 8.7598200e+00, 5.5697763e-01]), # Reservoir time scales [yr]
+  "a": jnp.array([0.04127917, 0.04904277, 0.14516222, 0.76451576]), # Carbon reservoir fractions [-]
+  "tau": jnp.array([2.1738056e+05, 1.0622746e+02, 6.8072896e+00, 1.1605897e+00]), # Reservoir time scales [yr]
   "ch4_tau": 10,                                  # CH4 lifetime
   "k_ch4": 0.046,                                   # Radiative forcing from CH4
 
@@ -82,7 +83,7 @@ MESM_PARAMS = {
   "k_n2o": 0.06395961,            # W/m2 per sqrt(ppb) difference, default 0.106
 
   # d_j: response timescales [years]
-  "d": jnp.array([0.9535624, 11.807025, 328.6892]),
+  "d": jnp.array([0.60589135, 16.034082, 277.6066]),
 
   # q_j: equilibrium response coefficients [K / (W m^-2)]
   "q": jnp.array([0.21279761, 0.2657743, 0.4667166]),
@@ -91,11 +92,12 @@ MESM_PARAMS = {
   "f2_BC": 0.0315142, # aerosol-radiation interaction
   "f1_aci": -0.8848617, # aerosol-cloud interaction
   "C0_SO2": 24.358507, # SO2 shape parameter
-  "f2_aci": -0.00948581 # aerosol-cloud interaction
+  "f2_aci": -0.00948581, # aerosol-cloud interaction
+
+  "C0_PI": 286.4 # Preindustrial CO2 [ppm]
 }
 
 # Constants
-C0_PI      = 278.0                      # Preindustrial CO2 [ppm]
 SPY        = 3600.0 * 24.0 * 365.25     # Seconds per year
 EARTHAREA  = 5.1e14                     # Surface area of Earth m^2
 LFRAC      = 0.292                      # Land fraction (unitless)
@@ -203,14 +205,14 @@ def carbon_step(cpool: jnp.ndarray,
 # ---------------------------
 # CO2 radiative forcing (AR6)
 # ---------------------------
-def radiative_forcing_co2(C: jnp.ndarray) -> jnp.ndarray:
+def radiative_forcing_co2(C: jnp.ndarray, params: dict) -> jnp.ndarray:
   """
   Piecewise polynomial coefficient in front of log(C/C0).
   """
   a1 = -2.4785e-7   # W m^-2 ppm^-2
   b1 = 7.5906e-4    # W m^-2 ppm^-1
   d1 = 5.2488       # W m^-2
-  C0 = C0_PI
+  C0 = params["C0_PI"]
 
   Camax = C0 - b1 / (2.0 * a1)
 
@@ -399,6 +401,8 @@ def simulate_temp(
     Et_co2_ppm_per_year = Et_co2_GtCO2_per_year * GTCO2_TO_PPM_PER_YEAR
     Et_co2_GtC_per_year = Et_co2_GtCO2_per_year * (12.0 / 44.0)
 
+    C0_PI = params["C0_PI"]
+
     # --- CO2 carbon pools -> Catm (ppm) ---
     cumulative_GtC_new = cumulative_GtC + Et_co2_GtC_per_year * dt
     Catm_ppm_prev = C0_PI + jnp.sum(cpool)
@@ -416,7 +420,7 @@ def simulate_temp(
     Natm_ppb   = M0_N2O_PI + n_anom_new
 
     # --- ERFs ---
-    RF_co2  = radiative_forcing_co2(Catm_ppm)
+    RF_co2  = radiative_forcing_co2(Catm_ppm, params)
     RF_ch4  = radiative_forcing_ch4(Matm_ppb, params)
     RF_n2o  = radiative_forcing_n2o(Natm_ppb, params)
     RF_aer  = radiative_forcing_SO2_BC(Et_sulfur_MtSulfur_per_year, Et_bc_MtBC_per_year, params)
@@ -536,7 +540,7 @@ def simulate_temp_prescribed_conc(
         E_bc   = emissions_by_agent[idx_BC, idx]
 
         # 3. Calculate Forcing
-        RF_co2 = radiative_forcing_co2(C_ppm)
+        RF_co2 = radiative_forcing_co2(C_ppm, params)
         RF_ch4 = radiative_forcing_ch4(M_ppb, params)
         RF_n2o = radiative_forcing_n2o(N_ppb, params)
         RF_aer = radiative_forcing_SO2_BC(E_sulf, E_bc, params)
@@ -946,7 +950,8 @@ def params_from_theta(theta: jnp.ndarray,
 
   # ecs is implied by q; keep ecs consistent if you want
   # F_2xCO2 from your AR6 RF at 2xCO2:
-  F2x = radiative_forcing_co2(2.0 * C0_PI)
+  C0_PI = params["C0_PI"]
+  F2x = radiative_forcing_co2(2.0 * C0_PI, params)
   params["ecs"] = F2x * jnp.sum(q)
 
   return params
@@ -1026,7 +1031,7 @@ def loss_fn(theta: jnp.ndarray,
 # ----------------------------------------
 # Mode A: Calibrate Carbon Cycle (Emis -> Conc)
 # ----------------------------------------
-def calibrate_carbon_cycle(filepath, emis_dict_JAX, target_conc_dict, theta0, dt, n_steps, learning_rate=1e-2):
+def calibrate_carbon_cycle(filepath, emis_dict_JAX, target_conc_dict, theta0, dt, n_steps, learning_rate=1e-2, mode='FaIR'):
     """
     Calibrates 'r0', 'rC', 'rT', 'a', 'tau' to match target CO2 concentrations.
     Ignores Temperature output/errors.
@@ -1037,7 +1042,7 @@ def calibrate_carbon_cycle(filepath, emis_dict_JAX, target_conc_dict, theta0, dt
     def loss_carbon(theta):
         params = params_from_theta(theta, FAIR_PARAMS)
         # Run standard forward model
-        res_dict = run_scenarios(emis_dict_JAX, params=params, dt=dt)
+        res_dict = run_scenarios(emis_dict_JAX, params=params, dt=dt, mode=mode)
 
         total_mse = 0.0
         # Calculate MSE only on CO2 concentrations
@@ -1062,7 +1067,7 @@ def calibrate_carbon_cycle(filepath, emis_dict_JAX, target_conc_dict, theta0, dt
         updates, opt_state = optimizer.update(grads, opt_state, theta)
         theta = optax.apply_updates(theta, updates)
 
-        if step % 20 == 0 or step == n_steps - 1:
+        if step % 100 == 0 or step == n_steps - 1:
             print(f"Step {step} | Loss (Conc MSE): {loss:.4f}")
 
     with open(filepath, 'wb') as f: pickle.dump(theta, f)
@@ -1108,7 +1113,7 @@ def calibrate_climate_sensitivity(filepath, emis_dict_JAX, conc_dict_JAX, target
         updates, opt_state = optimizer.update(grads, opt_state, theta)
         theta = optax.apply_updates(theta, updates)
 
-        if step % 20 == 0 or step == n_steps - 1:
+        if step % 100 == 0 or step == n_steps - 1:
             print(f"Step {step} | Loss (Temp MSE): {loss:.4f}")
 
     with open(filepath, 'wb') as f: pickle.dump(theta, f)
@@ -1336,8 +1341,8 @@ def plot_calibration_results(conc_dict, emis_dict, target_dict, theta0, theta_op
 
         # Plot Data
         ax.plot(years, target_matrix[i, :actual_len], color='black', label='Target (Data)', lw=2)
-        ax.plot(years, preds_init[i, :actual_len], color='tab:blue', linestyle=':', label='FaIR (Pre-Opt)', lw=2)
-        ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--', label='FaIR (Post-Opt)', lw=2)
+        ax.plot(years, preds_init[i, :actual_len], color='tab:blue', linestyle=':', label='SCM (Pre-Opt)', lw=2)
+        ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--', label='SCM (Post-Opt)', lw=2)
 
         ax.set_title(f'Scenario: {name}')
         ax.set_xlabel('Years')

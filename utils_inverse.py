@@ -2,9 +2,9 @@
 # Imports
 # -------
 import utils_FaIR_JAX
-#import FaIR_JAX_new
 import numpy as np
 import matplotlib.pyplot as plt
+import pickle
 
 # JAX
 import jax
@@ -15,6 +15,15 @@ from jax import tree as _jtree
 
 import os, pickle, numpy as np
 from functools import partial
+
+## Setup plots
+plt.rcParams['figure.figsize'] = [12, 4]
+plt.rcParams.update({'font.size': 16})
+plt.rcParams.update({
+  "text.usetex": True,
+  "font.family": "sans-serif",
+  "font.sans-serif": ["Helvetica Light"],
+})
 
 
 # Choose the row order for the emissions matrix passed to simulate_temp
@@ -521,11 +530,11 @@ def plot_mlp_predictions(params, Xs, y, metric="NRMSE", title_prefix="MLP fit"):
     plt.title(f"{title_prefix} - {metric.upper()}: {loss_val:.4f}")
     plt.tight_layout(); plt.show()
 
-def freeze_inactive_agents(emis_dict, active=("CO2",), agents=AGENTS_DEFAULT):
+def freeze_inactive_agents(emis_dict, active_agents=("CO2",), agents=AGENTS_DEFAULT):
     out = {}
     for a in agents:
         x = emis_dict[a]
-        out[a] = x if (a in active) else jax.lax.stop_gradient(x)
+        out[a] = x if (a in active_agents) else jax.lax.stop_gradient(x)
     return out
 
 def _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode="zeros"):
@@ -624,19 +633,20 @@ def build_train(
     N = min(X.shape[0], y.shape[0])
     return [(X[:N], y[:N], "opt_scen")]
 
-def build_dataset_no_history(emis_dict, scenarios, agents=AGENTS_DEFAULT):
+def build_dataset_no_history(emis_dict, scenarios, agents=AGENTS_DEFAULT, mode='FaIR'):
     """
     Build features/targets without prepending historical emissions.
     Uses a sentinel historical_name that won't be found in the dict.
     """
     return build_dataset_from_runfair_dict(
-        emis_dict, scenarios, historical_name="__NONE__", agents=agents
+        emis_dict, scenarios, historical_name="__NONE__", agents=agents, mode=mode
     )
 
 def build_valid(
     emis_dict_valid,
     historical_name="historical",
     agents=AGENTS_DEFAULT,
+    mode='FaIR'
 ):
     """
     Combined validation set:
@@ -646,7 +656,7 @@ def build_valid(
     """
     valid = build_dataset_from_runfair_dict(
         emis_dict_valid,
-        historical_name=historical_name, agents=agents
+        historical_name=historical_name, agents=agents, mode=mode
     )
     return valid
 
@@ -659,7 +669,7 @@ def make_objective_over_emissions(
     dtype=jnp.float32,
     agents=AGENTS_DEFAULT,
     ema_windows_years=(5.0, 30.0, 100.0),
-    active=("CO2",),
+    active_agents=("CO2",),
     mode='FaIR'
 ):
     # --- Historical context (if present) ---
@@ -690,7 +700,7 @@ def make_objective_over_emissions(
         """
         # 0) Normalize incoming emissions for the chosen training scenario
         emis_tr1_dict = _normalize_emissions_input(U_in, agents=agents, T=T, dtype=dtype)
-        emis_tr1_dict = freeze_inactive_agents(emis_tr1_dict, active=active, agents=agents)
+        emis_tr1_dict = freeze_inactive_agents(emis_tr1_dict, active_agents=active_agents, agents=agents)
 
         # 1) Features for chosen training scenario (causal, with EMAs & cumulative-to-prev)
         X_tr1_new = make_features_emissions_generic(
@@ -741,21 +751,6 @@ def make_objective_over_emissions(
 
     return objective_over_emissions
 
-
-def init_gaussian_emissions(
-    T: int,
-    peak_emis: float = 50.0,
-    mu: float = 350.0,
-    sigma: float = 100.0,
-    floor: float = 0.0,
-    dtype=jnp.float32,
-) -> jnp.ndarray:
-    """Gaussian-shaped initial emissions."""
-    t = jnp.arange(T, dtype=dtype)
-    z = (t - jnp.array(mu, dtype=dtype)) / jnp.array(sigma, dtype=dtype)
-    E = floor + jnp.array(peak_emis, dtype=dtype) * jnp.exp(-0.5 * z * z)
-    return jnp.maximum(jnp.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0), 0.0).astype(dtype)
-
 def init_constant_emissions(
     T: int,
     emis_val: float = 50.0,
@@ -772,20 +767,44 @@ def init_ramp_emissions(
     """Ramp initial emissions."""
     return jnp.linspace(0, int(final_val), T)
 
+def init_gaussian_emissions(
+    T: int,
+    peak_emis: float = 50.0,
+    mu: float = 350.0,
+    sigma: float = 100.0,
+    floor: float = 0.0,
+    dtype=jnp.float32,
+) -> jnp.ndarray:
+    """Gaussian-shaped initial emissions."""
+    t = jnp.arange(T, dtype=dtype)
+    z = (t - jnp.array(mu, dtype=dtype)) / jnp.array(sigma, dtype=dtype)
+    E = floor + jnp.array(peak_emis, dtype=dtype) * jnp.exp(-0.5 * z * z)
+    return jnp.maximum(jnp.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0), 0.0).astype(dtype)
+
+def init_sine_emissions(
+    T: int,
+    peak_emis: float = 50.0,
+    period: float = 150.0,
+    dtype=jnp.float32,
+) -> jnp.ndarray:
+    """Ramp initial emissions."""
+    t = jnp.arange(T, dtype=dtype)
+    return peak_emis * jnp.sin(2 * jnp.pi * t / period).astype(dtype)
+
 
 def make_init_emissions_pytree(
     T: int,
     agents=AGENTS_DEFAULT,
     active_agents=None,
-    init_spec=None,               # str (keyword) | array-like (matrix) | None
+    init_cond=None,               # str (keyword) | array-like (matrix) | None
     inactive_mode: str = "zeros", # "zeros" or "stop_grad_zeros"
     dtype=jnp.float32,
 ):
     """
     Build initial emissions as a PyTree {agent: (T,)}.
 
-    init_spec can be:
-      - str: keyword ("gaussian", "constant", "ramp") applied to all active agents,
+    init_cond can be:
+      - str: keyword ("gaussian", "constant", "ramp", "cos") applied to all active agents,
              using distinct default parameters per agent.
       - array-like (N_agents, T): rows correspond to `agents` order.
       - None: defaults to "gaussian".
@@ -799,13 +818,13 @@ def make_init_emissions_pytree(
     # Default parameters per agent for different initialization modes
     # Modify these values to tune the "different parameters" per forcing agent
     AGENT_CONFIGS = {
-        "CO2":    {"peak": 50.0,  "mu": 350, "sig_frac": 0.15},
-        "CH4":    {"peak": 500.0, "mu": 450, "sig_frac": 0.25},
-        "N2O":    {"peak": 10.0,  "mu": 350, "sig_frac": 0.15},
-        "Sulfur": {"peak": 60.0, "mu": 350, "sig_frac": 0.15},
-        "BC":     {"peak": 10.0,  "mu": 350, "sig_frac": 0.15},
+        "CO2":    {"peak": 50.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
+        "CH4":    {"peak": 500.0, "mu": 450, "sig_frac": 0.25, "period": 150},
+        "N2O":    {"peak": 10.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
+        "Sulfur": {"peak": 60.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
+        "BC":     {"peak": 10.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
         # Fallback for unknown agents
-        "DEFAULT": {"peak": 50.0,   "mu": 350, "sig_frac": 0.15},
+        "DEFAULT": {"peak": 50.0, "mu": 350, "sig_frac": 0.15, "period": 150},
     }
 
     def _get_zero():
@@ -816,16 +835,7 @@ def make_init_emissions_pytree(
         cfg = AGENT_CONFIGS.get(agent, AGENT_CONFIGS["DEFAULT"])
         key = keyword.lower().strip()
 
-        if key == "gaussian":
-            return init_gaussian_emissions(
-                T=T,
-                peak_emis=cfg["peak"],
-                mu=cfg["mu"],
-                sigma=cfg["sig_frac"] * T,
-                floor=0.0,
-                dtype=dtype
-            )
-        elif key == "constant":
+        if key == "constant":
             return init_constant_emissions(
                 T=T,
                 emis_val=cfg["peak"],
@@ -837,19 +847,36 @@ def make_init_emissions_pytree(
                 final_val=cfg["peak"],
                 dtype=dtype
             )
+        elif key == "gaussian":
+            return init_gaussian_emissions(
+                T=T,
+                peak_emis=cfg["peak"],
+                mu=cfg["mu"],
+                sigma=cfg["sig_frac"] * T,
+                floor=0.0,
+                dtype=dtype
+            )
+        elif key == "sine":
+            return init_sine_emissions(
+                T=T,
+                peak_emis=cfg["peak"],
+                period=cfg["period"],
+                dtype=dtype
+            )
+
         else:
-            raise ValueError(f"Unknown init_spec keyword: '{keyword}'. Supported: gaussian, constant, ramp.")
+            raise ValueError(f"Unknown init_cond keyword: '{keyword}'. Supported: constant, ramp, gaussian, sine.")
 
     # 2. Handle Matrix Input (N_agents, T)
-    if hasattr(init_spec, "shape") or isinstance(init_spec, (list, tuple, np.ndarray)):
+    if hasattr(init_cond, "shape") or isinstance(init_cond, (list, tuple, np.ndarray)):
         # Assume array-like
-        arr = jnp.asarray(init_spec, dtype=dtype)
+        arr = jnp.asarray(init_cond, dtype=dtype)
         if arr.ndim != 2:
-            raise ValueError(f"init_spec matrix must be (N_agents, T), got shape {arr.shape}")
+            raise ValueError(f"init_cond matrix must be (N_agents, T), got shape {arr.shape}")
         if arr.shape[0] != len(agents):
-            raise ValueError(f"init_spec rows {arr.shape[0]} != len(agents) {len(agents)}")
+            raise ValueError(f"init_cond rows {arr.shape[0]} != len(agents) {len(agents)}")
         if arr.shape[1] != T:
-            raise ValueError(f"init_spec cols {arr.shape[1]} != T {T}")
+            raise ValueError(f"init_cond cols {arr.shape[1]} != T {T}")
 
         U = {}
         for i, ag in enumerate(agents):
@@ -860,19 +887,19 @@ def make_init_emissions_pytree(
         return U
 
     # 3. Handle Keyword Input (str) or None
-    if init_spec is None:
-        init_spec = "gaussian"
+    if init_cond is None:
+        init_cond = "constant"
 
-    if isinstance(init_spec, str):
+    if isinstance(init_cond, str):
         U = {}
         for ag in agents:
             if ag in active_agents:
-                U[ag] = _make_from_keyword(ag, init_spec)
+                U[ag] = _make_from_keyword(ag, init_cond)
             else:
                 U[ag] = _get_zero()
         return U
 
-    raise TypeError(f"init_spec must be a keyword string, a matrix, or None. Got: {type(init_spec)}")
+    raise TypeError(f"init_cond must be a keyword string, a matrix, or None. Got: {type(init_cond)}")
 
 
 def make_time_weights(T: int, power: float = 2.0, min_scale: float = 0.1) -> jnp.ndarray:
@@ -888,7 +915,7 @@ def avg_nrmse_over_tests(params, test_list, eps: float = 1e-8):
     """
     For each scenario:
       NRMSE = RMSE(yhat, ytrue) / max(|ytrue|)
-    Then average NRMSE across scenarios.
+    Then average NRMSE across scenarios weighted by scenario length.
 
     eps prevents division by zero when ytrue is all zeros.
     """
@@ -900,7 +927,8 @@ def avg_nrmse_over_tests(params, test_list, eps: float = 1e-8):
         return _nrmse(yhat, yte, eps)
 
     vals = [nrmse_one(X, y) for (X, y, _) in test_list]
-    return jnp.mean(jnp.stack(vals)).astype(jnp.float32)
+    weights = jnp.array([len(y) for (_, y, _) in test_list])
+    return jnp.average(jnp.stack(vals), weights=weights).astype(jnp.float32)
 
 
 def make_inverse_objective_single_train(
@@ -951,7 +979,7 @@ def make_inverse_objective_single_train(
             params0, Xtr, ytr, K=K_inner, lr=lr_inner, weight_decay=wd_inner
         )
 
-        # 5) Average RMSE across ALL scenarios
+        # 5) Average NRMSE across all scenarios, weighted by scenario length
         nrmse_val = avg_nrmse_over_tests(paramsK, test_s)
         loss = nrmse_val + (smoothness_weight * reg_loss)
 
@@ -1037,17 +1065,17 @@ def optimize_emissions_inverse(
     historical_name="historical",
     agents=AGENTS_DEFAULT,
     active_agents=None,
-    init_spec=None,
+    init_cond=None,
     inactive_mode="zeros",
-    checkpoint_path=None,
-    checkpoint_every=10,
-    resume_if_exists=True,
-    preds_every=1,
     T: int = 750,
     n_nonneg_prefix: int | None = None,
     filter_hist: bool = False,
     smoothness_weight=0.0,
-    mode='FaIR'
+    mode='FaIR',
+    checkpoint_path=None,
+    checkpoint_every=50,
+    resume_if_exists=True,
+    preds_every=50,
 ):
     import gc # Import garbage collection
 
@@ -1067,6 +1095,7 @@ def optimize_emissions_inverse(
         emis_dict,
         historical_name=historical_name,
         agents=agents,
+        mode=mode
     )
 
     if filter_hist:
@@ -1161,17 +1190,16 @@ def optimize_emissions_inverse(
         preds_traj = ckpt.get("preds_traj", [])
         train_temp_traj = ckpt.get("train_temp_traj", [])
     else:
-        print("Starting fresh...")
+        if not resume_if_exists and os.path.isfile(checkpoint_path):
+            print("Overwriting save data...")
+        else:
+            print("No save data found, starting fresh...")
         U_pytree = make_init_emissions_pytree(
             T=T, agents=agents, active_agents=active_agents,
-            init_spec=init_spec, inactive_mode=inactive_mode
+            init_cond=init_cond, inactive_mode=inactive_mode
         )
         U_pytree = project_nonneg_prefix(U_pytree)
 
-        # Initial call (not JITed just to get shapes/init, or JITed single step)
-        # We can just run the JIT step with 0 learning rate or just reuse the logic.
-        # For simplicity, we assume the first real step will populate the logs,
-        # or we manually run one eval. Let's manually run one eval using the pure function.
         loss0, (paramsK0, test_arrays0, train_temp0) = loss_fn_pure(U_pytree)
 
         # Reconstruct string metadata for logging
@@ -1456,10 +1484,11 @@ def prepare_baseline_data(
     emis_dict_train,
     emis_dict_test,
     historical_name="historical",
+    mode='FaIR'
 ):
     """Build baseline train/test datasets with the same feature construction as inverse."""
-    train_data = build_dataset_from_runfair_dict(emis_dict_train, historical_name=historical_name)
-    test_data  = build_dataset_from_runfair_dict(emis_dict_test, historical_name=historical_name)
+    train_data = build_dataset_from_runfair_dict(emis_dict_train, historical_name=historical_name, mode=mode)
+    test_data  = build_dataset_from_runfair_dict(emis_dict_test, historical_name=historical_name, mode=mode)
     # scale (fit on train, apply to test) — same as inverse
     train_s, test_s, stats = split_and_scale(train_data, test_data)
     return train_s, test_s, stats
@@ -1513,17 +1542,18 @@ def _apply_stats_to_test(test_dataset, stats):
 # --- main wrapper ------------------------------------------------------------
 def evaluate_baseline_over_multiple_tests(
     emis_dict_train,
-    test_sets: dict,              # {"H": emis_dict_test_H, "S": emis_dict_test_S, ...}
+    eval_sets: dict,              # {"H": emis_dict_test_H, "S": emis_dict_test_S, ...}
     historical_name="historical",
     key=jax.random.PRNGKey(0),
     hidden_sizes=[16],
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
+    mode='FaIR'
 ):
     """
     Trains the baseline emulator ONCE using emis_dict_train,
-    then evaluates on each test set in `test_sets` using the same scaler and MLP params.
+    then evaluates on each set in `eval_sets` using the same scaler and MLP params.
 
     Returns:
       paramsK_base,
@@ -1539,6 +1569,7 @@ def evaluate_baseline_over_multiple_tests(
         emis_dict_train=emis_dict_train,
         emis_dict_test=emis_dict_train,
         historical_name=historical_name,
+        mode=mode
     )
 
     # 2) Train baseline emulator once
@@ -1553,68 +1584,72 @@ def evaluate_baseline_over_multiple_tests(
 
     # 3) Evaluate on each test designation
     baseline_results, baseline_preds, ground_truth = {}, {}, {}
-    for test_set, emis_dict_test in test_sets.items():
+    for eval_set, emis_dict_test in eval_sets.items():
+        year_weights = []
         # build raw test dataset
         test_raw = build_dataset_from_runfair_dict(
-            emis_dict_test, historical_name=historical_name
+            emis_dict_test, historical_name=historical_name, mode=mode
         )
         # scale with train stats (no refit!)
         test_s_scaled = _apply_stats_to_test(test_raw, stats)
 
         # compute per-scenario NRMSE and mean
-        baseline_results[test_set], baseline_preds[test_set], ground_truth[test_set] = {}, {}, {}
+        baseline_results[eval_set], baseline_preds[eval_set], ground_truth[eval_set] = {}, {}, {}
         for (Xte, yte, scen_name) in test_s_scaled:
+            if eval_set not in ['Tier 1','All'] and scen_name == 'historical':
+                continue
             yhat = mlp_forward(paramsK_base, Xte)
-            r_s  = float(_nrmse(jnp.asarray(yhat), jnp.asarray(yte)))
+            r_s  = _nrmse(jnp.asarray(yhat), jnp.asarray(yte))
 
-            ground_truth[test_set][scen_name] = yte
-            baseline_preds[test_set][scen_name] = yhat
-            baseline_results[test_set][scen_name] = r_s
+            ground_truth[eval_set][scen_name] = yte
+            baseline_preds[eval_set][scen_name] = yhat
+            baseline_results[eval_set][scen_name] = r_s
+            year_weights.append(len(jnp.asarray(yhat)))
 
-        baseline_results[test_set]['mean'] = float(np.mean(list(baseline_results[test_set].values()))) if baseline_results[test_set] else float("nan")
+        baseline_results[eval_set]['mean'] = np.average(list(baseline_results[eval_set].values()), weights=year_weights)
 
     return paramsK_base, baseline_results, baseline_preds, ground_truth
 
-def create_baseline(train_s, test_s, idx_demo, hidden_sizes=[16], verbose=False):
+def create_baseline(train_s, test_s, hidden_sizes=[16], idx_demo=None, verbose=False):
 
-  def eval_test_nrmse_by_scenario(params, test_list):
-      """Returns list of (scenario_name, rmse_value) for all tests."""
-      out = []
-      for (Xte, yte, scen_name) in test_list:
-          yhat = mlp_forward(params, Xte)
-          out.append((scen_name, _nrmse(yhat, yte)))
-      return out
+    def eval_test_nrmse_by_scenario(params, test_list):
+        """Returns list of (scenario_name, rmse_value) for all tests."""
+        out = []
+        for (Xte, yte, scen_name) in test_list:
+            yhat = mlp_forward(params, Xte)
+            out.append((scen_name, _nrmse(yhat, yte)))
+        return out
 
-  (Xs, y, scen) = train_s[0]
-  X_for_mlp = Xs.reshape((Xs.shape[0], 1, Xs.shape[1]))
+    (Xs, y, scen) = train_s[0]
+    X_for_mlp = Xs.reshape((Xs.shape[0], 1, Xs.shape[1]))
 
-  Xtr = jnp.concatenate([X for (X, _, _) in train_s], axis=0).astype(jnp.float32)  # (N, 4)
-  ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
+    Xtr = jnp.concatenate([X for (X, _, _) in train_s], axis=0).astype(jnp.float32)  # (N, 4)
+    ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
 
-  key    = jax.random.PRNGKey(0)
-  input_dim = Xtr.shape[1]
+    key    = jax.random.PRNGKey(0)
+    input_dim = Xtr.shape[1]
 
-  params0 = init_mlp_params(key, input_dim=input_dim, hidden_sizes=hidden_sizes)
+    params0 = init_mlp_params(key, input_dim=input_dim, hidden_sizes=hidden_sizes)
 
-  train_mlp_sgd_jit = jax.jit(train_mlp_sgd, static_argnames=("K",))
-  paramsK, losses = train_mlp_sgd_jit(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2)
+    train_mlp_sgd_jit = jax.jit(train_mlp_sgd, static_argnames=("K",))
+    paramsK, losses = train_mlp_sgd_jit(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2)
 
-  (Xs_demo, y_demo, scen_demo) = test_s[idx_demo]
+    if idx_demo is not None:
+        (Xs_demo, y_demo, scen_demo) = test_s[idx_demo]
+        plot_mlp_predictions(paramsK, Xs_demo, y_demo, metric="RMSE", title_prefix=f"{scen_demo}")
 
-  plot_mlp_predictions(paramsK, Xs_demo, y_demo, metric="RMSE", title_prefix=f"{scen_demo}")
+    rmse_list = eval_test_nrmse_by_scenario(paramsK, test_s)
+    avg_rmse  = jnp.mean(jnp.stack([r for (_, r) in rmse_list]))
 
-  rmse_list = eval_test_nrmse_by_scenario(paramsK, test_s)
-  avg_rmse  = jnp.mean(jnp.stack([r for (_, r) in rmse_list]))
+    if verbose:
+        # Print results
+        for name, r in rmse_list:
+            print(f"{name:30s}  RMSE = {float(r):.6f}")
+        print(f"\nAverage test RMSE across {len(rmse_list)} scenarios: {float(avg_rmse):.6f}")
 
-  if verbose:
-    # Print results
-    for name, r in rmse_list:
-        print(f"{name:30s}  RMSE = {float(r):.6f}")
-    print(f"\nAverage test RMSE across {len(rmse_list)} scenarios: {float(avg_rmse):.6f}")
+    return params0
 
-  return params0
-
-def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AGENTS_DEFAULT, active=("CO2",), mode='FaIR'):
+def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AGENTS_DEFAULT, active_agents=('CO2'), mode='FaIR'):
 
   years_tr1, E0 = extract_years_and_emis(emis_dict_JAX[scen])
 
@@ -1626,7 +1661,7 @@ def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AG
       params0=params0,
       historical_name="historical",
       agents=agents,
-      active=active,
+      active_agents=active_agents,
       dtype=jnp.float32,
       mode=mode
   )
@@ -1635,14 +1670,23 @@ def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AG
   val, g = jax.value_and_grad(objective_over_emissions, argnums=0, has_aux=False)((E0))
 
   # Gradient check (should be non-zero)
+  print(f'Getting gradient for {scen}...')
   for key in g:
-      print(f"||grad {key}||:", float(jnp.linalg.norm(g[key])))
+      print(f"\t||grad {key}||:", float(jnp.linalg.norm(g[key])))
 
   return
 
+all_scens = {'tier1': ['historical', 'H-ext', 'M', 'ML', 'L', 'VLLO-ext', 'VLHO'],
+             'tier2': ['H-ext-OS', 'M-ext', 'ML-ext', 'L-ext', 'VLHO-ext'],
+             'DECK': ['abrupt-4xCO2', '1pctCO2'],
+             'CS3': ['AA', 'CT'],
+             'all': ['historical', 'H-ext', 'M', 'ML', 'L', 'VLLO-ext', 'VLHO', 'H-ext-OS', 'M-ext', 'ML-ext', 'L-ext', 'VLHO-ext', 'abrupt-4xCO2', '1pctCO2', 'AA', 'CT'],
+}
+
 def evaluate_optimal_emulator(
     training_paths: list[str],
-    test_sets: dict,
+    train_scenarios: list[str],
+    eval_sets: dict,
     params0: dict=None,
     agents=AGENTS_DEFAULT,
     active_agents=None,
@@ -1652,19 +1696,20 @@ def evaluate_optimal_emulator(
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
-    mode='FaIR'
+    mode='FaIR',
+    ind_effects=False
 ):
-    """
-    Loads optimized emissions, converts them to a stacked array, trains a new emulator,
-    and evaluates against test sets.
-    """
     results_out = {}
+
+    if ind_effects:
+        y_hat_all = {}
 
     # Ensure active_agents is iterable; default to all if None
     if active_agents is None:
         active_agents = tuple(agents)
 
-    for path in training_paths:
+    for i, path in enumerate(training_paths):
+        train_label = train_scenarios[i]
         # 1) Load dataset
         with open(path, "rb") as f:
             raw = pickle.load(f)
@@ -1707,28 +1752,35 @@ def evaluate_optimal_emulator(
             params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay
         )
 
-        #paramsK = _tree_to_jnp(raw["paramsK_k"])
-
-        # 6) Evaluate on all test sets
-        path_res = {"params": paramsK, "stats": stats, "metrics": {}}
-
-        for test_name, emis_dict_test in test_sets.items():
+        results_out[train_label] = {}
+        if ind_effects:
+            y_hat_all[train_label] = {}
+        for test_name, emis_dict_test in eval_sets.items():
             test_raw = build_dataset_from_runfair_dict(
                 emis_dict_test, historical_name=historical_name
             )
             test_s_scaled = _apply_stats_to_test(test_raw, stats)
 
-            scen_errors = {}
+            weights = []
+            results_out[train_label][test_name] = {}
+            if ind_effects:
+                y_hat_all[train_label][test_name] = {}
             for (Xte, yte, scen_name) in test_s_scaled:
+                if test_name not in ['Tier 1', 'All'] and scen_name == 'historical':
+                    continue
                 yhat = mlp_forward(paramsK, Xte)
                 nrmse = float(_nrmse(jnp.asarray(yhat), jnp.asarray(yte)))
-                scen_errors[scen_name] = nrmse
+                results_out[train_label][test_name][scen_name] = nrmse
+                weights.append(len(yhat))
 
-            mean_err = np.mean(list(scen_errors.values())) if scen_errors else float("nan")
-            path_res["metrics"][test_name] = scen_errors
-            path_res["metrics"][test_name]['mean'] = float(mean_err)
+                if ind_effects:
+                    y_hat_all[train_label][test_name][scen_name] = yhat
 
-        results_out[path] = path_res
+            mean_err = np.average(list(results_out[train_label][test_name].values()), weights=weights)
+            results_out[train_label][test_name]['mean'] = float(mean_err)
+
+    if ind_effects:
+        return results_out, y_hat_all
 
     return results_out
 
@@ -1749,3 +1801,100 @@ def CS3_hist_modifier(scen_name, years_hist, emis_hist_dict):
         return years_new, emis_new
 
     return years_hist, emis_hist_dict
+
+
+# -------------------------------
+# Wrapper functions for notebooks
+# -------------------------------
+
+def generate_init_params_and_train_data(agents, active_agents, test_scen, hidden_sizes=[16], idx_demo=None, verbose=False, mode='FaIR'):
+
+    emis_dict_train_FaIR, emis_dict_test_FaIR, emis_dict_train_JAX, emis_dict_test_JAX, delT_dict_train_FaIR, delT_dict_test_FaIR, delT_dict_train_JAX, delT_dict_test_JAX = utils_FaIR_JAX.generate_train_test(agents, mode=mode)
+
+    train_data = build_dataset_from_runfair_dict(emis_dict_train_JAX, mode=mode)
+    test_data = build_dataset_from_runfair_dict(emis_dict_test_JAX, mode=mode)
+    train_s, test_s, stats = split_and_scale(train_data, test_data)
+
+    params0 = create_baseline(train_s, test_s, hidden_sizes=hidden_sizes, idx_demo=idx_demo, verbose=verbose)
+    test_get_grad(test_scen, params0, emis_dict_train_JAX, train_data, test_data, active_agents=active_agents, mode=mode)
+
+    return params0, emis_dict_train_JAX
+
+def generate_eval_data(agents, CS3=False, DAMIP=False, GeoMIP=False):
+
+    eval_data = utils_FaIR_JAX.generate_JAX_data(agents, CS3=CS3, DAMIP=DAMIP, GeoMIP=GeoMIP)
+
+    keys = ["Tier 1", "Tier 2", "DECK"]
+    if CS3: keys.append("CS3")
+    if DAMIP: keys.append("DAMIP")
+    if GeoMIP: keys.append("GeoMIP")
+
+    # TEMPORARY!
+    if len(agents) == 5:
+        for a in agents:
+            if a == 'CO2':
+                continue
+            eval_data[2].pop(f'abrupt-4x{a}')
+            eval_data[2].pop(f'1pct{a}')
+
+    eval_sets = dict(zip(keys, eval_data))
+
+    emis_dict_all_JAX = {}
+    for d in eval_data:
+        emis_dict_all_JAX |= d
+
+    eval_sets["All"] = emis_dict_all_JAX
+
+    return eval_sets, *eval_data, emis_dict_all_JAX
+
+def generate_and_eval_baseline_emulator(emis_dict_train, eval_sets, save_path=None, verbose=False, hidden_sizes=[16], mode='FaIR'):
+
+    paramsK_base, baseline_results, baseline_pred_delT, ground_truth_delT = evaluate_baseline_over_multiple_tests(
+    emis_dict_train=emis_dict_train,
+    eval_sets=eval_sets,
+    historical_name="historical",
+    key=jax.random.PRNGKey(0),
+    hidden_sizes=hidden_sizes,
+    K=400,
+    lr=5e-2,
+    weight_decay=1e-2,
+    mode=mode
+)
+
+    if save_path is not None:
+        with open(save_path, "wb") as f:
+            pickle.dump(baseline_results, f)
+
+    if verbose:
+        for eval_set in baseline_results:
+            per_scen = baseline_results[eval_set]
+            mean_err = baseline_results[eval_set]['mean']
+            print(f"\n{eval_set} mean NRMSE: {mean_err:.4f}")
+            for scen, val in per_scen.items():
+                if scen == 'mean':
+                    continue
+                print(f"  {scen:30s}  {val:.4f}")
+
+    return baseline_results, baseline_pred_delT, ground_truth_delT
+
+def plot_baseline_pred_delT(baseline_results, baseline_pred_delT, ground_truth_delT):
+    test_set = 'All'
+    N_scens = len(baseline_results[test_set])
+    rows = int(np.ceil(N_scens / 3))
+    cols = 3
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 3.5*rows), constrained_layout=True)
+    axes = axes.ravel()
+
+    for i, scen in enumerate(baseline_results[test_set]):
+        if scen == 'mean':
+            continue
+        ax = axes[i]
+        ax.plot(ground_truth_delT[test_set][scen],  label="truth", alpha=0.9)
+        ax.plot(baseline_pred_delT[test_set][scen],  label="prediction", ls="--", alpha=0.9)
+        ax.set_title(f"{scen} - NRMSE={baseline_results[test_set][scen]:.3f}")
+        ax.set_xlabel("time step")
+        ax.set_ylabel("GMST (K)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+    return
