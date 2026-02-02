@@ -310,7 +310,8 @@ def build_dataset_from_runfair_dict(
     emis_dict,
     historical_name="historical",
     agents=AGENTS_DEFAULT,
-    mode='FaIR'
+    mode='FaIR',
+    ema_windows_years=(5.0, 30.0, 100.0)
 ):
     """
     Returns list of (X_features, y_target, scenario_name), using:
@@ -342,7 +343,7 @@ def build_dataset_from_runfair_dict(
             emis_curr_dict=emis_cur_dict,
             emis_hist_dict=(emis_hist_dict if needs_history else None),
             agents=agents,
-            ema_windows_years=(5.0, 30.0, 100.0),
+            ema_windows_years=ema_windows_years,
             dt_years=1.0,
             zero_fill_missing=True,
         )
@@ -633,20 +634,21 @@ def build_train(
     N = min(X.shape[0], y.shape[0])
     return [(X[:N], y[:N], "opt_scen")]
 
-def build_dataset_no_history(emis_dict, scenarios, agents=AGENTS_DEFAULT, mode='FaIR'):
+def build_dataset_no_history(emis_dict, scenarios, agents=AGENTS_DEFAULT, mode='FaIR', ema_windows_years=(5.0, 30.0, 100.0)):
     """
     Build features/targets without prepending historical emissions.
     Uses a sentinel historical_name that won't be found in the dict.
     """
     return build_dataset_from_runfair_dict(
-        emis_dict, scenarios, historical_name="__NONE__", agents=agents, mode=mode
+        emis_dict, scenarios, historical_name="__NONE__", agents=agents, mode=mode, ema_windows_years=ema_windows_years
     )
 
 def build_valid(
     emis_dict_valid,
     historical_name="historical",
     agents=AGENTS_DEFAULT,
-    mode='FaIR'
+    mode='FaIR',
+    ema_windows_years=(5.0, 30.0, 100.0)
 ):
     """
     Combined validation set:
@@ -656,7 +658,7 @@ def build_valid(
     """
     valid = build_dataset_from_runfair_dict(
         emis_dict_valid,
-        historical_name=historical_name, agents=agents, mode=mode
+        historical_name=historical_name, agents=agents, mode=mode, ema_windows_years=ema_windows_years
     )
     return valid
 
@@ -941,7 +943,8 @@ def make_inverse_objective_single_train(
     active_agents=("CO2",),
     inactive_mode="zeros",
     smoothness_weight=0.0,
-    mode='FaIR'
+    mode='FaIR',
+    ema_windows_years=(5.0, 30.0, 100.0)
 ):
     def objective(U_pytree):
         U_eff = _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode)
@@ -958,7 +961,7 @@ def make_inverse_objective_single_train(
         train_updated = build_train(
             U_eff,
             agents=agents,
-            ema_windows_years=(5.0, 30.0, 100.0),
+            ema_windows_years=ema_windows_years,
             dtype=jnp.float32,
             years_hist=None,
             emis_hist_dict=None,
@@ -1076,6 +1079,7 @@ def optimize_emissions_inverse(
     checkpoint_every=50,
     resume_if_exists=True,
     preds_every=50,
+    ema_windows_years=(5.0, 30.0, 50.0)
 ):
     import gc # Import garbage collection
 
@@ -1114,7 +1118,8 @@ def optimize_emissions_inverse(
         active_agents=active_agents,
         inactive_mode=inactive_mode,
         smoothness_weight=smoothness_weight,
-        mode=mode
+        mode=mode,
+        ema_windows_years=ema_windows_years
     )
 
     # --- 1. Create a Pure Loss Function (No Strings) ---
@@ -1484,11 +1489,12 @@ def prepare_baseline_data(
     emis_dict_train,
     emis_dict_test,
     historical_name="historical",
-    mode='FaIR'
+    mode='FaIR',
+    ema_windows_years=(5.0, 30.0, 100.0)
 ):
     """Build baseline train/test datasets with the same feature construction as inverse."""
-    train_data = build_dataset_from_runfair_dict(emis_dict_train, historical_name=historical_name, mode=mode)
-    test_data  = build_dataset_from_runfair_dict(emis_dict_test, historical_name=historical_name, mode=mode)
+    train_data = build_dataset_from_runfair_dict(emis_dict_train, historical_name=historical_name, mode=mode, ema_windows_years=ema_windows_years)
+    test_data  = build_dataset_from_runfair_dict(emis_dict_test, historical_name=historical_name, mode=mode, ema_windows_years=ema_windows_years)
     # scale (fit on train, apply to test) — same as inverse
     train_s, test_s, stats = split_and_scale(train_data, test_data)
     return train_s, test_s, stats
@@ -1549,7 +1555,8 @@ def evaluate_baseline_over_multiple_tests(
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
-    mode='FaIR'
+    mode='FaIR',
+    ema_windows_years=(5.0, 30.0, 100.0)
 ):
     """
     Trains the baseline emulator ONCE using emis_dict_train,
@@ -1588,7 +1595,7 @@ def evaluate_baseline_over_multiple_tests(
         year_weights = []
         # build raw test dataset
         test_raw = build_dataset_from_runfair_dict(
-            emis_dict_test, historical_name=historical_name, mode=mode
+            emis_dict_test, historical_name=historical_name, mode=mode, ema_windows_years=ema_windows_years
         )
         # scale with train stats (no refit!)
         test_s_scaled = _apply_stats_to_test(test_raw, stats)
@@ -1697,7 +1704,8 @@ def evaluate_optimal_emulator(
     lr=5e-2,
     weight_decay=1e-2,
     mode='FaIR',
-    ind_effects=False
+    ind_effects=False,
+    ema_windows_years=(5.0, 30.0, 100.0)
 ):
     results_out = {}
 
@@ -1730,7 +1738,7 @@ def evaluate_optimal_emulator(
         train_updated = build_train(
             U_eff_array,
             agents=agents,
-            ema_windows_years=(5.0, 30.0, 100.0),
+            ema_windows_years=ema_windows_years,
             dtype=jnp.float32,
             years_hist=None,
             emis_hist_dict=None,
@@ -1757,7 +1765,7 @@ def evaluate_optimal_emulator(
             y_hat_all[train_label] = {}
         for test_name, emis_dict_test in eval_sets.items():
             test_raw = build_dataset_from_runfair_dict(
-                emis_dict_test, historical_name=historical_name
+                emis_dict_test, historical_name=historical_name, ema_windows_years=ema_windows_years
             )
             test_s_scaled = _apply_stats_to_test(test_raw, stats)
 
@@ -1807,12 +1815,12 @@ def CS3_hist_modifier(scen_name, years_hist, emis_hist_dict):
 # Wrapper functions for notebooks
 # -------------------------------
 
-def generate_init_params_and_train_data(agents, active_agents, test_scen, hidden_sizes=[16], idx_demo=None, verbose=False, mode='FaIR'):
+def generate_init_params_and_train_data(agents, active_agents, test_scen, hidden_sizes=[16], idx_demo=None, verbose=False, mode='FaIR', ema_windows_years=(5.0, 30.0, 100.0)):
 
     emis_dict_train_FaIR, emis_dict_test_FaIR, emis_dict_train_JAX, emis_dict_test_JAX, delT_dict_train_FaIR, delT_dict_test_FaIR, delT_dict_train_JAX, delT_dict_test_JAX = utils_FaIR_JAX.generate_train_test(agents, mode=mode)
 
-    train_data = build_dataset_from_runfair_dict(emis_dict_train_JAX, mode=mode)
-    test_data = build_dataset_from_runfair_dict(emis_dict_test_JAX, mode=mode)
+    train_data = build_dataset_from_runfair_dict(emis_dict_train_JAX, mode=mode, ema_windows_years=ema_windows_years)
+    test_data = build_dataset_from_runfair_dict(emis_dict_test_JAX, mode=mode, ema_windows_years=ema_windows_years)
     train_s, test_s, stats = split_and_scale(train_data, test_data)
 
     params0 = create_baseline(train_s, test_s, hidden_sizes=hidden_sizes, idx_demo=idx_demo, verbose=verbose)
@@ -1847,7 +1855,7 @@ def generate_eval_data(agents, CS3=False, DAMIP=False, GeoMIP=False):
 
     return eval_sets, *eval_data, emis_dict_all_JAX
 
-def generate_and_eval_baseline_emulator(emis_dict_train, eval_sets, save_path=None, verbose=False, hidden_sizes=[16], mode='FaIR'):
+def generate_and_eval_baseline_emulator(emis_dict_train, eval_sets, save_path=None, verbose=False, hidden_sizes=[16], mode='FaIR', ema_windows_years=(5.0, 30.0, 100.0)):
 
     paramsK_base, baseline_results, baseline_pred_delT, ground_truth_delT = evaluate_baseline_over_multiple_tests(
     emis_dict_train=emis_dict_train,
@@ -1858,7 +1866,8 @@ def generate_and_eval_baseline_emulator(emis_dict_train, eval_sets, save_path=No
     K=400,
     lr=5e-2,
     weight_decay=1e-2,
-    mode=mode
+    mode=mode,
+    ema_windows_years=ema_windows_years
 )
 
     if save_path is not None:
