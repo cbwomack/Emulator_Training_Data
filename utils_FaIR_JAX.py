@@ -777,19 +777,9 @@ def generate_calib_data(agents, mode='FaIR'):
 
   return emis_dict_calib_FaIR, emis_dict_calib_JAX, delT_dict_calib_FaIR, delT_dict_calib_JAX
 
-def generate_JAX_data(agents, CS3=False, DAMIP=False, GeoMIP=False):
+def generate_JAX_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
 
   emis_dict_tier1_FaIR, emis_dict_tier2_FaIR = run_fair.load_scenarioMIP_CMIP7(agents)
-  emis_dict_DECK_FaIR = run_fair.load_DECK_CMIP7(agents)
-
-  emis_dict_DECK_subset = {}
-  for scen in emis_dict_DECK_FaIR:
-    if any(a in scen for a in agents):
-      emis_dict_DECK_subset[scen] = {}
-      for a in agents:
-        emis_dict_DECK_subset[scen][a] = emis_dict_DECK_FaIR[scen][a].copy()
-    else:
-      continue
 
   emis_dict_JAX = get_emissions(emis_dict_tier1_FaIR, agents)
   emis_dict_tier1_JAX = build_emissions_by_agent(emis_dict_JAX)
@@ -797,13 +787,26 @@ def generate_JAX_data(agents, CS3=False, DAMIP=False, GeoMIP=False):
   emis_dict_JAX = get_emissions(emis_dict_tier2_FaIR, agents)
   emis_dict_tier2_JAX = build_emissions_by_agent(emis_dict_JAX)
 
-  emis_dict_JAX = get_emissions(emis_dict_DECK_subset, agents)
-  emis_dict_DECK_JAX = build_emissions_by_agent(emis_dict_JAX)
+  emis_dicts = [emis_dict_tier1_JAX, emis_dict_tier2_JAX]
 
-  emis_dicts = [emis_dict_tier1_JAX, emis_dict_tier2_JAX, emis_dict_DECK_JAX]
+  if DECK:
+    emis_dict_DECK_FaIR = run_fair.load_DECK_CMIP7(agents)
+
+    emis_dict_DECK_subset = {}
+    for scen in emis_dict_DECK_FaIR:
+      if any(a in scen for a in agents):
+        emis_dict_DECK_subset[scen] = {}
+        for a in agents:
+          emis_dict_DECK_subset[scen][a] = emis_dict_DECK_FaIR[scen][a].copy()
+      else:
+        continue
+
+    emis_dict_JAX = get_emissions(emis_dict_DECK_subset, agents)
+    emis_dict_DECK_JAX = build_emissions_by_agent(emis_dict_JAX)
+    emis_dicts.append(emis_dict_DECK_JAX)
 
   if CS3:
-    emis_dict_JAX = run_fair.load_CS3(agents=agents, emis_dict_tier1=emis_dict_DECK_FaIR)
+    emis_dict_JAX = run_fair.load_CS3(agents=agents, emis_dict_tier1=emis_dict_tier1_FaIR)
 
     for scen in emis_dict_JAX:
         for a in emis_dict_JAX[scen]:
