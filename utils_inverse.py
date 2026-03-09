@@ -368,6 +368,11 @@ def fit_scaler(X: jnp.ndarray, eps: float = 1e-8):
     Xs = (X - mu) / sd
     return Xs, (mu, sd)
 
+def fit_scaler_no_center(X: jnp.ndarray, eps: float = 1e-8):
+    scale = jnp.sqrt(jnp.mean(X**2, axis=0) + eps)
+    Xs = X / scale
+    return Xs, (jnp.zeros_like(scale), scale)
+
 def apply_scaler(X: jnp.ndarray, stats):
     mu, sd = stats
     return (X - mu) / sd
@@ -820,13 +825,13 @@ def make_init_emissions_pytree(
     # Default parameters per agent for different initialization modes
     # Modify these values to tune the "different parameters" per forcing agent
     AGENT_CONFIGS = {
-        "CO2":    {"peak": 50.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
-        "CH4":    {"peak": 500.0, "mu": 450, "sig_frac": 0.25, "period": 150},
-        "N2O":    {"peak": 10.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
-        "Sulfur": {"peak": 60.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
-        "BC":     {"peak": 10.0,  "mu": 350, "sig_frac": 0.15, "period": 150},
+        "CO2":    {"peak": 60.0,  "mu": 350, "sig_frac": 0.15, "period": 500},
+        "CH4":    {"peak": 750.0, "mu": 450, "sig_frac": 0.25, "period": 500},
+        "N2O":    {"peak": 10.0,  "mu": 350, "sig_frac": 0.15, "period": 250},
+        "Sulfur": {"peak": 60.0,  "mu": 350, "sig_frac": 0.15, "period": 250},
+        "BC":     {"peak": 10.0,  "mu": 350, "sig_frac": 0.15, "period": 250},
         # Fallback for unknown agents
-        "DEFAULT": {"peak": 50.0, "mu": 350, "sig_frac": 0.15, "period": 150},
+        "DEFAULT": {"peak": 50.0, "mu": 350, "sig_frac": 0.15, "period": 250},
     }
 
     def _get_zero():
@@ -1828,17 +1833,18 @@ def generate_init_params_and_train_data(agents, active_agents, test_scen, hidden
 
     return params0, emis_dict_train_JAX
 
-def generate_eval_data(agents, CS3=False, DAMIP=False, GeoMIP=False):
+def generate_eval_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
 
-    eval_data = utils_FaIR_JAX.generate_JAX_data(agents, CS3=CS3, DAMIP=DAMIP, GeoMIP=GeoMIP)
+    eval_data = utils_FaIR_JAX.generate_JAX_data(agents, DECK=DECK, CS3=CS3, DAMIP=DAMIP, GeoMIP=GeoMIP)
 
-    keys = ["Tier 1", "Tier 2", "DECK"]
+    keys = ["Tier 1", "Tier 2"]
+    if DECK: keys.append("DECK")
     if CS3: keys.append("CS3")
     if DAMIP: keys.append("DAMIP")
     if GeoMIP: keys.append("GeoMIP")
 
     # TEMPORARY!
-    if len(agents) == 5:
+    if len(agents) == 5 and "DECK" in keys:
         for a in agents:
             if a == 'CO2':
                 continue
@@ -1907,3 +1913,571 @@ def plot_baseline_pred_delT(baseline_results, baseline_pred_delT, ground_truth_d
         ax.legend(loc="best", fontsize=8)
 
     return
+
+## --------------
+## Emulating MESM
+## --------------
+
+def init_mlp_params_vector(key, input_dim, hidden_sizes, output_dim):
+    """
+    Initialize parameters for an MLP with a vector output.
+
+    Args:
+        output_dim: Size of the output vector (e.g., number of spatial EOFs or bins).
+    """
+    params = []
+    # Architecture: input -> hidden ... -> hidden -> output_vector
+    layer_dims = [input_dim] + hidden_sizes + [output_dim]
+
+    keys = jax.random.split(key, len(layer_dims) - 1)
+
+    for i in range(len(layer_dims) - 1):
+        in_d, out_d = layer_dims[i], layer_dims[i+1]
+
+        # Xavier/Glorot initialization
+        lim = jnp.sqrt(6.0 / (in_d + out_d))
+        W = jax.random.uniform(keys[i], (in_d, out_d), minval=-lim, maxval=lim)
+        b = jnp.zeros((out_d,))
+
+        params.append({'W': W, 'b': b})
+
+    return params
+
+def mlp_forward_vector(params, X):
+    """
+    Forward pass for a vector-output MLP.
+
+    Returns:
+        Array of shape (N, output_dim). No squeezing is applied.
+    """
+    X = X.astype(params[0]["W"].dtype)
+
+    # Flatten input to (N, D) if it comes in as (T, D) or similar
+    N = X.shape[0]
+    activations = X.reshape(N, -1)
+
+    # Hidden layers (tanh activation)
+    for layer in params[:-1]:
+        linear = activations @ layer['W'] + layer['b']
+        activations = jnp.tanh(linear)
+
+    # Final Output Layer (Linear)
+    final_layer = params[-1]
+    y = activations @ final_layer['W'] + final_layer['b']
+
+    return y
+
+def train_mlp_sgd_vector(params0, Xtr, ytr, weights=None, K=400, lr=5e-2, weight_decay=1e-2):
+    """
+    Training loop specifically for vector outputs (Xtr, ytr).
+    ytr shape should be (N_samples, output_dim).
+    """
+    # Ensure types match
+    pdt = params0[0]["W"].dtype
+    Xtr = Xtr.astype(pdt)
+    ytr = ytr.astype(pdt)
+
+    if weights is not None:
+        weights = weights.astype(pdt)
+        weights = weights.reshape(1, -1)
+    else:
+        weights = 1.0
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.add_decayed_weights(weight_decay),
+        optax.sgd(lr)
+    )
+    opt_state = optimizer.init(params0)
+
+    @jax.checkpoint
+    def step(carry, _):
+        params, opt_state = carry
+
+        def loss_fn(p):
+            yhat = mlp_forward_vector(p, Xtr)
+            sq_err = weights * (yhat - ytr)**2
+            return jnp.mean(sq_err)
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+
+        # Safety for gradients
+        grads = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=1e6, neginf=-1e6), grads)
+
+        updates, opt_state = optimizer.update(grads, opt_state, params=params)
+        params = optax.apply_updates(params, updates)
+
+        return (params, opt_state), loss
+
+    (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
+    return paramsK, losses
+
+def build_dataset_vector_targets(
+    emis_dict,
+    targets_dict,
+    scenarios,
+    historical_name="historical",
+    agents=AGENTS_DEFAULT,
+    ema_windows_years=(5.0, 30.0, 100.0),
+    target_crop_future=162,
+    emis_offset_hist=111
+):
+    """
+    Constructs a dataset where targets are retrieved from `targets_dict` rather
+    than being simulated internally.
+
+    Args:
+        emis_dict: Dictionary of emissions scenarios (inputs).
+        targets_dict: Dictionary of target arrays {scenario: (T, output_dim)}.
+        scenarios: List of scenario names to include.
+
+    Returns:
+        List of (X_feature, y_target, scenario_name) tuples.
+    """
+    # Extract historical emissions for feature construction context (full from 1750)
+    years_hist, emis_hist_dict = (None, None)
+    if historical_name in emis_dict:
+        years_hist, emis_hist_dict = extract_years_and_emis(
+            emis_dict[historical_name], agents=agents
+        )
+
+    dataset = []
+
+    for scen in scenarios:
+        # Skip if scenario is missing from either inputs or targets
+        if scen not in emis_dict or scen not in targets_dict:
+            continue
+
+        y_target = jnp.asarray(targets_dict[scen], dtype=jnp.float32)
+
+        if scen != historical_name and historical_name in emis_dict:
+            # For future scenarios, remove the prepended historical period
+            if y_target.shape[0] > target_crop_future:
+                y_target = y_target[target_crop_future:]
+            else:
+                print(f"Warning: Target for {scen} is shorter than crop length {target_crop_future}.")
+
+
+        # 2. Get Input Features (Emissions)
+        yrs_cur, emis_cur_dict = extract_years_and_emis(
+            emis_dict[scen], agents=agents
+        )
+
+        # Handle historical context for features
+        needs_history = (
+            (scen != historical_name) and
+            (years_hist is not None) and
+            (scen in scens_with_hist)
+        )
+
+        cur_hist_emis = emis_hist_dict
+        if needs_history:
+             _, cur_hist_emis = CS3_hist_modifier(scen, years_hist, emis_hist_dict)
+
+        # Build Features (same as baseline)
+        X = make_features_emissions_generic(
+            emis_curr_dict=emis_cur_dict,
+            emis_hist_dict=(cur_hist_emis if needs_history else None),
+            agents=agents,
+            ema_windows_years=ema_windows_years,
+            dt_years=1.0,
+            zero_fill_missing=True,
+        )
+
+        if scen == historical_name:
+            # Historical Emissions start 1750, Targets start 1861.
+            if X.shape[0] > emis_offset_hist:
+                X = X[emis_offset_hist:]
+
+        # 3. Align Lengths
+        # If feature generation and target array differ slightly in length, trim to min.
+        N = min(X.shape[0], y_target.shape[0])
+        dataset.append((X[:N], y_target[:N], scen))
+
+    return dataset
+
+def prepare_data_vector(
+    emis_dict_train,
+    targets_dict_train,
+    scenarios_train,
+    historical_name="historical",
+    ema_windows_years=(5.0, 30.0, 100.0),
+    target_crop_future=162,
+    emis_offset_hist=111,
+    precomp_stats_X=None
+):
+    """Builds and scales the training data for vector targets."""
+    # Build raw
+    train_raw = build_dataset_vector_targets(
+        emis_dict_train, targets_dict_train, scenarios_train,
+        historical_name=historical_name, ema_windows_years=ema_windows_years,
+        target_crop_future=target_crop_future, emis_offset_hist=emis_offset_hist
+    )
+
+    if not train_raw:
+        raise ValueError("Train dataset empty. Check scenario keys.")
+
+    # Stack to fit scalers
+    Xtr_all = jnp.concatenate([d[0] for d in train_raw], axis=0)
+
+    if precomp_stats_X is not None:
+        # Use provided baseline stats
+        stats_X = precomp_stats_X
+        Xtr_scaled_all = apply_scaler(Xtr_all, stats_X)
+    else:
+        # Fit new stats
+        Xtr_scaled_all, stats_X = fit_scaler(Xtr_all)
+
+    # Reshape back to list
+    train_scaled = []
+    idx = 0
+    for (X, y, scen) in train_raw:
+        n = X.shape[0]
+        train_scaled.append((
+            Xtr_scaled_all[idx : idx + n],
+            jnp.asarray(y, dtype=jnp.float32),
+            scen
+        ))
+        idx += n
+
+    return train_scaled, stats_X
+
+def evaluate_emulator_vector_over_multiple_tests(
+    params,
+    stats_X,
+    eval_emis_sets,
+    eval_targets_sets,
+    lat_coords=None,
+    historical_name="historical",
+    ema_windows_years=(5.0, 30.0, 100.0),
+    target_crop_future=162,
+    emis_offset_hist=111
+):
+    """
+    Evaluates vector emulator with both Zonal (per-dim) and Global (weighted) NRMSE.
+    """
+
+    results = {}
+    predictions = {}
+    ground_truth = {}
+
+    # --- 1. Setup Latitude Weights ---
+    # Expecting predictions to be shape (T, N_lat).
+    # Weights should be (N_lat,)
+    if lat_coords is not None:
+        # Convert to radians and take cosine
+        # We enforce a tiny epsilon floor to prevent division by zero if exactly 90 deg is passed
+        weights = np.cos(np.deg2rad(lat_coords))
+        weights = np.maximum(weights, 1e-6)
+        weights = weights / np.sum(weights) # Normalize so they sum to 1
+    else:
+        # If no lats provided, uniform weighting for global metric
+        # We can't know dimension yet, will init inside loop or assume uniform
+        weights = None
+
+    def apply_stats_to_test_vector(raw_list, sX):
+        out = []
+        for (X, y, scen) in raw_list:
+            Xs = apply_scaler(X, sX)
+            out.append((Xs, y, scen))
+        return out
+
+    for set_name, emis_d in eval_emis_sets.items():
+        targets_d = eval_targets_sets.get(set_name)
+        if targets_d is None: continue
+
+        # Build raw test data
+        scens = list(emis_d.keys())
+        raw_test = build_dataset_vector_targets(
+            emis_d, targets_d, scens,
+            historical_name=historical_name, ema_windows_years=ema_windows_years,
+            target_crop_future=target_crop_future, emis_offset_hist=emis_offset_hist
+        )
+
+        scaled_test = apply_stats_to_test_vector(raw_test, stats_X)
+
+        # Storage for this evaluation set
+        res_set = {}
+        pred_set, truth_set = {}, {}
+
+        # Lists to aggregate means across scenarios
+        errs_global_list, errs_zonal_list = [], []
+        lens = []
+
+        for (Xs, ytrue, scen) in scaled_test:
+            if set_name not in ['Tier 1', 'All'] and scen == historical_name:
+                continue
+
+            # Predict
+            yhat = mlp_forward_vector(params, Xs)
+
+            # Store predictions
+            pred_set[scen] = yhat
+            truth_set[scen] = ytrue
+
+            # --- METRIC CALCULATION ---
+
+            # Init weights if not done (uniform fallback)
+            dims = ytrue.shape[1]
+            if weights is None:
+                current_weights = np.ones(dims) / dims
+            else:
+                if len(weights) != dims:
+                    raise ValueError(f"Lat coords length {len(weights)} != Output dim {dims}")
+                current_weights = weights
+
+            # 1. Zonal NRMSE (Vector: one value per latitude band)
+            # RMSE per column
+            mse_zonal = np.mean((yhat - ytrue)**2, axis=0)
+            rmse_zonal = np.sqrt(mse_zonal)
+            # Normalize by range of truth per column
+            max_abs_zonal = np.max(np.abs(ytrue), axis=0)
+            nrmse_zonal = rmse_zonal / (max_abs_zonal + 1e-8)
+
+            # 2. Global NRMSE (Scalar: weighted average over space)
+            # Weighted MSE at each timestep, then averaged over time
+            # (T, D) -> (T,) -> Scalar
+            diff_sq = (yhat - ytrue)**2
+            weighted_diff_sq = diff_sq * current_weights[None, :] # Broadcast weights
+            mse_global_t = np.sum(weighted_diff_sq, axis=1) # Sum weighted errors over space
+            max_abs_global = np.max(np.abs(ytrue))
+            rmse_global_t = np.sqrt(mse_global_t)            # Shape (T,)
+            nrmse_global_t = rmse_global_t / (max_abs_global + 1e-8)
+            rmse_global = np.sqrt(np.mean(mse_global_t))    # Mean over time
+
+            # Normalize by global max abs
+            max_abs_global = np.max(np.abs(ytrue))
+            nrmse_global = rmse_global / (max_abs_global + 1e-8)
+
+            # Store per-scenario results
+            res_set[scen] = {
+                'global': float(nrmse_global),
+                'zonal': nrmse_zonal,
+                'global_t': nrmse_global_t
+            }
+
+            errs_global_list.append(nrmse_global)
+            errs_zonal_list.append(nrmse_zonal)
+            lens.append(ytrue.shape[0])
+
+        # Calculate Means across scenarios
+        if lens:
+            mean_global = np.average(errs_global_list, weights=lens)
+            # Average zonal vectors (stack them first)
+            mean_zonal = np.average(np.stack(errs_zonal_list), axis=0, weights=lens)
+
+            res_set['mean'] = {
+                'global': float(mean_global),
+                'zonal': mean_zonal
+            }
+
+        results[set_name] = res_set
+        predictions[set_name] = pred_set
+        ground_truth[set_name] = truth_set
+
+    return results, predictions, ground_truth
+
+def generate_and_eval_emulator_vector(
+    emis_dict_train,
+    targets_dict_train,
+    eval_emis_sets,
+    eval_targets_sets,
+    output_dim,
+    lat_coords=None,
+    hidden_sizes=[16],
+    lr=5e-2,
+    weight_decay=1e-2,
+    K=400,
+    save_path=None,
+    verbose=False,
+    key_seed=0,
+    historical_name="historical",
+    ema_windows_years=(5.0, 30.0, 100.0),
+    precomp_stats_X=None,
+    params0=None
+):
+    """Wrapper updated to pass lat_coords."""
+
+    # 1. Prepare Training Data
+    train_scens = list(emis_dict_train.keys())
+    train_scaled, stats_X = prepare_data_vector(
+        emis_dict_train, targets_dict_train, train_scens,
+        historical_name=historical_name, ema_windows_years=ema_windows_years,
+        precomp_stats_X=precomp_stats_X
+    )
+
+    Xtr = jnp.concatenate([d[0] for d in train_scaled], axis=0)
+    ytr = jnp.concatenate([d[1] for d in train_scaled], axis=0)
+
+    weights = None
+    if lat_coords is not None:
+        w = jnp.cos(jnp.deg2rad(lat_coords))
+        weights = w / jnp.mean(w)
+
+    # 2. Train
+    if params0 is None:
+        key = jax.random.PRNGKey(key_seed)
+        params0 = init_mlp_params_vector(key, Xtr.shape[1], hidden_sizes, output_dim)
+
+    paramsK, losses = jax.jit(train_mlp_sgd_vector, static_argnames=("K",))(
+        params0, Xtr, ytr, weights=weights, K=K, lr=lr, weight_decay=weight_decay
+    )
+
+    # 3. Evaluate (Pass lat_coords here)
+    results, preds, truths = evaluate_emulator_vector_over_multiple_tests(
+        paramsK, stats_X,
+        eval_emis_sets, eval_targets_sets,
+        lat_coords=lat_coords,
+        historical_name=historical_name,
+        ema_windows_years=ema_windows_years
+    )
+
+    if save_path is not None:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+        save_dict = {
+            "results": results,
+            "preds": preds,
+            "truth": truths,
+            "params": paramsK,
+            "stats": stats_X
+        }
+
+        with open(save_path, "wb") as f:
+            pickle.dump(save_dict, f)
+
+        if verbose:
+            print(f"Results saved to {save_path}")
+
+    if verbose:
+        for eval_set in results:
+            if 'mean' in results[eval_set]:
+                val = results[eval_set]['mean']['global']
+                print(f"\n{eval_set} Mean Global NRMSE: {val:.4f}")
+
+    if precomp_stats_X is None:
+        return results, preds, truths, paramsK, stats_X
+    return results, preds, truths, paramsK
+
+def plot_zonal_predictions(results, preds, truths, lat_coords, eval_set='Tier 1'):
+    """
+    Plots baseline emulator predictions vs ground truth at t=0, T/2, and T.
+    Includes a secondary axis (twinx) showing the Zonal NRMSE profile.
+    """
+    scenarios = list(preds[eval_set].keys())
+    n_scens = len(scenarios)
+
+    # 1. Determine Shared Axis Limits
+    # Flatten all arrays to find global min/max for Temperature
+    all_p = np.concatenate([p.flatten() for p in preds[eval_set].values()])
+    all_t = np.concatenate([t.flatten() for t in truths[eval_set].values()])
+    t_min, t_max = min(all_p.min(), all_t.min()), max(all_p.max(), all_t.max())
+
+    # Determine global limits for NRMSE (secondary axis)
+    all_nrmse = []
+    for s in scenarios:
+        if 'zonal' in results[eval_set][s]:
+            all_nrmse.append(results[eval_set][s]['zonal'])
+    if all_nrmse:
+        all_nrmse = np.concatenate(all_nrmse)
+        n_min, n_max = 0, max(all_nrmse.max() * 1.1, 0.1) # Start at 0, add buffer
+    else:
+        n_min, n_max = 0, 1
+
+    # 2. Setup Plot
+    fig, axes = plt.subplots(n_scens, 3, figsize=(15, 3.5 * n_scens), constrained_layout=True)
+    if n_scens == 1: axes = np.expand_dims(axes, 0) # Ensure 2D array
+
+    # 3. Plotting Loop
+    for i, scen in enumerate(scenarios):
+        y_pred = preds[eval_set][scen]
+        y_true = truths[eval_set][scen]
+
+        # Metrics
+        glob_nrmse_t_series = results[eval_set][scen]['global_t']
+        zonal_nrmse = results[eval_set][scen]['zonal'] # (N_lat,)
+
+        T = y_true.shape[0]
+        time_steps = [0, T//2, T-1]
+
+        for j, t in enumerate(time_steps):
+            ax = axes[i, j]
+
+            # --- Primary Axis: Temperature ---
+            ax.plot(lat_coords, y_true[t], 'k-', label='Truth', lw=1.5, alpha=0.8)
+            ax.plot(lat_coords, y_pred[t], 'r--', label='Pred', lw=1.5, alpha=0.9)
+
+            ax.set_ylim(t_min, t_max)
+            ax.set_xlabel("Latitude")
+            if j == 0:
+                ax.set_ylabel("Temp Anomaly (K)")
+                ax.text(-0.25, 0.5, scen, transform=ax.transAxes,
+                        rotation=90, va='center', ha='right', fontsize=12, fontweight='bold')
+
+            # --- Secondary Axis: NRMSE ---
+            ax2 = ax.twinx()
+            ax2.plot(lat_coords, zonal_nrmse, 'g:', label='Zonal NRMSE', lw=1.5, alpha=0.6)
+            ax2.set_ylim(n_min, n_max)
+            ax2.tick_params(axis='y', labelcolor='tab:green')
+
+            if j == 2:
+                ax2.set_ylabel("Zonal NRMSE", color='tab:green')
+            else:
+                ax2.set_yticklabels([]) # Hide ticks on inner plots
+
+            # Titles and Legends
+            current_glob_nrmse = glob_nrmse_t_series[t]
+            ax.set_title(f"Year {t} | Global NRMSE: {current_glob_nrmse:.4f}")
+
+            if i == 0 and j == 0:
+                # Combined legend
+                lines, labels = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
+
+    return fig
+
+def generate_target_data(scenarios_dict, data_dir="./", opt=False):
+    """
+    Loads pickled zonal temperature data for scenarios defined in scenarios_dict.
+
+    Args:
+        scenarios_dict (dict): Keys are set names (e.g., 'Tier 1'), values are lists of scenario names.
+        data_dir (str): Directory where the .pkl files are stored.
+
+    Returns:
+        dict: A dictionary with the same keys as scenarios_dict, where values are
+              dictionaries mapping {scenario_name: target_array}.
+    """
+    target_sets, all_targets = {}, {}
+
+    for label, scenario_list in scenarios_dict.items():
+        set_targets = {}
+        for scen in scenario_list:
+            if opt:
+                file_path = os.path.join(data_dir, f"{label}/opt_{scen}_mean.pkl")
+            else:
+                file_path = os.path.join(data_dir, f"{label}/{scen}_mean.pkl")
+
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    data = pickle.load(f)
+                    set_targets[scen] = data
+            else:
+                print(f"Warning: File not found for scenario '{scen}' at {file_path}")
+
+        target_sets[label] = set_targets
+        all_targets.update(set_targets)
+
+    for key1 in target_sets:
+        for key2 in target_sets[key1]:
+            output_dim = target_sets[key1][key2].shape[1]
+            break
+        break
+
+    lat0, latf = -88, 88
+    lat_coords = np.linspace(lat0, latf, output_dim)
+
+    individual_dicts = [target_sets[k] for k in scenarios_dict]
+    return target_sets, *individual_dicts, output_dim, lat_coords
