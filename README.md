@@ -15,3 +15,5 @@ Notebooks are organized as:
 
 There are also notebooks for the supplemental material that start with the prefix "SI". The "utils" files contain various helper functions that are necessary for experiments, plotting, etc.
 
+## Data
+Data required to run FaIR is uploaded here under /data/FaIR/, while MESM output data will be uploaded to Zenodo for publication as the files are larger than recommended to upload on github.
