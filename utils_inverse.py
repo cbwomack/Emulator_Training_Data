@@ -15,6 +15,7 @@ from jax import tree as _jtree
 
 import os, pickle, numpy as np
 from functools import partial
+from cmcrameri import cm
 
 ## Setup plots
 plt.rcParams['figure.figsize'] = [12, 4]
@@ -2386,7 +2387,9 @@ def plot_zonal_predictions(results, preds, truths, lat_coords, eval_set='Tier 1'
         n_min, n_max = 0, 1
 
     # 2. Setup Plot
-    fig, axes = plt.subplots(n_scens, 3, figsize=(15, 3.5 * n_scens), constrained_layout=True)
+    fig, axes = plt.subplots(n_scens, 3, sharey='row',
+                             figsize=(16, 4.5 * n_scens),
+                             constrained_layout=True)
     if n_scens == 1: axes = np.expand_dims(axes, 0) # Ensure 2D array
 
     # 3. Plotting Loop
@@ -2405,36 +2408,46 @@ def plot_zonal_predictions(results, preds, truths, lat_coords, eval_set='Tier 1'
             ax = axes[i, j]
 
             # --- Primary Axis: Temperature ---
-            ax.plot(lat_coords, y_true[t], 'k-', label='Truth', lw=1.5, alpha=0.8)
-            ax.plot(lat_coords, y_pred[t], 'r--', label='Pred', lw=1.5, alpha=0.9)
+            ax.plot(lat_coords, y_true[t], color=cm.batlowS(0), ls='-', label='MESM temp. anomaly', lw=1.5, alpha=0.8)
+            ax.plot(lat_coords, y_pred[t], color=cm.lajollaS(2), ls='--', label='Emulated temp. anomaly', lw=1.5, alpha=0.9)
 
             ax.set_ylim(t_min, t_max)
             ax.set_xlabel("Latitude")
             if j == 0:
-                ax.set_ylabel("Temp Anomaly (K)")
+                ax.set_ylabel("Temp. anomaly [K]")
                 ax.text(-0.25, 0.5, scen, transform=ax.transAxes,
-                        rotation=90, va='center', ha='right', fontsize=12, fontweight='bold')
+                        rotation=90, va='center', ha='right', fontsize=14, fontweight='bold')
 
             # --- Secondary Axis: NRMSE ---
-            ax2 = ax.twinx()
-            ax2.plot(lat_coords, zonal_nrmse, 'g:', label='Zonal NRMSE', lw=1.5, alpha=0.6)
-            ax2.set_ylim(n_min, n_max)
-            ax2.tick_params(axis='y', labelcolor='tab:green')
+            #ax2 = ax.twinx()
+            #ax2.plot(lat_coords, zonal_nrmse, 'g:', label='Zonal NRMSE', lw=1.5, alpha=0.6)
+            #ax2.set_ylim(n_min, n_max)
+            #ax2.tick_params(axis='y', labelcolor='tab:green')
 
-            if j == 2:
-                ax2.set_ylabel("Zonal NRMSE", color='tab:green')
-            else:
-                ax2.set_yticklabels([]) # Hide ticks on inner plots
+            #if j == 2:
+            #    ax2.set_ylabel("Zonal NRMSE", color='tab:green')
+            #else:
+            #    ax2.set_yticklabels([]) # Hide ticks on inner plots
 
             # Titles and Legends
             current_glob_nrmse = glob_nrmse_t_series[t]
-            ax.set_title(f"Year {t} | Global NRMSE: {current_glob_nrmse:.4f}")
+            if j == 0:
+                ax.set_title('Scenario start', fontsize=16)
+            elif j == 1:
+                ax.set_title('Scenario middle', fontsize=16)
+            elif j == 2:
+                ax.set_title('Scenario end', fontsize=16)
+            #ax.set_title(f"Year {t} | Global NRMSE: {current_glob_nrmse:.4f}")
 
-            if i == 0 and j == 0:
+            if j == 0:
                 # Combined legend
                 lines, labels = ax.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
+                #lines2, labels2 = ax2.get_legend_handles_labels()
+                #ax.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
+                ax.legend(lines, labels, loc='upper left', fontsize=14)
+
+            ax.set_xlim([-89, 89])
+            ax.grid(True, alpha=0.3)
 
     return fig
 
