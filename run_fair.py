@@ -15,87 +15,18 @@ from fair.io import read_properties
 from fair.interface import fill, initialise
 
 ## Misc.
-from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple, Optional
-from scipy.fft import rfft, rfftfreq
-
-#from pathlib import Path
 
 # ----------------------------
 # Constants and Configurations
 # ----------------------------
 
 DEFAULT_SCENARIO = 'ssp245'
-#EBM_CONFIG = 'data/FaIR/4xCO2_cummins_ebm3.csv'
-
 FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_median.csv'
 FAIR_SPECIES_CSV  = 'data/FaIR/species_configs_properties_1.4.1.csv'
-
 VOLCANIC_FORCING = 'data/FaIR/volcanic_ERF_monthly_175001-201912.csv'
-
 SPECIES = ['CO2','CH4','N2O','Sulfur','BC','Aerosol-radiation interactions','Aerosol-cloud interactions']
-#_DF_EBM = pd.read_csv(EBM_CONFIG)
-#_PROPERTIES = read_properties()[1]
 _PROPERTIES = read_properties(filename=FAIR_SPECIES_CSV)[1]
-#DEFAULT_ESMs = _DF_EBM['model'].unique()
-
-"""
-FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_1.4.1.csv'
-FAIR_PARAMS_MEAN  = 'data/FaIR/calibrated_constrained_parameters_median.csv'
-
-df = pd.read_csv(FAIR_PARAMS_CSV, index_col=0)
-DO_NOT_AVG = {'stochastic_run', 'use_seed', 'seed'}
-drop_cols = [c for c in df.columns if c in DO_NOT_AVG or df[c].dtype == bool]
-df_num = df.drop(columns=drop_cols, errors='ignore')
-
-mean_row = df_num.median(axis=0, numeric_only=True)
-mean_row = mean_row.to_dict()
-mean_row.update({
-    'stochastic_run': False,
-    'use_seed': False,
-    'seed': 0,
-})
-
-df_mean = pd.DataFrame([mean_row], index=['mean'])
-df_mean = df_mean.reindex(columns=df.columns, fill_value=np.nan)
-Path(FAIR_PARAMS_MEAN).parent.mkdir(parents=True, exist_ok=True)
-df_mean.to_csv(FAIR_PARAMS_MEAN)
-"""
-
-"""
-def _ebm_config_names(models: Iterable[str]) -> list:
-    Return list like ['ModelA_r1','ModelA_r2', ...] from the EBM table.
-    names = []
-    for model in models:
-        sub = _DF_EBM[_DF_EBM["model"] == model]
-        for run in sub["run"]:
-            names.append(f"{model}_{run}")
-    return names
-"""
-"""
-def _apply_ebm_configs(f: FAIR, configs: Iterable[str], stochastic: bool=False) -> None:
-    Fill FaIR climate_configs from the EBM CSV for all configs.
-    seed = 1355763
-    for cfg in configs:
-        model, run = cfg.split("_")
-        cond = (_DF_EBM["model"] == model) & (_DF_EBM["run"] == run)
-
-        # ocean heat capacity & transfer (expects arrays of length 3)
-        fill(f.climate_configs["ocean_heat_capacity"], _DF_EBM.loc[cond, "C1":"C3"].values.squeeze(), config=cfg)
-        fill(f.climate_configs["ocean_heat_transfer"], _DF_EBM.loc[cond, "kappa1":"kappa3"].values.squeeze(), config=cfg)
-
-        # scalars
-        fill(f.climate_configs["deep_ocean_efficacy"],     _DF_EBM.loc[cond, "epsilon"].values[0], config=cfg)
-        fill(f.climate_configs["gamma_autocorrelation"],   _DF_EBM.loc[cond, "gamma"].values[0],   config=cfg)
-        fill(f.climate_configs["sigma_eta"],               _DF_EBM.loc[cond, "sigma_eta"].values[0], config=cfg)
-        fill(f.climate_configs["sigma_xi"],                _DF_EBM.loc[cond, "sigma_xi"].values[0],  config=cfg)
-
-        # stochastic controls
-        fill(f.climate_configs["stochastic_run"], stochastic, config=cfg)
-        fill(f.climate_configs["use_seed"], stochastic, config=cfg)
-        fill(f.climate_configs["seed"], seed, config=cfg)
-        seed += 399
-"""
 
 def _species_properties(input_mode: str) -> Dict[str, dict]:
     """Copy baseline species properties and set CO2 input_mode."""
@@ -575,11 +506,6 @@ def load_DECK_CMIP7(agents):
 
     return emis_dict_DECK
 
-
-# -----------------------
-# DAMIP for CMIP7 Helpers
-# -----------------------
-# - Gillett et al. (2025)
 
 # ------------------------
 # GeoMIP for CMIP6 Helpers
