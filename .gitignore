@@ -1,6 +1,6 @@
 *spatial_anomaly.nc4
 /Committee_Meeting_Figs/
-/data/
+/data/*
 /old/
 /basic_run_example/
 /emulator_training/
@@ -8,3 +8,10 @@
 /Figures/
 /.ipynb_checkpoints/
 /__pycache__/
+
+# Exceptions
+!/data/CS3_outlook25/
+!/data/FaIR/
+!/data/FaIR_IO/
+!/data/GeoMIP/
+!/data/saved_emissions/
