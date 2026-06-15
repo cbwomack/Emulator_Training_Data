@@ -6,3 +6,5 @@
 /emulator_training/
 /checkpoints/
 /Figures/
+/.ipynb_checkpoints/
+/__pycache__/
