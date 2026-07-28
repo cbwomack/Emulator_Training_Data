@@ -1,5 +1,7 @@
 # Imports
 
+import pickle
+
 import numpy as np
 
 ## JAX
@@ -2652,3 +2654,171 @@ def plot_zonal_predictions(results: dict, preds: dict, truths: dict, lat_coords:
             ax.grid(True, alpha=0.3)
 
     return fig
+
+def plot_comparison_results(
+    result_paths: list[str],
+    column_titles: list[str],
+    baseline_errors: list[float],
+    active_agents: tuple | None = None,
+    agent_units: dict | None = None,
+    max_lines: int = 11,
+    save_path: str | None = None,
+) -> None:
+    """
+    Comparison plot for multiple optimize_emissions_inverse checkpoints, used
+    by supplementary_notebooks/SI_plots.ipynb's sensitivity-sweep figures
+    (initial condition / architecture / feature window).
+    Columns = datasets (defined by result_paths). Rows = 1 (NRMSE) + N (agents).
+
+    Args:
+        result_paths: File paths to pickle files containing 'errors'/'U_traj'.
+        column_titles: Text box label for each column (top left).
+        baseline_errors: Baseline error value (dashed line) per column.
+    """
+
+    # --- 1. Load Data ---
+    loaded_results = []
+    for path in result_paths:
+        with open(path, 'rb') as f:
+            loaded_results.append(pickle.load(f))
+
+    n_cols = len(loaded_results)
+    if len(column_titles) != n_cols:
+        raise ValueError("Length of column_titles must match result_paths.")
+    if len(baseline_errors) != n_cols:
+        raise ValueError("Length of baseline_errors must match result_paths.")
+
+    # --- 2. Helpers (Internal) ---
+    def _agents_in_state(state):
+        if isinstance(state, (tuple, list)) and len(state) == 2:
+            return ("CO2", "CH4")
+        if isinstance(state, dict):
+            return tuple(state.keys())
+        raise ValueError("Unrecognized U_traj state format.")
+
+    def _get_series(state, agent):
+        if isinstance(state, (tuple, list)):
+            if agent == "CO2": return jnp.asarray(state[0]).reshape(-1)
+            if agent == "CH4": return jnp.asarray(state[1]).reshape(-1)
+            raise KeyError(f"Agent {agent} not found in tuple state.")
+        return jnp.asarray(state[agent]).reshape(-1)
+
+    # --- 3. Determine Layout based on First Dataset ---
+    # (Assumes all datasets have roughly consistent agents, or uses active_agents to filter)
+    first_res = loaded_results[0]
+    present_agents = _agents_in_state(first_res["U_traj"][0])
+
+    if active_agents is None:
+        active_agents = present_agents
+    else:
+        active_agents = tuple(a for a in active_agents if a in present_agents)
+
+    if agent_units is None:
+        agent_units = {"CO2": "Gt/yr", "CH4": "Mt/yr", "N2O": "Mt/yr", "Sulfur":"Mt/yr", "BC": "Mt/yr"}
+
+    n_agents = len(active_agents)
+    n_rows = 1 + n_agents  # 1 for NRMSE, N for agents
+
+    # Calculate T (time) from the first dataset/first agent to set x-limits
+    # (Assumes all datasets span the same timeframe, which is standard for comparisons)
+    probe_agent = active_agents[0] if len(active_agents) > 0 else present_agents[0]
+    T = int(_get_series(first_res["U_traj"][-1], probe_agent).shape[0])
+
+    # --- 4. Create Subplots ---
+    fig_height = 2.5 * n_rows
+    fig_width = 4.0 * n_cols
+
+    # sharey='row' ensures all NRMSE plots share scale, and all CO2 plots share scale, etc.
+    fig, axes = plt.subplots(
+        nrows=n_rows, ncols=n_cols,
+        figsize=(fig_width, fig_height),
+        sharey='row',
+        sharex='row',
+        constrained_layout=True
+    )
+
+    # Ensure axes is always 2D array [row, col] even if n_cols=1 or n_rows=1
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    # --- 5. Plotting Loop ---
+    for col_idx, results in enumerate(loaded_results):
+
+        errors = jnp.asarray(results["errors"])
+        U_traj = results["U_traj"]
+        n_update_steps = int(results.get("updates_done", max(0, errors.shape[0] - 1)))
+
+        # --- Row 0: NRMSE ---
+        ax_err = axes[0, col_idx]
+        x_err = jnp.arange(errors.shape[0])
+
+        ax_err.loglog(x_err, errors, c=cm.batlowWS(1), label="Optimized emulator")
+        ax_err.axhline(float(baseline_errors[col_idx]), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
+
+        ax_err.set_xlim(0, n_update_steps)
+        if col_idx == 0:
+            ax_err.set_ylabel("NRMSE")
+
+        # Add the text box (Dataset Title) to the top plot of the column
+        ax_err.text(
+            0.03, 0.95, column_titles[col_idx], transform=ax_err.transAxes,
+            ha="left", va="top", fontsize=14, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+        )
+        ax_err.grid(True, alpha=0.3)
+        if col_idx == 0:
+            ax_err.legend(loc="upper right", fontsize=9)
+
+        # --- Rows 1..N: Emissions ---
+        n_total = len(U_traj)
+        if n_total <= max_lines:
+            sel_steps = np.arange(n_total, dtype=int)
+        else:
+            sel_steps = np.unique(np.linspace(0, n_total - 1, num=max_lines, dtype=int))
+
+        for row_offset, ag in enumerate(active_agents):
+            row_idx = 1 + row_offset
+            ax_curr = axes[row_idx, col_idx]
+
+            has_any = False
+            for i in sel_steps:
+                state = U_traj[i]
+                # Check if this agent exists in this specific dataset's state
+                # (Handles cases where datasets might have slightly different agent keys)
+                try:
+                    series = _get_series(state, ag)
+                    alpha = 0.2 + 0.6 * (i / max(1, len(U_traj) - 1))
+                    if i in [0, 100, 1000]:
+                        if i == 0:
+                            c = cm.lipariS(5)
+                            alpha = 1
+                        else:
+                            c = cm.batlowWS(1)
+                        ax_curr.plot(series, alpha=alpha, c=c, label=f"Step {i}")
+                    else:
+                        ax_curr.plot(series, alpha=alpha, c=cm.batlowWS(1))
+                    has_any = True
+                except KeyError:
+                    continue
+
+            ax_curr.set_xlim(0, T)
+            ax_curr.grid(True, alpha=0.3)
+
+            # Label Y-axis only for the first column
+            if col_idx == 0:
+                unit = agent_units.get(ag, "units/yr")
+                ax_curr.set_ylabel(f"{ag} ({unit})")
+
+            # Add Legend only on the first agent plot of the first column to avoid clutter
+            if col_idx == 0 and row_offset == 0 and has_any:
+                ax_curr.legend(fontsize=8, loc="lower left")
+
+        # Set X-label on the bottom-most plot of this column
+        axes[-1, col_idx].set_xlabel("Year")
+
+    if save_path is not None:
+        plt.savefig(FIGURES_DIR / f'{save_path}.pdf')
+
+    return

@@ -2752,3 +2752,154 @@ def load_fig7_emic_data() -> dict:
         "separator_indices": separator_indices,
         "group_labels": group_labels,
     }
+
+# ==================================================================
+# Part 5b: notebook-facing data-prep for supplementary_notebooks/SI_plots.ipynb
+# Same pattern as the fig1-7 helpers above: each function loads/aggregates
+# exactly what one utils_plotting.plot_comparison_results/
+# plot_vertical_stacked_bars call needs, so SI_plots.ipynb only ever does
+# "load data" then "plot data".
+# ==================================================================
+
+def load_SI_ic_sensitivity_data(baseline_path: str = 'checkpoints/co2/baseline_co2_only.pkl') -> dict:
+    """
+    kwargs for utils_plotting.plot_comparison_results: CO2-only
+    initial-condition sensitivity sweep (constant/gaussian/sine).
+    """
+    with open(baseline_path, 'rb') as f:
+        baseline_results = pickle.load(f)
+
+    IC_list = ['constant', 'gaussian', 'sine']
+    return {
+        "result_paths": [f'data/SI_results/sensitivity_initial_condition/inverse_{IC}_co2_only.pkl' for IC in IC_list],
+        "column_titles": ['(a) Constant', '(b) Gaussian', '(c) Sinusoid'],
+        "baseline_errors": [baseline_results['All']['mean']] * len(IC_list),
+        "active_agents": ("CO2",),
+    }
+
+
+def load_SI_architecture_sensitivity_data(IC: str = 'sine') -> dict:
+    """
+    kwargs for utils_plotting.plot_comparison_results: CO2-only MLP-hidden-
+    layer-architecture sensitivity sweep.
+    """
+    arch_list = ['8', '16', '32', '16_16']
+    baseline_errors = []
+    for arch in arch_list:
+        with open(f'data/SI_results/sensitivity_architecture/baseline_{arch}_co2_only.pkl', 'rb') as f:
+            baseline_errors.append(pickle.load(f)['All']['mean'])
+
+    return {
+        "result_paths": [f'data/SI_results/sensitivity_architecture/inverse_{arch}_co2_only_{IC}_test.pkl' for arch in arch_list],
+        "column_titles": ['(a) [8]', '(b) [16]', '(c) [32]', '(d) [16, 16]'],
+        "baseline_errors": baseline_errors,
+        "active_agents": ("CO2",),
+        "save_path": f'SI_arch_{IC}',
+    }
+
+
+def load_SI_feature_sensitivity_data(IC: str = 'sine') -> dict:
+    """
+    kwargs for utils_plotting.plot_comparison_results: CO2-only EMA-feature-
+    window (short/medium/long) sensitivity sweep.
+    """
+    feat_list = ['short', 'medium', 'long']
+    baseline_errors = []
+    for feat in feat_list:
+        with open(f'data/SI_results/sensitivity_features/baseline_{feat}_co2_only.pkl', 'rb') as f:
+            baseline_errors.append(pickle.load(f)['All']['mean'])
+
+    return {
+        "result_paths": [f'data/SI_results/sensitivity_features/inverse_{feat}_co2_only_{IC}.pkl' for feat in feat_list],
+        "column_titles": ['(a) Short', '(b) Medium', '(c) Long'],
+        "baseline_errors": baseline_errors,
+        "active_agents": ("CO2",),
+        "save_path": f'SI_feat_{IC}',
+    }
+
+
+def regenerate_SI_extended_results_cache(agents: list[str] = ['N2O', 'Sulfur', 'BC']) -> None:
+    """
+    Recompute the per-agent optimal-emulator NRMSE summary (used by the SI
+    extended-results stacked-bar figure) for every agent in `agents` and
+    overwrite data/SI_results/extended_results/optimal_<agent>_only.pkl.
+
+    Not called by default from the notebook - load_SI_extended_results_data()
+    reads the existing cache instead. Call this only to refresh the cache
+    after new single-agent inverse-optimization checkpoints are produced.
+    Only covers N2O/Sulfur/BC by default, matching the original notebook -
+    the CO2/CH4 baseline+optimal caches this figure also reads were produced
+    by a separate, untracked process outside this notebook, not this loop.
+    """
+    for agent in agents:
+        agent_lower = agent if agent in ('Sulfur', 'BC') else agent.lower()
+        active_agents = (agent,)
+
+        params0, _ = generate_init_params_and_train_data(
+            [agent], active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=1, verbose=False
+        )
+        eval_sets, *_ = generate_eval_data([agent], CS3=True, DAMIP=False, GeoMIP=False)
+
+        training_paths = [
+            f'checkpoints/{agent_lower}/inverse_constant_tier1_{agent_lower}_only.pkl',
+            f'checkpoints/{agent_lower}/inverse_constant_tier2_{agent_lower}_only.pkl',
+            f'checkpoints/{agent_lower}/inverse_constant_DECK_{agent_lower}_only.pkl',
+            f'checkpoints/{agent_lower}/inverse_constant_CS3_{agent_lower}_only.pkl',
+            f'checkpoints/{agent_lower}/inverse_constant_all_{agent_lower}_only.pkl',
+        ]
+        train_scenarios = ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All']
+        optimal_results = evaluate_optimal_emulator(
+            training_paths=training_paths,
+            train_scenarios=train_scenarios,
+            eval_sets=eval_sets,
+            params0=params0,
+            active_agents=active_agents,
+            inactive_mode="zeros",
+            historical_name="historical",
+            key=jax.random.PRNGKey(0),
+            K=400,
+            lr=5e-2,
+            weight_decay=1e-2,
+        )
+
+        save_path = f'data/SI_results/extended_results/optimal_{agent_lower}_only.pkl'
+        with open(save_path, "wb") as f:
+            pickle.dump(optimal_results, f)
+
+
+def load_SI_extended_results_data(agent_lower_list: list[str] = ['co2', 'ch4', 'n2o', 'Sulfur', 'BC']) -> dict:
+    """
+    kwargs for utils_plotting.plot_vertical_stacked_bars: SI extended-results
+    summary across all 5 single-agent optimizations.
+
+    Fixes a real pre-existing bug: the original notebook's call passed only 5
+    positional args (baseline_results_list, optimal_results_list,
+    train_scenarios, test_scenarios, weights), but
+    plot_vertical_stacked_bars requires 7 positional-capable args
+    (...train_scenarios, test_scenarios, x_labels, leg_labels, weights...) -
+    weights was silently landing in the x_labels slot and the call would
+    TypeError on the two missing required args (leg_labels, weights) if run
+    against the current function signature. x_labels/leg_labels below use
+    the same values as the analogous Figure 5 call
+    (load_fig5_data/utils_plotting.plot_vertical_stacked_bars in
+    utils_inverse.py), since both plot the same train_scenarios/
+    test_scenarios/weights for the same kind of grouped-bar summary.
+    """
+    baseline_results_list, optimized_results_list = [], []
+    for agent_lower in agent_lower_list:
+        with open(f'data/SI_results/extended_results/baseline_{agent_lower}_only.pkl', 'rb') as f:
+            baseline_results_list.append(pickle.load(f))
+        with open(f'data/SI_results/extended_results/optimal_{agent_lower}_only.pkl', 'rb') as f:
+            optimized_results_list.append(pickle.load(f))
+
+    return {
+        "baseline_results_list": baseline_results_list,
+        "optimized_results_list": optimized_results_list,
+        "train_scenarios": ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
+        "test_scenarios": ['Tier 1', 'Tier 2', 'DECK', 'CS3'],
+        "x_labels": ['Opt. Priority 1', 'Opt. Priority 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
+        "leg_labels": ['Priority 1', 'Priority 2', 'DECK', 'CS3'],
+        "weights": [7, 5, 2, 2],
+        "titles": None,
+        "figname": 'SI_extended_results',
+    }
