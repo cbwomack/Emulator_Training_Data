@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Companion script for 3f_inverse_all_agents.ipynb: runs the all-forcing-agent bilevel inverse-optimization
+Companion script for 3b_inverse_all_agents.ipynb: runs the all-forcing-agent bilevel inverse-optimization
 experiments used to build checkpoints/multi/inverse_*.pkl checkpoints. Runs
 standalone (no notebook/kernel needed) so long jobs can be scheduled; the
 notebook itself only loads the resulting checkpoints and plots them.

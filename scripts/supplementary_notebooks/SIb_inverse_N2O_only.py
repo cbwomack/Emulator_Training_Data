@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Companion script for supplementary/3c_inverse_N2O_only.ipynb: runs the N2O-only bilevel inverse-optimization
+Companion script for supplementary_notebooks/SIb_inverse_N2O_only.ipynb: runs the N2O-only bilevel inverse-optimization
 experiments used to build checkpoints/n2o/inverse_*.pkl checkpoints. Runs
 standalone (no notebook/kernel needed) so long jobs can be scheduled; the
 notebook itself only loads the resulting checkpoints and plots them.

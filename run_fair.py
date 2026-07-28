@@ -663,6 +663,59 @@ def load_CS3(
     return emis_dict_CS3
 
 
+def generate_and_save_scenario_data(save_path: str | None = None) -> dict:
+    """
+    Notebook-facing wrapper for 1_generate_FaIR_data.ipynb / its companion
+    script: build emissions + FaIR temperature-response data for all 4
+    scenario sets (ScenarioMIP tier1/tier2, DECK, GeoMIP, CS3) and optionally
+    pickle the result to `save_path`.
+
+    load_scenarioMIP_CMIP7/load_DECK_CMIP7/load_geoMIP_CMIP6/load_CS3 each
+    already disk-cache their emis_dict under data/saved_emissions/ (see their
+    docstrings) - the get_delT calls here are the actual "compute-intensive"
+    part this wrapper exists to make schedulable, since FaIR temperature
+    integration is not cached anywhere else.
+
+    Returns a dict keyed by scenario-set name ('tier1', 'tier2', 'DECK',
+    'geoMIP', 'CS3'), each value a dict with 'agents', 'emis_dict',
+    'delT_dict', 'scenarios'.
+    """
+    agents_scenarioMIP = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
+    emis_dict_tier1, emis_dict_tier2 = load_scenarioMIP_CMIP7(agents_scenarioMIP)
+    scenarios_tier1, scenarios_tier2 = list(emis_dict_tier1.keys()), list(emis_dict_tier2.keys())
+    delT_dict_tier1 = get_delT(emis_dict_tier1, scenarios_tier1, agents_scenarioMIP, MIP='ScenarioMIP_tier1')
+    delT_dict_tier2 = get_delT(emis_dict_tier2, scenarios_tier2, agents_scenarioMIP, MIP='ScenarioMIP_tier2')
+
+    agents_DECK = ['Sulfur', 'BC']
+    emis_dict_DECK = load_DECK_CMIP7(agents_DECK)
+    scenarios_DECK = list(emis_dict_DECK.keys())
+    delT_dict_DECK = get_delT(emis_dict_DECK, scenarios_DECK, agents_DECK, MIP='DECK')
+
+    agents_geoMIP = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
+    emis_dict_geoMIP = load_geoMIP_CMIP6(agents_geoMIP, emis_dict_tier1)
+    scenarios_geoMIP = list(emis_dict_geoMIP.keys())
+    delT_dict_geoMIP = get_delT(emis_dict_geoMIP, scenarios_geoMIP, agents_geoMIP, MIP='GeoMIP')
+
+    agents_CS3 = ['CO2']
+    emis_dict_CS3 = load_CS3(agents_CS3, emis_dict_tier1)
+    scenarios_CS3 = list(emis_dict_CS3.keys())
+    delT_dict_CS3 = get_delT(emis_dict_CS3, scenarios_CS3, agents_CS3, MIP='CS3')
+
+    data = {
+        "tier1": {"agents": agents_scenarioMIP, "emis_dict": emis_dict_tier1, "delT_dict": delT_dict_tier1, "scenarios": scenarios_tier1},
+        "tier2": {"agents": agents_scenarioMIP, "emis_dict": emis_dict_tier2, "delT_dict": delT_dict_tier2, "scenarios": scenarios_tier2},
+        "DECK": {"agents": agents_DECK, "emis_dict": emis_dict_DECK, "delT_dict": delT_dict_DECK, "scenarios": scenarios_DECK},
+        "geoMIP": {"agents": agents_geoMIP, "emis_dict": emis_dict_geoMIP, "delT_dict": delT_dict_geoMIP, "scenarios": scenarios_geoMIP},
+        "CS3": {"agents": agents_CS3, "emis_dict": emis_dict_CS3, "delT_dict": delT_dict_CS3, "scenarios": scenarios_CS3},
+    }
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as f:
+            pickle.dump(data, f)
+
+    return data
+
 
 snames_short = ['historical','H-ext','H-ext-OS',
                 'M','M-ext','ML','ML-ext','L',

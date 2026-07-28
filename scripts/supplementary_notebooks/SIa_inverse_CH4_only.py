@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """
-Companion script for supplementary/3d_inverse_Sulfur_only.ipynb: runs the Sulfur-only bilevel inverse-optimization
-experiments used to build checkpoints/Sulfur/inverse_*.pkl checkpoints. Runs
+Companion script for supplementary_notebooks/SIa_inverse_CH4_only.ipynb: runs the CH4-only bilevel inverse-optimization
+experiments used to build checkpoints/ch4/inverse_*.pkl checkpoints. Runs
 standalone (no notebook/kernel needed) so long jobs can be scheduled; the
 notebook itself only loads the resulting checkpoints and plots them.
 
 Usage:
-    python SIc_inverse_Sulfur_only.py                        # run every experiment below, in order
-    python SIc_inverse_Sulfur_only.py --experiment H-ext    # run just one
-    python SIc_inverse_Sulfur_only.py --baseline-save-path checkpoints/.../baseline_x.pkl
+    python SIa_inverse_CH4_only.py                        # run every experiment below, in order
+    python SIa_inverse_CH4_only.py --experiment H-ext    # run just one
+    python SIa_inverse_CH4_only.py --baseline-save-path checkpoints/.../baseline_x.pkl
 """
 import os
 import sys
@@ -22,22 +22,22 @@ import argparse
 
 import utils_inverse
 
-AGENTS = ['Sulfur']
-ACTIVE_AGENTS = ('Sulfur',)
+AGENTS = ['CH4']
+ACTIVE_AGENTS = ('CH4',)
 MODE = 'FaIR'
-CHECKPOINT_DIR = 'checkpoints/Sulfur'
+CHECKPOINT_DIR = 'checkpoints/ch4'
 DEFAULT_BASELINE_SAVE_PATH = None
 
-# Exact hyperparameters transcribed programmatically from supplementary/3d_inverse_Sulfur_only.ipynb - see
+# Exact hyperparameters transcribed programmatically from supplementary/3b_inverse_CH4_only.ipynb - see
 # PROGRESS.md for the extraction method. Preserved as-is, including known
 # oddities (e.g. duplicate 'all' entries, "2"-suffixed checkpoint tags)
 # rather than silently "fixing" them; those are flagged for Phase 5.
 EXPERIMENTS = {
     'H-ext':     {
         'group': 'H-ext',
-        'tag': 'Sulfur_only',
+        'tag': 'ch4_only',
         'num_updates': 1000,
-        'step_size': 5000.0,
+        'step_size': 10000.0,
         'momentum': 0.9,
         'nesterov': True,
         'K_inner': 400,
@@ -51,11 +51,11 @@ EXPERIMENTS = {
         'resume_if_exists': True,
         'preds_every': 50,
     },
-    'tier1':     {
-        'group': 'tier1',
-        'tag': 'Sulfur_only2',
+    'tier2':     {
+        'group': 'tier2',
+        'tag': 'ch4_only2',
         'num_updates': 1000,
-        'step_size': 10000.0,
+        'step_size': 100000.0,
         'momentum': 0.9,
         'nesterov': True,
         'K_inner': 400,
@@ -63,10 +63,10 @@ EXPERIMENTS = {
         'wd_inner': 0.01,
         'init_cond': 'constant',
         'T': 751,
-        'filter_hist': False,
-        'smoothness_weight': 5e-06,
+        'filter_hist': True,
+        'smoothness_weight': 1e-06,
         'checkpoint_every': 50,
-        'resume_if_exists': True,
+        'resume_if_exists': False,
         'preds_every': 50,
     },
 }

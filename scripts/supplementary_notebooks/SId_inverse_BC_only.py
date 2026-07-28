@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Companion script for supplementary/3e_inverse_BC_only.ipynb: runs the BC-only bilevel inverse-optimization
+Companion script for supplementary_notebooks/SId_inverse_BC_only.ipynb: runs the BC-only bilevel inverse-optimization
 experiments used to build checkpoints/BC/inverse_*.pkl checkpoints. Runs
 standalone (no notebook/kernel needed) so long jobs can be scheduled; the
 notebook itself only loads the resulting checkpoints and plots them.
