@@ -1520,8 +1520,9 @@ def create_baseline(
     paramsK, losses = train_mlp_sgd_jit(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2)
 
     if idx_demo is not None:
+        import utils_plotting  # deferred: utils_plotting imports this module, so this must not be a module-level import
         (Xs_demo, y_demo, scen_demo) = test_s[idx_demo]
-        plot_mlp_predictions(paramsK, Xs_demo, y_demo, metric="RMSE", title_prefix=f"{scen_demo}")
+        utils_plotting.plot_mlp_predictions(paramsK, Xs_demo, y_demo, metric="RMSE", title_prefix=f"{scen_demo}")
 
     rmse_list = eval_test_nrmse_by_scenario(paramsK, test_s)
     avg_rmse  = jnp.mean(jnp.stack([r for (_, r) in rmse_list]))
@@ -1811,6 +1812,151 @@ def generate_and_eval_baseline_emulator(
                 print(f"  {scen:30s}  {val:.4f}")
 
     return baseline_results, baseline_pred_delT, ground_truth_delT
+
+def run_inverse_experiment_setup(
+    agents: list[str],
+    active_agents: tuple[str, ...],
+    mode: str = 'FaIR',
+    hidden_sizes: list[int] = [16],
+    idx_demo: int = 1,
+    test_scen: str = 'historical',
+    verbose: bool = False,
+    CS3: bool = True,
+    DAMIP: bool = False,
+    GeoMIP: bool = False,
+    baseline_save_path: str | None = None,
+) -> dict:
+    """
+    Shared setup for the 3x/4a/SI_1 inverse-optimization companion scripts and
+    notebooks: build the initial baseline MLP params + training data
+    (generate_init_params_and_train_data), the named eval_sets
+    (generate_eval_data), and the trained+evaluated baseline emulator
+    (generate_and_eval_baseline_emulator) that every inverse-optimization
+    experiment in the notebook is compared against.
+
+    Returns a dict with keys: agents, active_agents, mode, params0,
+    emis_dict_train_JAX, eval_sets, baseline_results, baseline_pred_delT,
+    ground_truth_delT. Pass this dict straight into run_inverse_experiment.
+    """
+    params0, emis_dict_train_JAX = generate_init_params_and_train_data(
+        agents, active_agents, test_scen, hidden_sizes=hidden_sizes,
+        idx_demo=idx_demo, verbose=verbose, mode=mode,
+    )
+    eval_sets, *_ = generate_eval_data(agents, CS3=CS3, DAMIP=DAMIP, GeoMIP=GeoMIP)
+    baseline_results, baseline_pred_delT, ground_truth_delT = generate_and_eval_baseline_emulator(
+        eval_sets["Tier 1"], eval_sets, save_path=baseline_save_path,
+        verbose=verbose, hidden_sizes=hidden_sizes, mode=mode,
+    )
+    return {
+        "agents": agents,
+        "active_agents": active_agents,
+        "mode": mode,
+        "params0": params0,
+        "emis_dict_train_JAX": emis_dict_train_JAX,
+        "eval_sets": eval_sets,
+        "baseline_results": baseline_results,
+        "baseline_pred_delT": baseline_pred_delT,
+        "ground_truth_delT": ground_truth_delT,
+    }
+
+def build_group_emis_dicts(emis_dict_train_JAX: dict, eval_sets: dict) -> dict[str, dict]:
+    """
+    Build the {group_name: emis_dict} lookup used by run_inverse_experiment.
+    'H-ext' is the single-scenario optimization target used by every
+    notebook's "2a" section (H-ext + historical, taken from the training
+    split, matching ScenarioMIP's requirement that historical always
+    precede a future scenario); every other group name is a .copy() of the
+    correspondingly-named eval_sets entry, only included if that eval_sets
+    entry was actually built (i.e. the DAMIP/GeoMIP/CS3 flags passed to
+    run_inverse_experiment_setup).
+    """
+    eval_set_names = {
+        'tier1': 'Tier 1', 'tier2': 'Tier 2', 'DECK': 'DECK', 'CS3': 'CS3',
+        'DAMIP': 'DAMIP', 'GeoMIP': 'GeoMIP', 'all': 'All',
+    }
+    groups = {
+        'H-ext': {
+            'H-ext': emis_dict_train_JAX['H-ext'].copy(),
+            'historical': emis_dict_train_JAX['historical'].copy(),
+        }
+    }
+    for group, eval_key in eval_set_names.items():
+        if eval_key in eval_sets:
+            groups[group] = eval_sets[eval_key].copy()
+    return groups
+
+def run_inverse_experiment(
+    setup: dict,
+    group: str,
+    checkpoint_dir: str,
+    tag: str,
+    num_updates: int,
+    step_size: float | dict,
+    momentum: float,
+    nesterov: bool,
+    K_inner: int,
+    lr_inner: float,
+    wd_inner: float,
+    init_cond: str,
+    T: int,
+    filter_hist: bool,
+    checkpoint_every: int,
+    resume_if_exists: bool,
+    preds_every: int,
+    smoothness_weight: float = 0.0,
+    active_agents: tuple[str, ...] | None = None,
+    mode: str | None = None,
+) -> dict:
+    """
+    Run one optimize_emissions_inverse experiment against `group` - either
+    'H-ext' (the single-scenario target used by every notebook's "2a"
+    section) or one of the named eval_sets groups built by
+    run_inverse_experiment_setup ('tier1', 'tier2', 'DECK', 'CS3', 'DAMIP',
+    'GeoMIP', 'all'). The checkpoint path is auto-built as
+    f"{checkpoint_dir}/inverse_{init_cond}_{group}_{tag}.pkl" for every
+    group, including 'H-ext' - the original 3x/4a notebooks special-cased
+    'H-ext' with the segment order swapped
+    ("inverse_H-ext_<init_cond>_<tag>.pkl"), which was a naming bug, not an
+    intentional convention; this function and every existing 'H-ext'
+    checkpoint on disk have been normalized to the uniform template.
+
+    No hyperparameter has a default here (aside from smoothness_weight/
+    active_agents/mode) - every 3x/4a notebook tunes these per group, so
+    callers must pass them explicitly rather than rely on a value that might
+    silently differ from what was tuned for a given experiment.
+    """
+    group_emis_dicts = build_group_emis_dicts(setup["emis_dict_train_JAX"], setup["eval_sets"])
+    if group not in group_emis_dicts:
+        raise ValueError(f"Unknown group {group!r}; available: {sorted(group_emis_dicts)}")
+
+    if active_agents is None:
+        active_agents = setup["active_agents"]
+    if mode is None:
+        mode = setup["mode"]
+
+    checkpoint_path = f"{checkpoint_dir}/inverse_{init_cond}_{group}_{tag}.pkl"
+
+    return optimize_emissions_inverse(
+        emis_dict=group_emis_dicts[group],
+        params0=setup["params0"],
+        num_updates=num_updates,
+        step_size=step_size,
+        momentum=momentum,
+        nesterov=nesterov,
+        K_inner=K_inner,
+        lr_inner=lr_inner,
+        wd_inner=wd_inner,
+        active_agents=active_agents,
+        init_cond=init_cond,
+        T=T,
+        filter_hist=filter_hist,
+        smoothness_weight=smoothness_weight,
+        mode=mode,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_if_exists=resume_if_exists,
+        preds_every=preds_every,
+    )
 
 # ==================================================================
 # Part 4: MESM zonal (vector-target) emulator - init/train/eval variants
@@ -2340,7 +2486,7 @@ def load_fig1_tier1_scenarios(agents: list[str] = ['CO2']) -> dict:
 
 def load_fig2_data(
     agents: list[str] = ['CO2'],
-    path: str = 'checkpoints/co2/inverse_H-ext_constant_co2_only.pkl',
+    path: str = 'checkpoints/co2/inverse_constant_H-ext_co2_only.pkl',
 ) -> dict:
     """
     Optimal CO2 emissions trajectory vs. its H-ext target (Figure 2) for
