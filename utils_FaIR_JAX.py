@@ -7,6 +7,9 @@ import pickle
 
 import numpy as np
 
+## Misc.
+from typing import Iterable
+
 ## Local
 from paths import DATA_DIR
 
@@ -128,6 +131,10 @@ idx_CH4     = 1
 idx_N2O     = 2
 idx_Sulfur  = 3
 idx_BC      = 4
+
+# ==================================================================
+# Part 2a: JAX SCM physics core (per-agent cycle steps + thermal response)
+# ==================================================================
 
 # -----------------------------------
 # Carbon cycle step (Joos-like 4-box)
@@ -268,7 +275,7 @@ def radiative_forcing_ch4(M_ppb: jnp.ndarray, params: dict) -> jnp.ndarray:
   M = jnp.clip(M_ppb, 1e-6, jnp.inf)
   return k * (jnp.sqrt(M) - jnp.sqrt(M0_CH4_PI))
 
-def radiative_forcing_SO2_BC(E_SO2, E_BC, params):
+def radiative_forcing_SO2_BC(E_SO2: jnp.ndarray, E_BC: jnp.ndarray, params: dict) -> jnp.ndarray:
     """
     E_*: [T] arrays of annual emissions (same dt grid as other agents)
     theta_aer: dict or pytree with FaIR-like aerosol params
@@ -349,7 +356,15 @@ def simulate_temp(
   mode: str = 'FaIR',
   params: dict | None = None,
   dt: float = 0.1
-):
+) -> dict:
+  """
+  Forward-integrate the JAX SCM (carbon/CH4/N2O cycles + thermal response) from
+  annual emissions to a full state-and-diagnostics dict, sampled back to `years`.
+
+  emissions_by_agent rows follow (CO2, CH4, N2O, Sulfur, BC) order (see idx_* constants).
+  Returns a dict with keys "years", "Catm_ppm", "Matm_ppb", "Natm_ppb", "RF_*", "GMST",
+  plus cumulative-emissions diagnostics and sub-annual ("_sub") series.
+  """
   if params is None:
     if mode == 'FaIR':
       params = FAIR_PARAMS
@@ -507,10 +522,11 @@ def simulate_temp_prescribed_conc(
     emissions_by_agent: jnp.ndarray,      # (5, T) [Needed for Aerosols]
     params: dict | None = None,
     dt: float = 0.1
-):
+) -> jnp.ndarray:
     """
     Forward model: Concentration (+ Aer Emissions) -> Temperature.
     Bypasses gas cycles. Used for calibrating Climate Sensitivity (d, q).
+    Returns GMST (K anomaly), one value per entry in `years`.
     """
     if params is None:
       params = FAIR_PARAMS
@@ -562,23 +578,14 @@ def simulate_temp_prescribed_conc(
 
     return GMST_full[year_indices]
 
+# ==================================================================
+# Part 1 / 2a: FaIR <-> JAX emissions data plumbing, and evaluation metrics
+# ==================================================================
+
 # ----------------------
 # Misc. helper functions
 # ----------------------
-
-def plot_FaIR_v_JAX(delT_dict_FaIR, delT_dict_JAX):
-  fig, ax = plt.subplots(constrained_layout=True)
-  for i, scen in enumerate(delT_dict_JAX):
-    if scen in needs_historical:
-      ax.plot(delT_dict_JAX[scen][274:], c=f"C{i}", label=scen)
-      ax.plot(delT_dict_FaIR[scen], ls='--', c=f"C{i}", label=scen)
-    else:
-      ax.plot(delT_dict_JAX[scen], c=f"C{i}", label=scen)
-      ax.plot(delT_dict_FaIR[scen], ls='--', c=f"C{i}", label=scen)
-
-  ax.set_xlabel('Year')
-  ax.set_ylabel(r'$\overline{\Delta T}(t)$ [$^\circ$ C]')
-  #fig.legend()
+# (plot_FaIR_v_JAX moved to utils_plotting.py; see needs_historical below, which it uses)
 
 tier1 = ['H-ext','M','ML','L','VLLO-ext','VLHO']
 
@@ -586,7 +593,8 @@ needs_historical = ['H-ext','H-ext-OS','M',
                     'M-ext','ML','ML-ext','L',
                     'L-ext','VLLO-ext','VLHO','VLHO-ext']
 
-def get_emissions(emis_dict, agents):
+def get_emissions(emis_dict: dict, agents: Iterable[str]) -> dict:
+  """Convert emis_dict[scenario][agent] (numpy) into the same nested structure as jnp arrays."""
   emis_dict_JAX = {}
   for scen in emis_dict:
     if scen == 'historical' and 'historical' in emis_dict_JAX:
@@ -604,7 +612,7 @@ def get_emissions(emis_dict, agents):
 
   return emis_dict_JAX
 
-def build_emissions_by_agent(emis_dict_JAX, agent_order=('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')):
+def build_emissions_by_agent(emis_dict_JAX: dict, agent_order: tuple[str, ...] = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')) -> dict:
   """
   Convert emis_dict_JAX[scenario][agent] -> emissions_by_agent[scenario].
 
@@ -640,7 +648,7 @@ def build_emissions_by_agent(emis_dict_JAX, agent_order=('CO2', 'CH4', 'N2O', 'S
 
   return emis_by_agent
 
-def run_scenarios(emis_by_agent_dict, mode='FaIR', params=None, dt=0.1):
+def run_scenarios(emis_by_agent_dict: dict, mode: str = 'FaIR', params: dict | None = None, dt: float = 0.1) -> dict:
     """
     Batched execution of scenarios using simulate_temp logic.
 
@@ -720,7 +728,8 @@ def run_scenarios(emis_by_agent_dict, mode='FaIR', params=None, dt=0.1):
     return outputs
 
 
-def calc_nrmse(T_model, T_true, min_range=1):
+def calc_nrmse(T_model: jnp.ndarray, T_true: jnp.ndarray, min_range: float = 1) -> jnp.ndarray:
+  """RMSE(T_model, T_true) normalized by max(range(T_true), min_range)."""
   diff = T_model - T_true
   rmse = jnp.sqrt(jnp.mean(diff**2))
 
@@ -731,9 +740,9 @@ def calc_nrmse(T_model, T_true, min_range=1):
   return rmse / scale
 
 def mean_nrmse_from_outputs(
-    delT_dict_JAX,
-    delT_dict_FaIR,
-):
+    delT_dict_JAX: dict,
+    delT_dict_FaIR: dict,
+) -> tuple[list, jnp.ndarray]:
   """
   Using precomputed model outputs:
     - compute per-scenario NRMSE
@@ -751,7 +760,13 @@ def mean_nrmse_from_outputs(
 # -----------------
 # Model calibration
 # -----------------
-def generate_calib_data(agents, mode='FaIR'):
+def generate_calib_data(agents: Iterable[str], mode: str = 'FaIR') -> tuple[dict, dict, dict, dict]:
+  """
+  Build a FaIR-vs-JAX calibration dataset for `agents`: ScenarioMIP tier1+tier2
+  plus the DECK scenarios relevant to those agents.
+
+  Returns (emis_dict_calib_FaIR, emis_dict_calib_JAX, delT_dict_calib_FaIR, delT_dict_calib_JAX).
+  """
 
   emis_dict_tier1, emis_dict_tier2 = run_fair.load_scenarioMIP_CMIP7(agents)
   delT_dict_tier1 = run_fair.get_delT(emis_dict_tier1, list(emis_dict_tier1.keys()), agents, MIP='ScenarioMIP_tier1')
@@ -780,7 +795,14 @@ def generate_calib_data(agents, mode='FaIR'):
 
   return emis_dict_calib_FaIR, emis_dict_calib_JAX, delT_dict_calib_FaIR, delT_dict_calib_JAX
 
-def generate_JAX_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
+def generate_JAX_data(
+    agents: Iterable[str], DECK: bool = True, CS3: bool = False, DAMIP: bool = False, GeoMIP: bool = False
+) -> list[dict]:
+  """
+  Build the list of JAX-format emissions dicts (one per scenario group requested)
+  used to drive the SCM: ScenarioMIP tier1/tier2 always, plus DECK/CS3/DAMIP/GeoMIP
+  groups when their flag is set.
+  """
 
   emis_dict_tier1_FaIR, emis_dict_tier2_FaIR = run_fair.load_scenarioMIP_CMIP7(agents)
 
@@ -836,10 +858,14 @@ def generate_JAX_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
 
   return emis_dicts
 
+# ==================================================================
+# Part 2a: calibration (theta <-> params mapping, loss, optimizers)
+# ==================================================================
+
 # ----------------------------------
 # Calibrate model parameters to FaIR
 # ----------------------------------
-def make_theta0(mode='FaIR') -> jnp.ndarray:
+def make_theta0(mode: str = 'FaIR') -> jnp.ndarray:
   """
   Build an initial parameter vector theta from a params dict.
 
@@ -1037,10 +1063,20 @@ def loss_fn(theta: jnp.ndarray,
 # ----------------------------------------
 # Mode A: Calibrate Carbon Cycle (Emis -> Conc)
 # ----------------------------------------
-def calibrate_carbon_cycle(filepath, emis_dict_JAX, target_conc_dict, theta0, dt, n_steps, learning_rate=1e-2, mode='FaIR'):
+def calibrate_carbon_cycle(
+    filepath: str,
+    emis_dict_JAX: dict,
+    target_conc_dict: dict,
+    theta0: jnp.ndarray,
+    dt: float,
+    n_steps: int,
+    learning_rate: float = 1e-2,
+    mode: str = 'FaIR',
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Calibrates 'r0', 'rC', 'rT', 'a', 'tau' to match target CO2 concentrations.
-    Ignores Temperature output/errors.
+    Ignores Temperature output/errors. Checkpoints theta to `filepath` every step.
+    Returns (theta_opt, final_loss).
     """
     # Pre-pad data for JAX (similar to run_scenarios)
     scen_names = list(emis_dict_JAX.keys())
@@ -1082,10 +1118,22 @@ def calibrate_carbon_cycle(filepath, emis_dict_JAX, target_conc_dict, theta0, dt
 # ----------------------------------------
 # Mode B: Calibrate Climate (Conc -> Temp)
 # ----------------------------------------
-def calibrate_climate_sensitivity(filepath, emis_dict_JAX, conc_dict_JAX, target_temp_dict, theta0, dt, n_steps, learning_rate=1e-2):
+def calibrate_climate_sensitivity(
+    filepath: str,
+    emis_dict_JAX: dict,
+    conc_dict_JAX: dict,
+    target_temp_dict: dict,
+    theta0: jnp.ndarray,
+    dt: float,
+    n_steps: int,
+    learning_rate: float = 1e-2,
+) -> tuple[jnp.ndarray, dict]:
     """
-    Calibrates 'd', 'q' to match target Temperature given prescribed Concentrations.
-    Bypasses Carbon Cycle completely.
+    Calibrates the thermal response params (d, q) to match target GMST given
+    prescribed concentrations (via simulate_temp_prescribed_conc), bypassing the
+    carbon cycle entirely. Params are built against MESM_PARAMS (this function is
+    only used for the MESM-calibrated SCM). Checkpoints theta to `filepath`.
+    Returns (theta_opt, params_opt).
     """
     scen_names = list(emis_dict_JAX.keys())
 
@@ -1129,7 +1177,13 @@ def calibrate_climate_sensitivity(filepath, emis_dict_JAX, conc_dict_JAX, target
 # Train/test split
 # ----------------
 
-def generate_train_test(agents, mode='FaIR'):
+def generate_train_test(agents: Iterable[str], mode: str = 'FaIR') -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
+  """
+  Build a ScenarioMIP tier1 (train) / tier2 (test) split of FaIR + JAX emissions and delT.
+
+  Returns (emis_dict_train_FaIR, emis_dict_test_FaIR, emis_dict_train_JAX, emis_dict_test_JAX,
+  delT_dict_train_FaIR, delT_dict_test_FaIR, delT_dict_train_JAX, delT_dict_test_JAX).
+  """
 
   emis_dict_train_FaIR, emis_dict_test_FaIR = run_fair.load_scenarioMIP_CMIP7(agents)
   delT_dict_train_FaIR = run_fair.get_delT(emis_dict_train_FaIR, list(emis_dict_train_FaIR.keys()), agents, MIP='ScenarioMIP_tier1')
@@ -1145,8 +1199,20 @@ def generate_train_test(agents, mode='FaIR'):
 
   return emis_dict_train_FaIR, emis_dict_test_FaIR, emis_dict_train_JAX, emis_dict_test_JAX, delT_dict_train_FaIR, delT_dict_test_FaIR, delT_dict_train_JAX, delT_dict_test_JAX
 
-def calibrate_inverse(filepath, emis_dict_JAX, delT_dict_FaIR, theta0, dt, n_steps, target: str = "CO2", learning_rate: float = 1e-2):
+def calibrate_inverse(
+    filepath: str,
+    emis_dict_JAX: dict,
+    delT_dict_FaIR: dict,
+    theta0: jnp.ndarray,
+    dt: float,
+    n_steps: int,
+    target: str = "CO2",
+    learning_rate: float = 1e-2,
+) -> tuple[dict, jnp.ndarray]:
   """
+  Calibrate the `target` group of theta (see make_theta_mask) against FaIR delT via
+  Adam, checkpointing theta to `filepath` every 10 steps. Returns (params_opt, final_loss).
+
   Note: theta's entries span very different natural scales (e.g. ch4_rT ~ 4e-2,
   ch4_ra ~ 1e-4 vs. r0 ~ 35), so a single learning_rate can be stable for one
   `target` group and diverge for another (observed for target='CH4' at the
@@ -1184,17 +1250,20 @@ def calibrate_inverse(filepath, emis_dict_JAX, delT_dict_FaIR, theta0, dt, n_ste
   print("Final loss_avg:", float(loss_value))
   return params_from_theta(theta_opt), loss_value
 
+# ==================================================================
+# Part 2b: GeoMIP sulfur-injection inverse solve
+# ==================================================================
 
 def solve_sulfur_inverse(
-    emissions_H_jax,    # (5, T) array: Full emissions for Scenario H
-    target_temp_M,      # (T,) array: Target GMST from Scenario M
-    years,              # (T,) array: Year coordinates
-    mode='FaIR',
-    params=None,
-    learning_rate=0.1,
-    n_steps=2000,
-    reg_weight=0.1      # Regularization weight to prevent jagged emissions
-):
+    emissions_H_jax: jnp.ndarray,    # (5, T) array: Full emissions for Scenario H
+    target_temp_M: jnp.ndarray,      # (T,) array: Target GMST from Scenario M
+    years: jnp.ndarray,              # (T,) array: Year coordinates
+    mode: str = 'FaIR',
+    params: dict | None = None,
+    learning_rate: float = 0.1,
+    n_steps: int = 2000,
+    reg_weight: float = 0.1      # Regularization weight to prevent jagged emissions
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Solves for sulfur emissions that force the model to match target_temp_M,
     given background emissions from Scenario H.
@@ -1257,209 +1326,3 @@ def solve_sulfur_inverse(
     return current_sulfur, final_T_pred
 
 
-def plot_calibration_results(conc_dict, emis_dict, target_dict, theta0, theta_opt, dt=0.1, calib="Climate", mode='FaIR'):
-    """
-    Plots the model performance before and after optimization.
-
-    Args:
-        conc_dict: {scenario: (3, T)} Input concentrations (Used in 'Climate' mode).
-        emis_dict: {scenario: (5, T)} Input emissions (Used in both modes).
-        target_dict: {scenario: (T,)} Target data.
-                     If mode='Climate', this is Temperature (K).
-                     If mode='Carbon', this is CO2 Concentration (ppm).
-        mode: "Climate" (Conc -> Temp) or "Carbon" (Emis -> Conc).
-    """
-    # 1. Prepare Data
-    # Use target_dict for keys/lengths as it is required in both modes
-    scenario_names = list(target_dict.keys())
-    n_scens = len(scenario_names)
-
-    # Determine maximum time length
-    if calib == 'Climate':
-      max_len = max([target_dict[s].shape[0] for s in scenario_names])
-    else:
-      max_len = max([target_dict[s].shape[1] for s in scenario_names])
-
-    # Initialize padded arrays
-    # Conc: (N_scen, 3, Max_T), Emis: (N_scen, 5, Max_T), Target: (N_scen, Max_T)
-    conc_matrix = jnp.zeros((n_scens, 3, max_len))
-    emis_matrix = jnp.zeros((n_scens, 5, max_len))
-    target_matrix = jnp.zeros((n_scens, max_len))
-    loss_mask = jnp.zeros((n_scens, max_len))
-
-    # Fill arrays
-    for i, name in enumerate(scenario_names):
-        # Handle inputs based on availability
-        if conc_dict is not None and name in conc_dict:
-            c_data = conc_dict[name]
-            conc_matrix = conc_matrix.at[i, :, :c_data.shape[1]].set(c_data)
-
-        if emis_dict is not None and name in emis_dict:
-            e_data = emis_dict[name]
-            emis_matrix = emis_matrix.at[i, :, :e_data.shape[1]].set(e_data)
-
-        t_data = target_dict[name]
-        if calib == 'Climate':
-          curr_len = t_data.shape[0]
-          target_matrix = target_matrix.at[i, :curr_len].set(t_data)
-        else:
-          curr_len = t_data.shape[1]
-          target_matrix = target_matrix.at[i, :curr_len].set(t_data[0,:])
-        loss_mask = loss_mask.at[i, :curr_len].set(1.0)
-
-    # 2. Setup Vmap Inputs
-    T_steps = max_len
-    years_template = jnp.arange(T_steps, dtype=jnp.float32)
-    years_batch = jnp.tile(years_template, (n_scens, 1))
-
-    params_initial = params_from_theta(theta0, FAIR_PARAMS)
-    params_optimized = params_from_theta(theta_opt, FAIR_PARAMS)
-
-    # 3. Generate Predictions based on Mode
-    if calib == "Carbon":
-        # Emissions -> Concentrations (CO2)
-        # vmap over simulate_temp(years, emissions, params, dt)
-        vmap_model = jax.vmap(simulate_temp, in_axes=(0, 0, None, None, None))
-
-        # Helper to extract just the CO2 ppm from the full output dict
-        def get_preds(params):
-            res_dict = vmap_model(years_batch, emis_matrix, mode, params, dt)
-            return res_dict["Catm_ppm"]
-
-        preds_init = get_preds(params_initial)
-        preds_opt = get_preds(params_optimized)
-        ylabel = r'$CO_2$ Concentration (ppm)'
-
-    elif calib == "Climate":
-        # Concentrations -> Temperature
-        # vmap over simulate_temp_prescribed_conc(years, conc, emis, params, dt)
-        vmap_model = jax.vmap(simulate_temp_prescribed_conc, in_axes=(0, 0, 0, None, None))
-
-        preds_init = vmap_model(years_batch, conc_matrix, emis_matrix, params_initial, dt)
-        preds_opt = vmap_model(years_batch, conc_matrix, emis_matrix, params_optimized, dt)
-        ylabel = r'$\Delta T$ (K)'
-
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    # 4. Plotting
-    fig, axes = plt.subplots(1, n_scens, figsize=(6 * n_scens, 5), sharey=True)
-    if n_scens == 1: axes = [axes]
-
-    for i, name in enumerate(scenario_names):
-        ax = axes[i]
-        actual_len = int(jnp.sum(loss_mask[i]))
-        years = jnp.arange(actual_len)
-
-        # Plot Data
-        ax.plot(years, target_matrix[i, :actual_len], color='black', label='Target (Data)', lw=2)
-        ax.plot(years, preds_init[i, :actual_len], color='tab:blue', linestyle=':', label='SCM (Pre-Opt)', lw=2)
-        ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--', label='SCM (Post-Opt)', lw=2)
-
-        ax.set_title(f'Scenario: {name}')
-        ax.set_xlabel('Years')
-        ax.grid(alpha=0.3)
-
-    axes[0].set_ylabel(ylabel)
-    axes[0].legend()
-    plt.tight_layout()
-    plt.show()
-
-def plot_model_comparison(emis_dict, target_dict, theta0, mode='FaIR', dt=0.1):
-    """
-    Plots a comparison between:
-    1. The 'True' target temperature data.
-    2. The simulation using optimized parameters (theta0).
-    3. The simulation using default parameters for the specified mode (e.g., MESM defaults).
-
-    Args:
-        emis_dict: {scenario: (5, T)} Input emissions.
-        target_dict: {scenario: (T,)} Target Temperature data.
-        theta0: Optimized parameter vector.
-        mode: 'FaIR' or 'MESM'. Determines the default parameters compared against.
-    """
-    # 1. Parameter Setup
-    # Select the correct base parameters for the mode to reconstruct theta0
-    if mode == 'FaIR':
-        base_params = FAIR_PARAMS
-    elif mode == 'MESM':
-        base_params = MESM_PARAMS
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    params_opt = params_from_theta(theta0, base_params=base_params)
-
-    # 2. Prepare Data (Padding and Batching)
-    scenario_names = list(target_dict.keys())
-    n_scens = len(scenario_names)
-
-    # Determine maximum time length (looking at target data)
-    lengths = [target_dict[s].shape[0] for s in scenario_names]
-    max_len = max(lengths)
-
-    # Initialize padded arrays
-    emis_matrix = jnp.zeros((n_scens, 5, max_len))
-    target_matrix = jnp.zeros((n_scens, max_len))
-    loss_mask = jnp.zeros((n_scens, max_len))
-
-    for i, name in enumerate(scenario_names):
-        # Emissions
-        if name in emis_dict:
-            e_data = emis_dict[name]
-            # Clamp to max_len if necessary
-            curr_len_e = min(e_data.shape[1], max_len)
-            emis_matrix = emis_matrix.at[i, :, :curr_len_e].set(e_data[:, :curr_len_e])
-
-        # Targets
-        t_data = target_dict[name]
-        curr_len_t = min(t_data.shape[0], max_len)
-        target_matrix = target_matrix.at[i, :curr_len_t].set(t_data[:curr_len_t])
-
-        # Store valid length for plotting
-        loss_mask = loss_mask.at[i, :curr_len_t].set(1.0)
-
-    # 3. Setup Vmap Inputs
-    years_template = jnp.arange(max_len, dtype=jnp.float32)
-    years_batch = jnp.tile(years_template, (n_scens, 1))
-
-    # 4. Run Simulations
-    # Vmap signature: (years, emis, mode, params, dt)
-    vmap_model = jax.vmap(simulate_temp, in_axes=(0, 0, None, None, None))
-
-    # Run A: Optimized Parameters
-    res_opt = vmap_model(years_batch, emis_matrix, mode, params_opt, dt)
-    preds_opt = res_opt["GMST"]
-
-    # Run B: Default Mode Parameters
-    # We pass params=None so simulate_temp uses the defaults for 'mode'
-    res_default = vmap_model(years_batch, emis_matrix, mode, None, dt)
-    preds_default = res_default["GMST"]
-
-    # 5. Plotting
-    fig, axes = plt.subplots(1, n_scens, figsize=(6 * n_scens, 5), sharey=True)
-    if n_scens == 1: axes = [axes]
-
-    for i, name in enumerate(scenario_names):
-        ax = axes[i]
-        actual_len = int(jnp.sum(loss_mask[i]))
-        years = jnp.arange(actual_len)
-
-        # Plot Truth
-        ax.plot(years, target_matrix[i, :actual_len], color='black', label='Target (Data)', lw=2)
-
-        # Plot Default
-        ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--',
-                label='Default (FaIR)', lw=2)
-
-        # Plot MESM calibration
-        ax.plot(years, preds_default[i, :actual_len], color='tab:blue', linestyle=':',
-                label=f'Calibrated ({mode})', lw=2)
-
-        ax.set_title(f'Scenario: {name}')
-        ax.set_xlabel('Years')
-        ax.grid(alpha=0.3)
-
-    axes[0].set_ylabel(r'$\Delta T$ (K)')
-    axes[0].legend()
-    plt.tight_layout()
-    plt.show()

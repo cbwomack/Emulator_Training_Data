@@ -14,8 +14,6 @@ import optax
 from jax import tree as _jtree
 
 import os, pickle, numpy as np
-from functools import partial
-from cmcrameri import cm
 
 ## Setup plots
 plt.rcParams['figure.figsize'] = [12, 4]
@@ -32,10 +30,15 @@ AGENTS_DEFAULT = ("CO2", "CH4", "N2O", "Sulfur", "BC")  # rows in this order
 # (simulate_temp references idx_CO2 / idx_CH4; keep these consistent)
 idx_CO2, idx_CH4, idx_N2O, idx_Sulfur, idx_BC = 0, 1, 2, 3, 4
 
-def _as_jnp(x, dtype=jnp.float32):
+# ==================================================================
+# Part 3: feature engineering, dataset construction, and the MLP emulator
+# ==================================================================
+
+def _as_jnp(x: jnp.ndarray | np.ndarray | float, dtype: type = jnp.float32) -> jnp.ndarray:
+    """Coerce x to a jnp array of the given dtype."""
     return jnp.asarray(x, dtype=dtype)
 
-def _prev_and_cumu_prev(E_curr, E_hist=None):
+def _prev_and_cumu_prev(E_curr: jnp.ndarray, E_hist: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
   """Causal previous-year emission and cumulative-to-previous-year."""
   E_curr = _as_jnp(E_curr).reshape(-1)
   T  = E_curr.shape[0]
@@ -57,7 +60,7 @@ def _prev_and_cumu_prev(E_curr, E_hist=None):
     Cumu_prev = jnp.concatenate([zero, Cumu_curr[:-1]], axis=0)  # (T,)
   return E_prev, Cumu_prev
 
-def _ema(x, alpha):
+def _ema(x: jnp.ndarray, alpha: jnp.ndarray) -> jnp.ndarray:
   """
   Causal EMA via lax.scan: y_t = (1-alpha) y_{t-1} + alpha x_t
   Returns y for all t (same length as x). Init y_0 = x_0 * alpha (light bias).
@@ -72,7 +75,7 @@ def _ema(x, alpha):
   ys = jnp.concatenate([jnp.expand_dims(y0, 0), ys], axis=0)
   return ys
 
-def _ema_prev(E_curr, E_hist, alpha):
+def _ema_prev(E_curr: jnp.ndarray, E_hist: jnp.ndarray | None, alpha: jnp.ndarray) -> jnp.ndarray:
   """
   EMA computed on concatenated history+current, then aligned causally:
   feature at t uses EMA up to t-1 (no leakage).
@@ -96,13 +99,13 @@ def _ema_prev(E_curr, E_hist, alpha):
   return ema_prev
 
 def make_features_emissions_generic(
-    emis_curr_dict,              # dict: agent -> (T,) emissions
-    emis_hist_dict=None,         # dict or None: agent -> (H,) emissions
-    agents=AGENTS_DEFAULT,        # tuple/list of agents to include (order = column grouping)
-    ema_windows_years=(5.0, 30.0, 100.0),
-    dt_years=1.0,
-    zero_fill_missing=True,
-):
+    emis_curr_dict: dict,              # dict: agent -> (T,) emissions
+    emis_hist_dict: dict | None = None,         # dict or None: agent -> (H,) emissions
+    agents: tuple = AGENTS_DEFAULT,        # tuple/list of agents to include (order = column grouping)
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    dt_years: float = 1.0,
+    zero_fill_missing: bool = True,
+) -> jnp.ndarray:
   """
   Builds causal, per-agent features:
     For each agent a in `agents`, columns (in this order):
@@ -165,12 +168,13 @@ def make_features_emissions_generic(
   return X
 
 def _infer_step(yrs: jnp.ndarray) -> jnp.ndarray:
+    """Median spacing between consecutive years (1.0 if fewer than 2 points)."""
     yrs = _as_jnp(yrs).reshape(-1)
     if yrs.size <= 1:
         return jnp.array(1.0, dtype=jnp.float32)
     return jnp.median(jnp.diff(yrs))
 
-def _make_contiguous_years(yrs_hist: jnp.ndarray, yrs_curr: jnp.ndarray):
+def _make_contiguous_years(yrs_hist: jnp.ndarray, yrs_curr: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Rebase yrs_curr so its first point is exactly one step after yrs_hist[-1].
     Keeps the *spacing* of yrs_curr. If yrs_curr already follows yrs_hist,
@@ -194,7 +198,7 @@ def _make_contiguous_years(yrs_hist: jnp.ndarray, yrs_curr: jnp.ndarray):
     yrs_all  = jnp.concatenate([yrs_h, yrs_c_rb])
     return yrs_all, yrs_c_rb
 
-def _stack_emissions(agents, emis_dict, T, dtype=jnp.float32):
+def _stack_emissions(agents: tuple, emis_dict: dict, T: int, dtype: type = jnp.float32) -> jnp.ndarray:
     """
     Build (N_agents, T) with rows in `agents` order.
     Missing agents are zero-filled.
@@ -212,14 +216,14 @@ def _stack_emissions(agents, emis_dict, T, dtype=jnp.float32):
     return jnp.stack(rows, axis=0)  # (N_agents, T)
 
 def simulate_targets_gmst(
-    years_curr,                         # (T_cur,)
-    emis_curr_dict,                     # dict: {"CO2": (T_cur,), "CH4": (T_cur,), ...}
-    years_hist=None,                    # (T_hist,) or None
-    emis_hist_dict=None,                # dict or None: {"CO2": (T_hist,), "CH4": (T_hist,), ...}
-    agents=AGENTS_DEFAULT,              # tuple/list: which agents to include and their row order
-    mode='FaIR',
-    dt=0.1
-):
+    years_curr: jnp.ndarray,                         # (T_cur,)
+    emis_curr_dict: dict,                     # dict: {"CO2": (T_cur,), "CH4": (T_cur,), ...}
+    years_hist: jnp.ndarray | None = None,                    # (T_hist,) or None
+    emis_hist_dict: dict | None = None,                # dict or None: {"CO2": (T_hist,), "CH4": (T_hist,), ...}
+    agents: tuple = AGENTS_DEFAULT,              # tuple/list: which agents to include and their row order
+    mode: str = 'FaIR',
+    dt: float = 0.1
+) -> jnp.ndarray:
     """
     Returns GMST over the current scenario's years using the new multi-agent simulator.
 
@@ -272,7 +276,7 @@ def simulate_targets_gmst(
 
     return GMST_curr
 
-def extract_years_and_emis(emis_entry_for_scenario, agents=AGENTS_DEFAULT):
+def extract_years_and_emis(emis_entry_for_scenario: jnp.ndarray, agents: tuple = AGENTS_DEFAULT) -> tuple[jnp.ndarray, dict]:
     """
     Input:
       emis_entry_for_scenario: array-like with shape (N_agents, T),
@@ -308,12 +312,12 @@ scens_with_hist = ['H-ext','H-ext-OS','M',
                    'AA','CT']
 
 def build_dataset_from_runfair_dict(
-    emis_dict,
-    historical_name="historical",
-    agents=AGENTS_DEFAULT,
-    mode='FaIR',
-    ema_windows_years=(5.0, 30.0, 100.0)
-):
+    emis_dict: dict,
+    historical_name: str = "historical",
+    agents: tuple = AGENTS_DEFAULT,
+    mode: str = 'FaIR',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> list[tuple[jnp.ndarray, jnp.ndarray, str]]:
     """
     Returns list of (X_features, y_target, scenario_name), using:
       - X_features built by make_features_emissions_generic (per-agent prev, 5y/30y EMA, cum_prev)
@@ -363,28 +367,32 @@ def build_dataset_from_runfair_dict(
 
     return dataset
 
-def fit_scaler(X: jnp.ndarray, eps: float = 1e-8):
+def fit_scaler(X: jnp.ndarray, eps: float = 1e-8) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    """Per-column standardize X (zero mean, unit var). Returns (Xs, (mu, sd))."""
     mu = jnp.mean(X, axis=0)
     sd = jnp.sqrt(jnp.var(X, axis=0) + eps)
     Xs = (X - mu) / sd
     return Xs, (mu, sd)
 
-def fit_scaler_no_center(X: jnp.ndarray, eps: float = 1e-8):
+def fit_scaler_no_center(X: jnp.ndarray, eps: float = 1e-8) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    """Per-column rescale X by RMS without subtracting the mean. Returns (Xs, (0, scale))."""
     scale = jnp.sqrt(jnp.mean(X**2, axis=0) + eps)
     Xs = X / scale
     return Xs, (jnp.zeros_like(scale), scale)
 
-def apply_scaler(X: jnp.ndarray, stats):
+def apply_scaler(X: jnp.ndarray, stats: tuple[jnp.ndarray, jnp.ndarray]) -> jnp.ndarray:
+    """Apply a (mu, sd) scaler fit elsewhere (e.g. by fit_scaler) to X."""
     mu, sd = stats
     return (X - mu) / sd
 
-def _infer_feat_dim(train_dataset, test_dataset):
+def _infer_feat_dim(train_dataset: list, test_dataset: list) -> int:
+    """Feature width of the first (X, ...) row found across train/test datasets, else 0."""
     for ds in (train_dataset, test_dataset):
         for (X, *_rest) in ds:
             return int(X.shape[1])
     return 0
 
-def split_and_scale(train_dataset, test_dataset):
+def split_and_scale(train_dataset: list, test_dataset: list) -> tuple[list, list, tuple[jnp.ndarray, jnp.ndarray]]:
     """
     JAX-safe: lists of (X, y, scen) -> scaled train/test and (mu, sd) from train.
     Works for any feature width (e.g., 4*len(agents)).
@@ -418,7 +426,7 @@ def split_and_scale(train_dataset, test_dataset):
 
     return train_scaled, test_scaled, stats
 
-def init_mlp_params(key, input_dim, hidden_sizes):
+def init_mlp_params(key: jax.random.PRNGKey, input_dim: int, hidden_sizes: list[int]) -> list[dict]:
     """
     Initialize params for a standard MLP.
 
@@ -449,7 +457,7 @@ def init_mlp_params(key, input_dim, hidden_sizes):
 
     return params
 
-def mlp_forward(params, X):
+def mlp_forward(params: list[dict], X: jnp.ndarray) -> jnp.ndarray:
     """
     Standard Feedforward Neural Network.
 
@@ -484,12 +492,20 @@ def mlp_forward(params, X):
     # Squeeze to return shape (N,) matching the old output format
     return y.squeeze(-1)
 
-def _mse(pred, y):
+def _mse(pred: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """Mean squared error, casting pred to y's dtype first."""
     pred = pred.astype(y.dtype)
     return jnp.mean((pred - y)**2)
 
 _tree_map    = _jtree.map
-def train_mlp_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
+def train_mlp_sgd(
+    params0: list[dict], Xtr: jnp.ndarray, ytr: jnp.ndarray, K: int = 400, lr: float = 5e-2, weight_decay: float = 1e-2
+) -> tuple[list[dict], jnp.ndarray]:
+    """
+    Train an MLP (mlp_forward) with clipped-gradient SGD + weight decay for K steps,
+    scanning the whole loop with jax.lax.scan (checkpointed) for speed/memory.
+    Returns (params_final, losses) where losses has one entry per step.
+    """
     pdt = params0[0]["W"].dtype
     Xtr = Xtr.astype(pdt); ytr = ytr.astype(pdt)
 
@@ -518,7 +534,8 @@ def train_mlp_sgd(params0, Xtr, ytr, K=400, lr=5e-2, weight_decay=1e-2):
     (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
     return paramsK, losses
 
-def eval_on_tests_mlp(params, test_scaled_list):
+def eval_on_tests_mlp(params: list[dict], test_scaled_list: list) -> jnp.ndarray:
+    """Mean MSE of an MLP over a list of (X, y, name) test sets."""
     if not test_scaled_list:
         return jnp.array(0.0, dtype=jnp.float32)
 
@@ -526,25 +543,21 @@ def eval_on_tests_mlp(params, test_scaled_list):
 
     return jnp.mean(jnp.stack(errs))
 
-def plot_mlp_predictions(params, Xs, y, metric="NRMSE", title_prefix="MLP fit"):
-    yhat = mlp_forward(params, Xs)
-    loss_val = _nrmse(yhat, y)
+# ==================================================================
+# Part 3/4: core bilevel inverse optimization (shared by single- and
+# multi-agent, FaIR- and MESM-calibrated experiments)
+# ==================================================================
 
-    plt.figure(figsize=(8,3))
-    plt.plot(np.asarray(y),    label="truth", alpha=0.8)
-    plt.plot(np.asarray(yhat), label="pred",  alpha=0.8)
-    plt.legend(); plt.xlabel("time step"); plt.ylabel("target")
-    plt.title(f"{title_prefix} - {metric.upper()}: {loss_val:.4f}")
-    plt.tight_layout(); plt.show()
-
-def freeze_inactive_agents(emis_dict, active_agents=("CO2",), agents=AGENTS_DEFAULT):
+def freeze_inactive_agents(emis_dict: dict, active_agents: tuple = ("CO2",), agents: tuple = AGENTS_DEFAULT) -> dict:
+    """Stop gradients flowing through agents not in `active_agents` (values unchanged, just detached)."""
     out = {}
     for a in agents:
         x = emis_dict[a]
         out[a] = x if (a in active_agents) else jax.lax.stop_gradient(x)
     return out
 
-def _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode="zeros"):
+def _apply_active_mask_to_emis(U_pytree: dict, active_agents: tuple, inactive_mode: str = "zeros") -> dict:
+    """Zero (optionally stop-gradient) every agent in U_pytree not in active_agents."""
     def squash(u, active):
         if active:
             return u
@@ -555,7 +568,8 @@ def _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode="zeros"):
     return {ag: squash(U_pytree[ag], ag in active_agents) for ag in U_pytree}
 
 # Reuse the helper from earlier to accept dict OR (N_agents, T) arrays
-def _normalize_emissions_input(U_in, agents, T, dtype=jnp.float32):
+def _normalize_emissions_input(U_in: dict | jnp.ndarray, agents: tuple, T: int, dtype: type = jnp.float32) -> dict:
+    """Coerce U_in (dict of per-agent series, or a (N_agents, T) array) to {agent: (T,)}, zero-filling/padding as needed."""
     if isinstance(U_in, dict):
         out = {}
         for a in agents:
@@ -581,14 +595,14 @@ def _normalize_emissions_input(U_in, agents, T, dtype=jnp.float32):
         return {a: A[i, :] for i, a in enumerate(agents)}
 
 def build_train(
-    U_in,                              # dict {agent:(T,)} OR array (N_agents,T)
-    agents=AGENTS_DEFAULT,
-    ema_windows_years=(5.0, 30.0, 100.0),
-    dtype=jnp.float32,
-    years_hist=None,
-    emis_hist_dict=None,
-    mode='FaIR'
-):
+    U_in: dict | jnp.ndarray,                              # dict {agent:(T,)} OR array (N_agents,T)
+    agents: tuple = AGENTS_DEFAULT,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    dtype: type = jnp.float32,
+    years_hist: jnp.ndarray | None = None,
+    emis_hist_dict: dict | None = None,
+    mode: str = 'FaIR'
+) -> list[tuple[jnp.ndarray, jnp.ndarray, str]]:
     """
     Returns a single-scenario train dataset:
       [(X, y, 'opt_scen')]
@@ -640,22 +654,30 @@ def build_train(
     N = min(X.shape[0], y.shape[0])
     return [(X[:N], y[:N], "opt_scen")]
 
-def build_dataset_no_history(emis_dict, scenarios, agents=AGENTS_DEFAULT, mode='FaIR', ema_windows_years=(5.0, 30.0, 100.0)):
+def build_dataset_no_history(
+    emis_dict: dict, scenarios: list[str], agents: tuple = AGENTS_DEFAULT, mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> list[tuple[jnp.ndarray, jnp.ndarray, str]]:
     """
     Build features/targets without prepending historical emissions.
     Uses a sentinel historical_name that won't be found in the dict.
+
+    Note: appears unused elsewhere in the codebase, and the call below passes a
+    positional `scenarios` arg that build_dataset_from_runfair_dict's signature
+    doesn't accept as a second positional (it would collide with the
+    `historical_name` kwarg below) - this function raises TypeError if called
+    as written. Left as-is here; see Phase 5 dead-code/bug notes.
     """
     return build_dataset_from_runfair_dict(
         emis_dict, scenarios, historical_name="__NONE__", agents=agents, mode=mode, ema_windows_years=ema_windows_years
     )
 
 def build_valid(
-    emis_dict_valid,
-    historical_name="historical",
-    agents=AGENTS_DEFAULT,
-    mode='FaIR',
-    ema_windows_years=(5.0, 30.0, 100.0)
-):
+    emis_dict_valid: dict,
+    historical_name: str = "historical",
+    agents: tuple = AGENTS_DEFAULT,
+    mode: str = 'FaIR',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> list[tuple[jnp.ndarray, jnp.ndarray, str]]:
     """
     Combined validation set:
       - Tier-1 with historical context (where available)
@@ -669,17 +691,25 @@ def build_valid(
     return valid
 
 def make_objective_over_emissions(
-    scen_name_tr1,
-    train_data, test_data,
-    emis_dict,
-    params0,
-    historical_name="historical",
-    dtype=jnp.float32,
-    agents=AGENTS_DEFAULT,
-    ema_windows_years=(5.0, 30.0, 100.0),
-    active_agents=("CO2",),
-    mode='FaIR'
-):
+    scen_name_tr1: str,
+    train_data: list, test_data: list,
+    emis_dict: dict,
+    params0: list[dict],
+    historical_name: str = "historical",
+    dtype: type = jnp.float32,
+    agents: tuple = AGENTS_DEFAULT,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    active_agents: tuple = ("CO2",),
+    mode: str = 'FaIR'
+) -> callable:
+    """
+    Build a closure `objective_over_emissions(U_in)` that: substitutes U_in as the
+    `scen_name_tr1` training scenario's emissions, rebuilds that scenario's
+    features/targets, trains a fresh MLP on the updated training set, and returns
+    the resulting mean test NRMSE. This is the single-scenario building block used
+    by optimize_emissions_inverse's outer loop (see make_inverse_objective_single_train
+    for the multi-scenario version actually used there).
+    """
     # --- Historical context (if present) ---
     years_hist, emis_hist_dict = (None, None)
     if historical_name in emis_dict:
@@ -762,7 +792,7 @@ def make_objective_over_emissions(
 def init_constant_emissions(
     T: int,
     emis_val: float = 50.0,
-    dtype=jnp.float32,
+    dtype: type = jnp.float32,
 ) -> jnp.ndarray:
     """Constant initial emissions."""
     return jnp.ones(T, dtype=dtype) * emis_val
@@ -770,7 +800,7 @@ def init_constant_emissions(
 def init_ramp_emissions(
     T: int,
     final_val: float = 50.0,
-    dtype=jnp.float32,
+    dtype: type = jnp.float32,
 ) -> jnp.ndarray:
     """Ramp initial emissions."""
     return jnp.linspace(0, int(final_val), T)
@@ -781,7 +811,7 @@ def init_gaussian_emissions(
     mu: float = 350.0,
     sigma: float = 100.0,
     floor: float = 0.0,
-    dtype=jnp.float32,
+    dtype: type = jnp.float32,
 ) -> jnp.ndarray:
     """Gaussian-shaped initial emissions."""
     t = jnp.arange(T, dtype=dtype)
@@ -793,7 +823,7 @@ def init_sine_emissions(
     T: int,
     peak_emis: float = 50.0,
     period: float = 150.0,
-    dtype=jnp.float32,
+    dtype: type = jnp.float32,
 ) -> jnp.ndarray:
     """Ramp initial emissions."""
     t = jnp.arange(T, dtype=dtype)
@@ -802,12 +832,12 @@ def init_sine_emissions(
 
 def make_init_emissions_pytree(
     T: int,
-    agents=AGENTS_DEFAULT,
-    active_agents=None,
-    init_cond=None,               # str (keyword) | array-like (matrix) | None
+    agents: tuple = AGENTS_DEFAULT,
+    active_agents: tuple | None = None,
+    init_cond: str | jnp.ndarray | None = None,               # str (keyword) | array-like (matrix) | None
     inactive_mode: str = "zeros", # "zeros" or "stop_grad_zeros"
-    dtype=jnp.float32,
-):
+    dtype: type = jnp.float32,
+) -> dict:
     """
     Build initial emissions as a PyTree {agent: (T,)}.
 
@@ -911,15 +941,17 @@ def make_init_emissions_pytree(
 
 
 def make_time_weights(T: int, power: float = 2.0, min_scale: float = 0.1) -> jnp.ndarray:
+    """Per-timestep optimizer weight ramping from min_scale (t=0) to 1.0 (t=T-1), as t^power."""
     x = jnp.linspace(0.0, 1.0, T)
     w = x ** power
     return min_scale + (1.0 - min_scale) * w  # (T,)
 
-def make_time_weights_pytree(T: int, agents=AGENTS_DEFAULT, power=2.0, min_scale=0.15):
+def make_time_weights_pytree(T: int, agents: tuple = AGENTS_DEFAULT, power: float = 2.0, min_scale: float = 0.15) -> dict:
+    """Same weight vector (see make_time_weights) broadcast to every agent."""
     w = make_time_weights(T, power=power, min_scale=min_scale)
     return {a: w for a in agents}
 
-def avg_nrmse_over_tests(params, test_list, eps: float = 1e-8):
+def avg_nrmse_over_tests(params: list[dict], test_list: list, eps: float = 1e-8) -> jnp.ndarray:
     """
     For each scenario:
       NRMSE = RMSE(yhat, ytrue) / max(|ytrue|)
@@ -940,18 +972,29 @@ def avg_nrmse_over_tests(params, test_list, eps: float = 1e-8):
 
 
 def make_inverse_objective_single_train(
-    params0,
-    test_dataset_all,
-    K_inner=400,
-    lr_inner=5e-2,
-    wd_inner=1e-2,
-    agents=AGENTS_DEFAULT,
-    active_agents=("CO2",),
-    inactive_mode="zeros",
-    smoothness_weight=0.0,
-    mode='FaIR',
-    ema_windows_years=(5.0, 30.0, 100.0)
-):
+    params0: list[dict],
+    test_dataset_all: list,
+    K_inner: int = 400,
+    lr_inner: float = 5e-2,
+    wd_inner: float = 1e-2,
+    agents: tuple = AGENTS_DEFAULT,
+    active_agents: tuple = ("CO2",),
+    inactive_mode: str = "zeros",
+    smoothness_weight: float = 0.0,
+    mode: str = 'FaIR',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> callable:
+    """
+    Build the bilevel objective `objective(U_pytree) -> (loss, aux)` at the heart of
+    optimize_emissions_inverse: given a candidate emissions trajectory U_pytree,
+    (1) mask inactive agents, (2) build a single-scenario train set from U_pytree
+    (build_train), (3) train a fresh MLP emulator on it for K_inner SGD steps
+    (train_mlp_sgd) - this is the "inner" optimization, (4) evaluate that emulator's
+    mean NRMSE on `test_dataset_all`, plus an optional first-difference smoothness
+    penalty on U_pytree. The outer gradient (w.r.t. U_pytree) is obtained by
+    differentiating through the entire inner training loop.
+    aux = (paramsK, test_s, train_temp_raw) for logging/checkpointing.
+    """
     def objective(U_pytree):
         U_eff = _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode)
 
@@ -997,17 +1040,20 @@ def make_inverse_objective_single_train(
     return objective
 
 
-def _tree_to_numpy(tree):
+def _tree_to_numpy(tree: dict) -> dict:
+    """Recursively convert every jax array leaf in a pytree to a host numpy array."""
     return jax.tree_util.tree_map(
         lambda x: np.asarray(jax.device_get(x)) if isinstance(x, (jnp.ndarray, jax.Array)) else x, tree
     )
 
-def _tree_to_jnp(tree):
+def _tree_to_jnp(tree: dict) -> dict:
+    """Recursively convert every numpy array leaf in a pytree to a jnp array."""
     return jax.tree_util.tree_map(
         lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x, tree
     )
 
-def save_inverse_ckpt(path, state):
+def save_inverse_ckpt(path: str, state: dict) -> None:
+    """Pickle an optimize_emissions_inverse checkpoint dict to `path` (host numpy arrays)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     safe = {
         "U_traj": [_tree_to_numpy(u) for u in state["U_traj"]],
@@ -1024,7 +1070,8 @@ def save_inverse_ckpt(path, state):
     with open(path, "wb") as f:
         pickle.dump(safe, f)
 
-def load_inverse_ckpt(path):
+def load_inverse_ckpt(path: str) -> dict:
+    """Load a checkpoint saved by save_inverse_ckpt, restoring jnp arrays."""
     with open(path, "rb") as f:
         raw = pickle.load(f)
     out = {
@@ -1039,54 +1086,76 @@ def load_inverse_ckpt(path):
     }
     return out
 
-def scale_by_coord_pytree(weights_pytree):
+def scale_by_coord_pytree(weights_pytree: dict) -> optax.GradientTransformation:
+    """An optax transform that elementwise-multiplies gradients by a matching pytree of weights."""
     def _mul(g, w): return g * w
     def init_fn(_): return ()
     def update_fn(updates, state, params=None):
         return jax.tree_util.tree_map(_mul, updates, weights_pytree), state
     return optax.GradientTransformation(init_fn, update_fn)
 
-def preds_by_scenario(params, test_list):
+def preds_by_scenario(params: list[dict], test_list: list) -> list[tuple[str, jnp.ndarray, jnp.ndarray]]:
+    """Run the MLP on every (X, y, scenario) test row; returns [(scenario, y_hat, y_true), ...]."""
     out = []
     for (Xte, yte, scen) in test_list:
         yhat = mlp_forward(params, Xte)
         out.append((scen, yhat, yte))
     return out
 
-def make_agent_mask_pytree(T, agents, active_agents):
+def make_agent_mask_pytree(T: int, agents: tuple, active_agents: tuple) -> dict:
+    """{agent: ones(T)} for agents in active_agents, {agent: zeros(T)} otherwise."""
     one  = lambda: jnp.ones((T,), jnp.float32)
     zero = lambda: jnp.zeros((T,), jnp.float32)
     return {ag: (one() if ag in active_agents else zero()) for ag in agents}
 
-def mul_tree(a, b):
+def mul_tree(a: dict, b: dict) -> dict:
+    """Elementwise-multiply two matching pytrees."""
     return jax.tree_util.tree_map(lambda x, m: x * m, a, b)
 
 def optimize_emissions_inverse(
-    emis_dict,
-    params0,
-    num_updates=500,
-    step_size=1e3,
-    momentum=0.9,
-    nesterov=True,
-    K_inner=500,
-    lr_inner=5e-2,
-    wd_inner=1e-2,
-    historical_name="historical",
-    agents=AGENTS_DEFAULT,
-    active_agents=None,
-    init_cond=None,
-    inactive_mode="zeros",
+    emis_dict: dict,
+    params0: list[dict],
+    num_updates: int = 500,
+    step_size: float | dict = 1e3,
+    momentum: float = 0.9,
+    nesterov: bool = True,
+    K_inner: int = 500,
+    lr_inner: float = 5e-2,
+    wd_inner: float = 1e-2,
+    historical_name: str = "historical",
+    agents: tuple = AGENTS_DEFAULT,
+    active_agents: tuple | None = None,
+    init_cond: str | jnp.ndarray | None = None,
+    inactive_mode: str = "zeros",
     T: int = 750,
     n_nonneg_prefix: int | None = None,
     filter_hist: bool = False,
-    smoothness_weight=0.0,
-    mode='FaIR',
-    checkpoint_path=None,
-    checkpoint_every=50,
-    resume_if_exists=True,
-    preds_every=50,
-    ema_windows_years=(5.0, 30.0, 50.0)
-):
+    smoothness_weight: float = 0.0,
+    mode: str = 'FaIR',
+    checkpoint_path: str | None = None,
+    checkpoint_every: int = 50,
+    resume_if_exists: bool = True,
+    preds_every: int = 50,
+    ema_windows_years: tuple = (5.0, 30.0, 50.0)
+) -> dict:
+    """
+    The core bilevel/outer-loop optimizer: finds an emissions trajectory U (one
+    (T,) series per agent, starting from `init_cond`) that minimizes the objective
+    built by make_inverse_objective_single_train - i.e. the trajectory whose
+    resulting training data yields the best-generalizing emulator on
+    `emis_dict`'s scenarios (via build_valid). Optimizes with SGD+momentum
+    (per-agent time-weighted, see make_time_weights_pytree/step_size), clips
+    gradients to unit global norm, and optionally projects the first
+    `n_nonneg_prefix` timesteps to be non-negative.
+
+    Checkpoints (U trajectory, optimizer state, losses, prediction snapshots) are
+    written to `checkpoint_path` every `checkpoint_every` steps and resumed from
+    there if `resume_if_exists` and the file exists - this is what makes long runs
+    safe to schedule/interrupt/resume.
+
+    Returns a dict with keys "U_traj", "errors", "updates_done", "paramsK_k",
+    "checkpoint_path", "preds_traj", "train_temp_traj".
+    """
     import gc # Import garbage collection
 
     def hostify_tree(tree):
@@ -1281,223 +1350,17 @@ def optimize_emissions_inverse(
         "train_temp_traj": train_temp_traj,
     }
 
-def plot_inverse_results(
-    results,
-    baseline_error,                  # 1) dashed reference line
-    active_agents=None,              # 4) only plot these agents’ emissions
-    agent_units=None,                # optional: {'CO2':'GtCO₂/yr','CH4':'MtCH₄/yr'}
-    max_lines=11,                    # 7) up to 12 emissions curves
-    pred_scenario=None,
-    baseline_preds=None,
-):
-    """
-    Multipanel plot:
-      (a) NRMSE vs update step
-      (b) Optimal emissions profiles (one subplot per active agent)
-      (c) Training temperature trajectory
-      (d) Predictions vs Truth
-    """
-    errors = jnp.asarray(results["errors"])
-    U_traj = results["U_traj"]
-    preds_traj = results.get("preds_traj", [])
-
-    # --- helpers to read U_traj --------------------------------
-    def _agents_in_state(state):
-        if isinstance(state, (tuple, list)) and len(state) == 2:
-            return ("CO2", "CH4")
-        if isinstance(state, dict):
-            return tuple(state.keys())
-        raise ValueError("Unrecognized U_traj state format.")
-
-    def _get_series(state, agent):
-        if isinstance(state, (tuple, list)):
-            if agent == "CO2": return jnp.asarray(state[0]).reshape(-1)
-            if agent == "CH4": return jnp.asarray(state[1]).reshape(-1)
-            raise KeyError(f"Agent {agent} not found in tuple state.")
-        return jnp.asarray(state[agent]).reshape(-1)
-
-    # Figure out which agents exist in this run
-    present_agents = _agents_in_state(U_traj[0])
-    if active_agents is None:
-        active_agents = present_agents
-    else:
-        active_agents = tuple(a for a in active_agents if a in present_agents)
-
-    # Units
-    if agent_units is None:
-        agent_units = {"CO2": "Gt/yr", "CH4": "Mt/yr", "N2O": "Mt/yr", "Sulfur":"Mt/yr", "BC": "Mt/yr"}
-
-    n_update_steps = int(results.get("updates_done", max(0, errors.shape[0] - 1)))
-
-    # years length
-    if len(active_agents) == 0:
-        probe_agent = present_agents[0]
-    else:
-        probe_agent = active_agents[0]
-    T = int(_get_series(U_traj[-1], probe_agent).shape[0])
-
-    # --- DYNAMIC SUBPLOTS ---
-    # Rows: 1 (NRMSE) + N (Agents) + 1 (TrainTemp) + 1 (Preds)
-    n_agents = len(active_agents)
-    n_rows = 3 + n_agents
-
-    # Adjust figure height based on number of rows to maintain aspect ratio
-    fig_height = 2.5 * n_rows
-    fig, axes = plt.subplots(
-        nrows=n_rows, ncols=1,
-        figsize=(9, fig_height),
-        constrained_layout=True
-    )
-
-    # Handle single axis case (unlikely but safe)
-    if n_rows == 1: axes = [axes]
-
-    # Assign axes
-    ax_err = axes[0]
-    ax_emis_list = axes[1 : 1 + n_agents] # Slice for emissions
-    ax_train = axes[-2]
-    ax_pred = axes[-1]
-
-    # Share x-axis between all emissions plots and the training temperature
-    for ax in ax_emis_list:
-        ax.sharex(ax_train)
-
-    # ----- Panel (a): scaled RMSE vs update step --------------------------------
-    x_err = jnp.arange(errors.shape[0])
-    ax_err.semilogy(x_err, errors, label="NRMSE")
-    ax_err.axhline(float(baseline_error), ls="--", c='r', lw=1.5, label=f"Baseline emulator (avg.)")
-    ax_err.set_xlim(0, n_update_steps)
-    ax_err.set_xlabel("Update step")
-    ax_err.set_ylabel("NRMSE")
-    ax_err.text(
-        0.015, 0.93, "NRMSE vs. Update Step", transform=ax_err.transAxes,
-        ha="left", va="top", fontsize=16, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-    )
-    ax_err.grid(True, alpha=0.3)
-    ax_err.legend(loc="best")
-
-    # ----- Panel (b): Optimal emissions (One subplot per agent) -----------------
-    n_total = len(U_traj)
-    if n_total <= max_lines:
-        sel_steps = np.arange(n_total, dtype=int)
-    else:
-        sel_steps = np.unique(np.linspace(0, n_total - 1, num=max_lines, dtype=int))
-
-    # Iterate over agents and their corresponding axes
-    for idx, ag in enumerate(active_agents):
-        ax_curr = ax_emis_list[idx]
-        has_any = False
-
-        for i in sel_steps:
-            state = U_traj[i]
-            alpha = 0.3 + 0.7 * (i / max(1, len(U_traj) - 1))
-            series = _get_series(state, ag)
-            ax_curr.plot(series, alpha=alpha, label=f"Step {i}")
-            has_any = True
-
-        ax_curr.set_xlim(0, T)
-        unit = agent_units.get(ag, "units/yr")
-        ax_curr.set_ylabel(f"{ag} ({unit})")
-
-        ax_curr.text(
-            0.015, 0.93, f"Optimal {ag}", transform=ax_curr.transAxes,
-            ha="left", va="top", fontsize=16, fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
-        )
-
-        ax_curr.grid(True, alpha=0.3)
-        # Turn off x-tick labels for all emissions plots (shared with bottom)
-        ax_curr.tick_params(axis="x", labelbottom=False)
-
-        if has_any and idx == 0:
-            # Only put legend on the first emissions plot to avoid clutter
-            ax_curr.legend(ncol=3, fontsize=8, loc="best")
-
-    # ----- Panel (c): Training temperature trajectory -------------------------
-    train_temp_traj = results.get("train_temp_traj", [])
-    if len(train_temp_traj) > 0:
-        M_all = len(train_temp_traj)
-        if M_all <= max_lines:
-            sel_train = np.arange(M_all, dtype=int)
-        else:
-            sel_train = np.unique(np.linspace(0, M_all - 1, num=max_lines, dtype=int))
-
-        for k, i in enumerate(sel_train):
-            temp_list = train_temp_traj[i]
-            if temp_list is None or len(temp_list) == 0: continue
-            y_train = np.asarray(temp_list[0])
-            if y_train.ndim > 1: y_plot = y_train[:, 0]
-            else: y_plot = y_train
-
-            alpha = 0.3 + 0.7 * (k / max(1, len(sel_train) - 1))
-            ax_train.plot(y_plot, alpha=alpha, label=f"Step {i}")
-
-        ax_train.set_xlabel("Year")
-        ax_train.set_ylabel(r"$\overline{\Delta T}(t)$ ($^\circ$C)")
-        ax_train.grid(True, alpha=0.3)
-        ax_train.set_xlim(0, T)
-        ax_train.text(
-            0.015, 0.93, r"$\overline{\Delta T}(t)$ from Optimal Emissions", transform=ax_train.transAxes,
-            ha="left", va="top", fontsize=16, fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
-        )
-
-    # ----- Panel (d): Predictions vs Truth ------------------------------------
-    if pred_scenario is None:
-        target_scen = preds_traj[0][0][0] if len(preds_traj) > 0 else "Unknown"
-    else:
-        target_scen = pred_scenario
-
-    def _find_scen_idx(step_list, name):
-        for j, (sc, _, _) in enumerate(step_list):
-            if sc == name: return j
-        return None
-
-    N_all = len(preds_traj)
-    if N_all > 0:
-        if N_all <= max_lines:
-            sel_pred = np.arange(N_all, dtype=int)
-        else:
-            sel_pred = np.unique(np.linspace(0, N_all - 1, num=max_lines, dtype=int))
-
-        last_ytrue = None
-        for k, i in enumerate(sel_pred):
-            step_list = preds_traj[i]
-            j = _find_scen_idx(step_list, target_scen)
-            if j is None: continue
-            _, yhat, ytrue = step_list[j]
-            yhat, ytrue = jnp.asarray(yhat), jnp.asarray(ytrue)
-
-            alpha = 0.3 + 0.7 * (k / max(1, len(sel_pred) - 1))
-            ax_pred.plot(yhat, alpha=alpha, label=(f"Step {i}"))
-            last_ytrue = ytrue
-
-        if last_ytrue is not None:
-            ax_pred.plot(last_ytrue, ls="--", c="C3", label=f"truth: {target_scen}")
-            if baseline_preds is not None:
-                ax_pred.plot(baseline_preds, ls="-.", c="C2", label=f"Baseline Emulator")
-            ax_pred.set_xlim(0, int(last_ytrue.shape[0]) - 1)
-
-    ax_pred.text(
-        0.015, 0.93, f"Predictions vs Truth ({target_scen})", transform=ax_pred.transAxes,
-        ha="left", va="top", fontsize=16, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
-    )
-    ax_pred.set_xlabel("Year")
-    ax_pred.set_ylabel(r"$\overline{\Delta T}(t)$ ($^\circ$C)")
-    ax_pred.grid(True, alpha=0.3)
-    ax_pred.legend(ncol=3, loc="best", fontsize=8)
-
-    return
+# ==================================================================
+# Part 3/4: baseline & optimal emulator evaluation, notebook-facing wrappers
+# ==================================================================
 
 def prepare_baseline_data(
-    emis_dict_train,
-    emis_dict_test,
-    historical_name="historical",
-    mode='FaIR',
-    ema_windows_years=(5.0, 30.0, 100.0)
-):
+    emis_dict_train: dict,
+    emis_dict_test: dict,
+    historical_name: str = "historical",
+    mode: str = 'FaIR',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> tuple[list, list, tuple[jnp.ndarray, jnp.ndarray]]:
     """Build baseline train/test datasets with the same feature construction as inverse."""
     train_data = build_dataset_from_runfair_dict(emis_dict_train, historical_name=historical_name, mode=mode, ema_windows_years=ema_windows_years)
     test_data  = build_dataset_from_runfair_dict(emis_dict_test, historical_name=historical_name, mode=mode, ema_windows_years=ema_windows_years)
@@ -1506,14 +1369,14 @@ def prepare_baseline_data(
     return train_s, test_s, stats
 
 def train_baseline_emulator(
-    train_scaled,                 # list[(X_s, y, scen), ...]
-    key,
-    hidden_sizes=[16],
-    K=400,
-    lr=5e-2,
-    weight_decay=1e-2,
-    dtype=jnp.float32
-):
+    train_scaled: list,                 # list[(X_s, y, scen), ...]
+    key: jax.random.PRNGKey,
+    hidden_sizes: list[int] = [16],
+    K: int = 400,
+    lr: float = 5e-2,
+    weight_decay: float = 1e-2,
+    dtype: type = jnp.float32
+) -> tuple[list[dict], tuple[jnp.ndarray, jnp.ndarray], dict]:
     """Concatenate train tensors and train via the same MLP+optimizer as inverse."""
     Xtr = jnp.concatenate([X for (X, _, _) in train_scaled], axis=0).astype(dtype)
     ytr = jnp.concatenate([y for (_, y, _) in train_scaled], axis=0).astype(dtype)
@@ -1528,10 +1391,11 @@ def train_baseline_emulator(
     return paramsK, (jnp.mean(losses), losses), meta
 
 def evaluate_emulator_nrmse(
-    params,
-    dataset,          # list[(X, y, scen)]
-    stats             # (mu, sd) from fit on the baseline train set
-):
+    params: list[dict],
+    dataset: list,          # list[(X, y, scen)]
+    stats: tuple[jnp.ndarray, jnp.ndarray]             # (mu, sd) from fit on the baseline train set
+) -> jnp.ndarray:
+    """Mean NRMSE of an MLP over `dataset`, rescaling features with `stats` (no refit)."""
     # Apply the SAME scaler used in training
     test_scaled = []
     for (X, y, scen) in dataset:
@@ -1539,12 +1403,14 @@ def evaluate_emulator_nrmse(
         test_scaled.append((Xs, jnp.asarray(y, dtype=jnp.float32), scen))
     return avg_nrmse_over_tests(params, test_scaled)
 
-def _nrmse(yhat: jnp.ndarray, ytrue: jnp.ndarray, eps: float = 1e-8):
+def _nrmse(yhat: jnp.ndarray, ytrue: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+    """RMSE(yhat, ytrue) normalized by max(|ytrue|)."""
     max_abs = jnp.maximum(jnp.max(jnp.abs(ytrue)), eps)
     return jnp.sqrt(jnp.mean((yhat - ytrue) ** 2)) / max_abs
 
 # --- helper: apply train stats to a test dataset list[(X, y, scen)] ---------
-def _apply_stats_to_test(test_dataset, stats):
+def _apply_stats_to_test(test_dataset: list, stats: tuple[jnp.ndarray, jnp.ndarray]) -> list:
+    """Apply a (mu, sd) scaler to every X in a list of (X, y, scen) rows."""
     out = []
     for (X, y, scen) in test_dataset:
         Xs = apply_scaler(jnp.asarray(X, jnp.float32), stats)
@@ -1553,17 +1419,17 @@ def _apply_stats_to_test(test_dataset, stats):
 
 # --- main wrapper ------------------------------------------------------------
 def evaluate_baseline_over_multiple_tests(
-    emis_dict_train,
+    emis_dict_train: dict,
     eval_sets: dict,              # {"H": emis_dict_test_H, "S": emis_dict_test_S, ...}
-    historical_name="historical",
-    key=jax.random.PRNGKey(0),
-    hidden_sizes=[16],
-    K=400,
-    lr=5e-2,
-    weight_decay=1e-2,
-    mode='FaIR',
-    ema_windows_years=(5.0, 30.0, 100.0)
-):
+    historical_name: str = "historical",
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0),
+    hidden_sizes: list[int] = [16],
+    K: int = 400,
+    lr: float = 5e-2,
+    weight_decay: float = 1e-2,
+    mode: str = 'FaIR',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> tuple[list[dict], dict, dict, dict]:
     """
     Trains the baseline emulator ONCE using emis_dict_train,
     then evaluates on each set in `eval_sets` using the same scaler and MLP params.
@@ -1623,7 +1489,12 @@ def evaluate_baseline_over_multiple_tests(
 
     return paramsK_base, baseline_results, baseline_preds, ground_truth
 
-def create_baseline(train_s, test_s, hidden_sizes=[16], idx_demo=None, verbose=False):
+def create_baseline(
+    train_s: list, test_s: list, hidden_sizes: list[int] = [16], idx_demo: int | None = None, verbose: bool = False
+) -> list[dict]:
+    """
+    Train a baseline MLP on `train_s` and report per-scenario NRMSE on `test_s`.
+    """
 
     def eval_test_nrmse_by_scenario(params, test_list):
         """Returns list of (scenario_name, rmse_value) for all tests."""
@@ -1662,7 +1533,17 @@ def create_baseline(train_s, test_s, hidden_sizes=[16], idx_demo=None, verbose=F
 
     return params0
 
-def test_get_grad(scen, params0, emis_dict_JAX, train_data, test_data, agents=AGENTS_DEFAULT, active_agents=('CO2'), mode='FaIR'):
+def test_get_grad(
+    scen: str, params0: list[dict], emis_dict_JAX: dict, train_data: list, test_data: list,
+    agents: tuple = AGENTS_DEFAULT, active_agents=('CO2'), mode: str = 'FaIR'
+) -> None:
+  """
+  Debug helper: print the gradient norm of make_objective_over_emissions w.r.t.
+  each agent's emissions for `scen`.
+
+  Note: default active_agents=('CO2') is the *string* 'CO2', not a 1-tuple
+  (missing trailing comma) - preserved as-is; flagged for Phase 5.
+  """
 
   years_tr1, E0 = extract_years_and_emis(emis_dict_JAX[scen])
 
@@ -1700,19 +1581,26 @@ def evaluate_optimal_emulator(
     training_paths: list[str],
     train_scenarios: list[str],
     eval_sets: dict,
-    params0: dict=None,
-    agents=AGENTS_DEFAULT,
-    active_agents=None,
-    inactive_mode="zeros",
-    historical_name="historical",
-    key=jax.random.PRNGKey(0),
-    K=400,
-    lr=5e-2,
-    weight_decay=1e-2,
-    mode='FaIR',
-    ind_effects=False,
-    ema_windows_years=(5.0, 30.0, 100.0)
-):
+    params0: list[dict] = None,
+    agents: tuple = AGENTS_DEFAULT,
+    active_agents: tuple | None = None,
+    inactive_mode: str = "zeros",
+    historical_name: str = "historical",
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0),
+    K: int = 400,
+    lr: float = 5e-2,
+    weight_decay: float = 1e-2,
+    mode: str = 'FaIR',
+    ind_effects: bool = False,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> dict | tuple[dict, dict]:
+    """
+    For each optimize_emissions_inverse checkpoint in `training_paths` (final U in
+    the trajectory), train a fresh MLP on the resulting optimal emissions and
+    evaluate NRMSE against every eval_sets entry. Returns results_out
+    (results_out[train_label][eval_set][scenario] = NRMSE, plus 'mean'), and also
+    y_hat_all (raw predictions) if ind_effects=True.
+    """
     results_out = {}
 
     if ind_effects:
@@ -1798,7 +1686,8 @@ def evaluate_optimal_emulator(
 
     return results_out
 
-def CS3_hist_modifier(scen_name, years_hist, emis_hist_dict):
+def CS3_hist_modifier(scen_name: str, years_hist: jnp.ndarray, emis_hist_dict: dict) -> tuple[jnp.ndarray, dict]:
+    """For CS3 scenarios (AA, CT), truncate the shared historical series to their shorter 256-year record."""
     # Define the scenarios that need partial history
     SPECIAL_SCENS = ["AA", "CT"]
 
@@ -1821,7 +1710,17 @@ def CS3_hist_modifier(scen_name, years_hist, emis_hist_dict):
 # Wrapper functions for notebooks
 # -------------------------------
 
-def generate_init_params_and_train_data(agents, active_agents, test_scen, hidden_sizes=[16], idx_demo=None, verbose=False, mode='FaIR', ema_windows_years=(5.0, 30.0, 100.0)):
+def generate_init_params_and_train_data(
+    agents: tuple, active_agents: tuple, test_scen: str, hidden_sizes: list[int] = [16],
+    idx_demo: int | None = None, verbose: bool = False, mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> tuple[list[dict], dict]:
+    """
+    Notebook-facing wrapper: build the tier1/tier2 train/test split (via
+    utils_FaIR_JAX.generate_train_test), train the initial baseline MLP params
+    (create_baseline) used to seed optimize_emissions_inverse, and print a
+    gradient sanity check (test_get_grad) for `test_scen`.
+    Returns (params0, emis_dict_train_JAX).
+    """
 
     emis_dict_train_FaIR, emis_dict_test_FaIR, emis_dict_train_JAX, emis_dict_test_JAX, delT_dict_train_FaIR, delT_dict_test_FaIR, delT_dict_train_JAX, delT_dict_test_JAX = utils_FaIR_JAX.generate_train_test(agents, mode=mode)
 
@@ -1834,7 +1733,17 @@ def generate_init_params_and_train_data(agents, active_agents, test_scen, hidden
 
     return params0, emis_dict_train_JAX
 
-def generate_eval_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
+def generate_eval_data(
+    agents: tuple, DECK: bool = True, CS3: bool = False, DAMIP: bool = False, GeoMIP: bool = False
+) -> tuple:
+    """
+    Notebook-facing wrapper (the most-reused function in this file - used across
+    nearly every 3x/4x/SI notebook): build the named eval_sets dict ("Tier 1",
+    "Tier 2", and whichever of "DECK"/"CS3"/"DAMIP"/"GeoMIP" are requested, plus
+    "All") from utils_FaIR_JAX.generate_JAX_data.
+    Returns (eval_sets, *eval_data, emis_dict_all_JAX) - the individual eval_data
+    dicts are also returned positionally, in the same order they went into eval_sets.
+    """
 
     eval_data = utils_FaIR_JAX.generate_JAX_data(agents, DECK=DECK, CS3=CS3, DAMIP=DAMIP, GeoMIP=GeoMIP)
 
@@ -1862,7 +1771,16 @@ def generate_eval_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
 
     return eval_sets, *eval_data, emis_dict_all_JAX
 
-def generate_and_eval_baseline_emulator(emis_dict_train, eval_sets, save_path=None, verbose=False, hidden_sizes=[16], mode='FaIR', ema_windows_years=(5.0, 30.0, 100.0)):
+def generate_and_eval_baseline_emulator(
+    emis_dict_train: dict, eval_sets: dict, save_path: str | None = None, verbose: bool = False,
+    hidden_sizes: list[int] = [16], mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0)
+) -> tuple[dict, dict, dict]:
+    """
+    Notebook-facing wrapper around evaluate_baseline_over_multiple_tests: train
+    the baseline emulator on emis_dict_train, evaluate NRMSE on every eval_sets
+    entry, optionally pickle baseline_results to save_path, optionally print a
+    per-scenario summary. Returns (baseline_results, baseline_pred_delT, ground_truth_delT).
+    """
 
     paramsK_base, baseline_results, baseline_pred_delT, ground_truth_delT = evaluate_baseline_over_multiple_tests(
     emis_dict_train=emis_dict_train,
@@ -1893,33 +1811,13 @@ def generate_and_eval_baseline_emulator(emis_dict_train, eval_sets, save_path=No
 
     return baseline_results, baseline_pred_delT, ground_truth_delT
 
-def plot_baseline_pred_delT(baseline_results, baseline_pred_delT, ground_truth_delT):
-    test_set = 'All'
-    N_scens = len(baseline_results[test_set])
-    rows = int(np.ceil(N_scens / 3))
-    cols = 3
-    fig, axes = plt.subplots(rows, cols, figsize=(14, 3.5*rows), constrained_layout=True)
-    axes = axes.ravel()
+# ==================================================================
+# Part 4: MESM zonal (vector-target) emulator - init/train/eval variants
+# of the Part 3 MLP that predict a full spatial (latitude) vector instead
+# of a single GMST scalar
+# ==================================================================
 
-    for i, scen in enumerate(baseline_results[test_set]):
-        if scen == 'mean':
-            continue
-        ax = axes[i]
-        ax.plot(ground_truth_delT[test_set][scen],  label="truth", alpha=0.9)
-        ax.plot(baseline_pred_delT[test_set][scen],  label="prediction", ls="--", alpha=0.9)
-        ax.set_title(f"{scen} - NRMSE={baseline_results[test_set][scen]:.3f}")
-        ax.set_xlabel("time step")
-        ax.set_ylabel("GMST (K)")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-
-    return
-
-## --------------
-## Emulating MESM
-## --------------
-
-def init_mlp_params_vector(key, input_dim, hidden_sizes, output_dim):
+def init_mlp_params_vector(key: jax.random.PRNGKey, input_dim: int, hidden_sizes: list[int], output_dim: int) -> list[dict]:
     """
     Initialize parameters for an MLP with a vector output.
 
@@ -1944,7 +1842,7 @@ def init_mlp_params_vector(key, input_dim, hidden_sizes, output_dim):
 
     return params
 
-def mlp_forward_vector(params, X):
+def mlp_forward_vector(params: list[dict], X: jnp.ndarray) -> jnp.ndarray:
     """
     Forward pass for a vector-output MLP.
 
@@ -1968,7 +1866,10 @@ def mlp_forward_vector(params, X):
 
     return y
 
-def train_mlp_sgd_vector(params0, Xtr, ytr, weights=None, K=400, lr=5e-2, weight_decay=1e-2):
+def train_mlp_sgd_vector(
+    params0: list[dict], Xtr: jnp.ndarray, ytr: jnp.ndarray, weights: jnp.ndarray | None = None,
+    K: int = 400, lr: float = 5e-2, weight_decay: float = 1e-2
+) -> tuple[list[dict], jnp.ndarray]:
     """
     Training loop specifically for vector outputs (Xtr, ytr).
     ytr shape should be (N_samples, output_dim).
@@ -2014,15 +1915,15 @@ def train_mlp_sgd_vector(params0, Xtr, ytr, weights=None, K=400, lr=5e-2, weight
     return paramsK, losses
 
 def build_dataset_vector_targets(
-    emis_dict,
-    targets_dict,
-    scenarios,
-    historical_name="historical",
-    agents=AGENTS_DEFAULT,
-    ema_windows_years=(5.0, 30.0, 100.0),
-    target_crop_future=162,
-    emis_offset_hist=111
-):
+    emis_dict: dict,
+    targets_dict: dict,
+    scenarios: list[str],
+    historical_name: str = "historical",
+    agents: tuple = AGENTS_DEFAULT,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    target_crop_future: int = 162,
+    emis_offset_hist: int = 111
+) -> list[tuple[jnp.ndarray, jnp.ndarray, str]]:
     """
     Constructs a dataset where targets are retrieved from `targets_dict` rather
     than being simulated internally.
@@ -2098,15 +1999,15 @@ def build_dataset_vector_targets(
     return dataset
 
 def prepare_data_vector(
-    emis_dict_train,
-    targets_dict_train,
-    scenarios_train,
-    historical_name="historical",
-    ema_windows_years=(5.0, 30.0, 100.0),
-    target_crop_future=162,
-    emis_offset_hist=111,
-    precomp_stats_X=None
-):
+    emis_dict_train: dict,
+    targets_dict_train: dict,
+    scenarios_train: list[str],
+    historical_name: str = "historical",
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    target_crop_future: int = 162,
+    emis_offset_hist: int = 111,
+    precomp_stats_X: tuple[jnp.ndarray, jnp.ndarray] | None = None
+) -> tuple[list, tuple[jnp.ndarray, jnp.ndarray]]:
     """Builds and scales the training data for vector targets."""
     # Build raw
     train_raw = build_dataset_vector_targets(
@@ -2144,18 +2045,20 @@ def prepare_data_vector(
     return train_scaled, stats_X
 
 def evaluate_emulator_vector_over_multiple_tests(
-    params,
-    stats_X,
-    eval_emis_sets,
-    eval_targets_sets,
-    lat_coords=None,
-    historical_name="historical",
-    ema_windows_years=(5.0, 30.0, 100.0),
-    target_crop_future=162,
-    emis_offset_hist=111
-):
+    params: list[dict],
+    stats_X: tuple[jnp.ndarray, jnp.ndarray],
+    eval_emis_sets: dict,
+    eval_targets_sets: dict,
+    lat_coords: np.ndarray | None = None,
+    historical_name: str = "historical",
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    target_crop_future: int = 162,
+    emis_offset_hist: int = 111
+) -> tuple[dict, dict, dict]:
     """
     Evaluates vector emulator with both Zonal (per-dim) and Global (weighted) NRMSE.
+    Returns (results, predictions, ground_truth), each keyed by eval-set name then
+    scenario ('mean' also included per eval-set with weighted-average zonal/global NRMSE).
     """
 
     results = {}
@@ -2279,25 +2182,33 @@ def evaluate_emulator_vector_over_multiple_tests(
     return results, predictions, ground_truth
 
 def generate_and_eval_emulator_vector(
-    emis_dict_train,
-    targets_dict_train,
-    eval_emis_sets,
-    eval_targets_sets,
-    output_dim,
-    lat_coords=None,
-    hidden_sizes=[16],
-    lr=5e-2,
-    weight_decay=1e-2,
-    K=400,
-    save_path=None,
-    verbose=False,
-    key_seed=0,
-    historical_name="historical",
-    ema_windows_years=(5.0, 30.0, 100.0),
-    precomp_stats_X=None,
-    params0=None
-):
-    """Wrapper updated to pass lat_coords."""
+    emis_dict_train: dict,
+    targets_dict_train: dict,
+    eval_emis_sets: dict,
+    eval_targets_sets: dict,
+    output_dim: int,
+    lat_coords: np.ndarray | None = None,
+    hidden_sizes: list[int] = [16],
+    lr: float = 5e-2,
+    weight_decay: float = 1e-2,
+    K: int = 400,
+    save_path: str | None = None,
+    verbose: bool = False,
+    key_seed: int = 0,
+    historical_name: str = "historical",
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    precomp_stats_X: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    params0: list[dict] | None = None
+) -> tuple:
+    """
+    Notebook-facing wrapper (used by 4c_evaluate_MESM_emulator.ipynb): build vector-
+    target train data (prepare_data_vector), train a vector-output MLP
+    (train_mlp_sgd_vector), evaluate it (evaluate_emulator_vector_over_multiple_tests),
+    and optionally pickle the results to save_path. Note: test_vector_emulator.py
+    calls this function under the name `generate_and_eval_baseline_emulator_vector`,
+    which doesn't exist - see Phase 4 test-suite notes.
+    Returns (results, preds, truths, paramsK[, stats_X if precomp_stats_X was None]).
+    """
 
     # 1. Prepare Training Data
     train_scens = list(emis_dict_train.keys())
@@ -2361,97 +2272,7 @@ def generate_and_eval_emulator_vector(
         return results, preds, truths, paramsK, stats_X
     return results, preds, truths, paramsK
 
-def plot_zonal_predictions(results, preds, truths, lat_coords, eval_set='Tier 1'):
-    """
-    Plots baseline emulator predictions vs ground truth at t=0, T/2, and T.
-    Includes a secondary axis (twinx) showing the Zonal NRMSE profile.
-    """
-    scenarios = list(preds[eval_set].keys())
-    n_scens = len(scenarios)
-
-    # 1. Determine Shared Axis Limits
-    # Flatten all arrays to find global min/max for Temperature
-    all_p = np.concatenate([p.flatten() for p in preds[eval_set].values()])
-    all_t = np.concatenate([t.flatten() for t in truths[eval_set].values()])
-    t_min, t_max = min(all_p.min(), all_t.min()), max(all_p.max(), all_t.max())
-
-    # Determine global limits for NRMSE (secondary axis)
-    all_nrmse = []
-    for s in scenarios:
-        if 'zonal' in results[eval_set][s]:
-            all_nrmse.append(results[eval_set][s]['zonal'])
-    if all_nrmse:
-        all_nrmse = np.concatenate(all_nrmse)
-        n_min, n_max = 0, max(all_nrmse.max() * 1.1, 0.1) # Start at 0, add buffer
-    else:
-        n_min, n_max = 0, 1
-
-    # 2. Setup Plot
-    fig, axes = plt.subplots(n_scens, 3, sharey='row',
-                             figsize=(16, 4.5 * n_scens),
-                             constrained_layout=True)
-    if n_scens == 1: axes = np.expand_dims(axes, 0) # Ensure 2D array
-
-    # 3. Plotting Loop
-    for i, scen in enumerate(scenarios):
-        y_pred = preds[eval_set][scen]
-        y_true = truths[eval_set][scen]
-
-        # Metrics
-        glob_nrmse_t_series = results[eval_set][scen]['global_t']
-        zonal_nrmse = results[eval_set][scen]['zonal'] # (N_lat,)
-
-        T = y_true.shape[0]
-        time_steps = [0, T//2, T-1]
-
-        for j, t in enumerate(time_steps):
-            ax = axes[i, j]
-
-            # --- Primary Axis: Temperature ---
-            ax.plot(lat_coords, y_true[t], color=cm.batlowS(0), ls='-', label='MESM temp. anomaly', lw=1.5, alpha=0.8)
-            ax.plot(lat_coords, y_pred[t], color=cm.lajollaS(2), ls='--', label='Emulated temp. anomaly', lw=1.5, alpha=0.9)
-
-            ax.set_ylim(t_min, t_max)
-            ax.set_xlabel("Latitude")
-            if j == 0:
-                ax.set_ylabel("Temp. anomaly [K]")
-                ax.text(-0.25, 0.5, scen, transform=ax.transAxes,
-                        rotation=90, va='center', ha='right', fontsize=14, fontweight='bold')
-
-            # --- Secondary Axis: NRMSE ---
-            #ax2 = ax.twinx()
-            #ax2.plot(lat_coords, zonal_nrmse, 'g:', label='Zonal NRMSE', lw=1.5, alpha=0.6)
-            #ax2.set_ylim(n_min, n_max)
-            #ax2.tick_params(axis='y', labelcolor='tab:green')
-
-            #if j == 2:
-            #    ax2.set_ylabel("Zonal NRMSE", color='tab:green')
-            #else:
-            #    ax2.set_yticklabels([]) # Hide ticks on inner plots
-
-            # Titles and Legends
-            current_glob_nrmse = glob_nrmse_t_series[t]
-            if j == 0:
-                ax.set_title('Scenario start', fontsize=16)
-            elif j == 1:
-                ax.set_title('Scenario middle', fontsize=16)
-            elif j == 2:
-                ax.set_title('Scenario end', fontsize=16)
-            #ax.set_title(f"Year {t} | Global NRMSE: {current_glob_nrmse:.4f}")
-
-            if j == 0:
-                # Combined legend
-                lines, labels = ax.get_legend_handles_labels()
-                #lines2, labels2 = ax2.get_legend_handles_labels()
-                #ax.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
-                ax.legend(lines, labels, loc='upper left', fontsize=14)
-
-            ax.set_xlim([-89, 89])
-            ax.grid(True, alpha=0.3)
-
-    return fig
-
-def generate_target_data(scenarios_dict, data_dir="./", opt=False):
+def generate_target_data(scenarios_dict: dict, data_dir: str = "./", opt: bool = False) -> tuple:
     """
     Loads pickled zonal temperature data for scenarios defined in scenarios_dict.
 

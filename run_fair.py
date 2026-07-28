@@ -3,7 +3,6 @@
 ## Standard
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import xarray as xr
 import os
 import pickle
@@ -19,6 +18,10 @@ from typing import Dict, Iterable, Tuple, Optional
 
 ## Local
 from paths import DATA_DIR
+
+# ==================================================================
+# Part 1: FaIR-driven scenario data generation
+# ==================================================================
 
 # ----------------------------
 # Constants and Configurations
@@ -167,15 +170,18 @@ def run_fair(f: FAIR, years: Iterable[int], layer: int = 0) -> Tuple[list, np.nd
 # ----------------------
 
 def impulse_profile(n_steps: int, dt: float, magnitude: float = 1.0) -> np.ndarray:
+    """Single-timestep impulse of area `magnitude`. Unused elsewhere - candidate for Phase 5 removal."""
     v = np.zeros(n_steps)
     v[0] = magnitude / dt   # integrates to 'magnitude'
     return v
 
 def white_noise_profile(n_steps: int, sigma: float = 1.0, seed: Optional[int] = None) -> np.ndarray:
+    """Gaussian white noise of length n_steps. Unused elsewhere - candidate for Phase 5 removal."""
     rng = np.random.default_rng(seed)
     return rng.normal(0.0, sigma, size=n_steps)
 
-def ensure_all_agents(d, n_steps):
+def ensure_all_agents(d: dict, n_steps: int) -> dict:
+    """Zero-fill any SPECIES missing from d. Unused elsewhere - candidate for Phase 5 removal."""
     for a in SPECIES:
         d.setdefault(a, np.zeros(n_steps))
     return d
@@ -266,8 +272,12 @@ def load_scenarioMIP_CMIP7(agents: list) -> Dict[str, Dict[str, np.ndarray]]:
 
     return emis_dict_tier1, emis_dict_tier2
 
-def get_delT(emis_dict, scenarios, agents, MIP='ScenarioMIP_tier1'):
-
+def get_delT(emis_dict: dict, scenarios: Iterable[str], agents: Iterable[str], MIP: str = 'ScenarioMIP_tier1') -> Dict[str, np.ndarray]:
+    """
+    Run FaIR on each scenario in `emis_dict` (prepending the historical period where
+    required) and return {scenario: T_mean} GMST anomaly time series. Caches to
+    data/FaIR_IO/delT/{MIP}_{agents}.pkl and reuses the cache on subsequent calls.
+    """
     # Check if this scenario is already cached
     tag_post = ''
     for a in agents:
@@ -334,100 +344,7 @@ def get_delT(emis_dict, scenarios, agents, MIP='ScenarioMIP_tier1'):
 
     return delT_dict
 
-def plot_emissions(emis_dict, agent, experiment_id, MIP='ScenarioMIP_tier1'):
-    fig, ax = plt.subplots(figsize=(14,4), constrained_layout=True)
-    for tag in emis_dict.keys():
-        if MIP in ['ScenarioMIP_tier1','ScenarioMIP_tier2','GeoMIP']:
-            if tag == 'historical':
-                years = np.arange(1750, 2024)
-                ls = '-'
-            elif 'ext' not in tag:
-                years = np.arange(2024, 2151)
-                ls = '-'
-            else:
-                years = np.arange(2024, 2501)
-                ls = '--'
-        elif MIP == 'DECK':
-            if 'abrupt' in tag:
-                years = np.arange(1750, 2051)
-                ls = '--'
-            elif '1pct' in tag:
-                years = np.arange(1750, 1901)
-                ls = '-'
-        elif MIP == 'CS3':
-            if tag == 'historical':
-                years = np.arange(1750, 2006)
-                ls = '-'
-            else:
-                years = np.arange(2006, 2151)
-                ls = '-'
-        elif MIP == 'Optimal':
-            years = np.arange(1750, 2501)
-            ls = '-'
-        else:
-            raise ValueError(f'Error: type {MIP} not recognized.')
-
-        if MIP == 'DECK':
-            ax.semilogy(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
-        else:
-            ax.plot(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=colors[tag])
-
-    units = {'CO2':'Gt',
-             'CH4':'Mt',
-             'N2O':'Mt',
-             'Sulfur':'Mt',
-             'BC':'Mt'}
-
-    ax.legend()
-    ax.set_xlabel('Year')
-    ax.set_ylabel(f'{agent} emissions ({units[agent]})')
-    ax.set_title(f'{experiment_id} scenarios')
-    #ax.set_xlim([1750,2500])
-    plt.grid(True, alpha=0.3)
-
-    return
-
-def plot_delT(delT_dict, scen_to_plot, experiment_id, MIP='ScenarioMIP'):
-    fig, ax = plt.subplots(figsize=(10,5), constrained_layout=True)
-    for tag in scen_to_plot:
-        if MIP in ['ScenarioMIP','GeoMIP']:
-            if tag == 'historical':
-                years = np.arange(1750, 2024)
-                ls = '-'
-            elif 'ext' not in tag:
-                years = np.arange(2024, 2151)
-                ls = '-'
-            else:
-                years = np.arange(2024, 2501)
-                ls = '--'
-        elif MIP == 'DECK':
-            if 'abrupt' in tag:
-                years = np.arange(1750, 2051)
-                ls = '--'
-            elif '1pct' in tag:
-                years = np.arange(1750, 1901)
-                ls = '-'
-        elif MIP == 'CS3':
-            if tag == 'historical':
-                years = np.arange(1750, 2006)
-                ls = '-'
-            else:
-                years = np.arange(2006, 2151)
-                ls = '-'
-        elif MIP == 'Optimal':
-            years = np.arange(1750, 2501)
-            ls = '-'
-        else:
-            raise ValueError(f'Error: type {MIP} not recognized.')
-
-        ax.plot(years, delT_dict[tag], label=tag, ls=ls, lw=2, c=colors[tag])
-
-    ax.legend()
-    ax.set_xlabel('Year')
-    ax.set_ylabel(r'$\overline{\Delta T}(t)$')
-    ax.set_title(f'{experiment_id} scenarios')
-
-    return
+# (plot_emissions, plot_delT moved to utils_plotting.py)
 
 # ----------------------
 # DECK for CMIP7 Helpers
@@ -437,10 +354,16 @@ def plot_delT(delT_dict, scen_to_plot, experiment_id, MIP='ScenarioMIP'):
 # Includes abrupt-4xGHG and 1pctGHG;
 # historical is loaded with ScenarioMIP
 
-def generate_DECK_profile(agent, type):
-    # If we select Sulfur or BC, calculate the CO2 profile
-    # and scale bby the estimated historical ratio of CO2
-    # emissions to the emissions of that agent
+def generate_DECK_profile(agent: str, type: str) -> np.ndarray:
+    """
+    Back out the emissions that produce a DECK concentration-driven target profile
+    (1pctCO2-style 1%/yr compounding growth or abrupt-4x step) for `agent` via FaIR
+    run in concentration-driven mode. `type` is '1pct' or 'abrupt'.
+
+    If we select Sulfur or BC, calculate the CO2 profile
+    and scale by the estimated historical ratio of CO2
+    emissions to the emissions of that agent.
+    """
 
     c0 = {'CO2': 278.0, # ppm
           'CH4': 722.0, # ppb
@@ -481,7 +404,12 @@ def generate_DECK_profile(agent, type):
         return emis[:-1] * convt[agent]
     return emis[:-1]
 
-def load_DECK_CMIP7(agents):
+def load_DECK_CMIP7(agents: Iterable[str]) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Build the DECK abrupt-4x / 1pct single-agent emissions scenarios (via
+    generate_DECK_profile) for each agent in `agents`. Non-target agents in each
+    scenario are zeroed. Returns dict[scenario][agent] -> emissions array.
+    """
 
     # Define DECK scenarios
     scenarios_DECK  = ['abrupt-4xCO2','abrupt-4xCH4',
@@ -519,14 +447,14 @@ def load_DECK_CMIP7(agents):
 # - Visioni et al. (2023)
 
 def find_sulfur_for_target_temp(
-    modify_year,
-    target_year,
-    hist_emissions,
-    future_baseline_emissions,
-    solved_sulfur_so_far,
-    target_temp,
-    initial_guess=50.0
-):
+    modify_year: int,
+    target_year: int,
+    hist_emissions: Dict[str, np.ndarray],
+    future_baseline_emissions: Dict[str, np.ndarray],
+    solved_sulfur_so_far: np.ndarray,
+    target_temp: float,
+    initial_guess: float = 50.0
+) -> float:
     """
     Solves for the sulfur emission in `modify_year` to hit a target temperature in `target_year`.
     Uses an intelligent first guess and a temperature-based tolerance for faster convergence.
@@ -581,7 +509,12 @@ def find_sulfur_for_target_temp(
 
     return current_S_guess
 
-def solve_G3(emis_dict_tier1, verbose=False):
+def solve_G3(emis_dict_tier1: Dict[str, Dict[str, np.ndarray]], verbose: bool = False) -> np.ndarray:
+    """
+    Solve for the yearly sulfur injection (2024-2149) that holds GMST at its 2024
+    (end-of-historical) level under the 'ML' baseline scenario, year by year via
+    find_sulfur_for_target_temp. Returns the resulting Sulfur emissions array.
+    """
 
     print("--- Establishing Target Temperature ---")
     hist_start, hist_stop = 1750, 2024
@@ -644,7 +577,16 @@ def solve_G3(emis_dict_tier1, verbose=False):
 
     return calculated_S_emissions
 
-def load_geoMIP_CMIP6(agents=None, emis_dict_tier1=None, verbose=False):
+def load_geoMIP_CMIP6(
+    agents: Iterable[str] | None = None,
+    emis_dict_tier1: Dict[str, Dict[str, np.ndarray]] | None = None,
+    verbose: bool = False,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Build the GeoMIP G3 (temperature-stabilization, via solve_G3) and G4 (+5 Tg/yr
+    SO2 on top of ML) sulfur-injection scenarios. Cached to
+    data/saved_emissions/emis_dict_geoMIP.pkl; recomputed (and re-cached) if missing.
+    """
 
     geoMIP_filepath = str(DATA_DIR / 'saved_emissions' / 'emis_dict_geoMIP.pkl')
 
@@ -673,7 +615,16 @@ def load_geoMIP_CMIP6(agents=None, emis_dict_tier1=None, verbose=False):
 # CS3 Outlook Scenario Helpers
 # ----------------------------
 
-def load_CS3(agents=None, emis_dict_tier1=None):
+def load_CS3(
+    agents: Iterable[str] | None = None,
+    emis_dict_tier1: Dict[str, Dict[str, np.ndarray]] | None = None,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Load the CS3 "Global Change Outlook 2025" AA/CT scenarios from their raw
+    .fordata files (converting units to FaIR's expected Gt/Mt/Tg), prepending the
+    2024-and-earlier historical emissions. Cached to
+    data/saved_emissions/emis_dict_CS3.pkl.
+    """
 
     CS3_filepath = str(DATA_DIR / 'saved_emissions' / 'emis_dict_CS3.pkl')
 

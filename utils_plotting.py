@@ -15,6 +15,9 @@ import matplotlib.colors as mcolors
 
 ## Local
 from paths import FIGURES_DIR
+import run_fair
+import utils_FaIR_JAX
+import utils_inverse
 
 ## Setup plots
 plt.rcParams['figure.figsize'] = [12, 4]
@@ -25,7 +28,12 @@ plt.rcParams.update({
   "font.sans-serif": ["Helvetica Light"],
 })
 
-def plot_init(res, save=False):
+# ==================================================================
+# Part 5: paper & SI figures
+# ==================================================================
+
+def plot_init(res: dict, save: bool = False) -> None:
+  """Plot the initial (step-0) CO2 trajectory from an optimize_emissions_inverse result."""
   fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
   ax.plot(res['U_traj'][0]['CO2'], c=cm.batlowWS(1), lw=2)
   ax.set_ylabel(r'Emissions [GtCO$_2$/yr]')
@@ -34,7 +42,8 @@ def plot_init(res, save=False):
   if save:
     plt.savefig(FIGURES_DIR / "init_emis.pdf", transparent=True)
 
-def plot_tier1(years, tier1, group, save=False):
+def plot_tier1(years: list, tier1: list, group: list[str], save: bool = False) -> None:
+  """Plot one CO2 emissions line per tier-1 scenario in `tier1` (labeled by `group`)."""
   fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
   for i, scen in enumerate(tier1):
     ax.plot(years[i], tier1[i], c=cm.batlowWS(i + 1), lw=2, label=group[i])
@@ -47,7 +56,8 @@ def plot_tier1(years, tier1, group, save=False):
   if save:
     plt.savefig(FIGURES_DIR / "tier1.pdf", transparent=True)
 
-def plot_updates(res, save=False):
+def plot_updates(res: dict, save: bool = False) -> None:
+  """Plot the CO2 trajectory every 50 outer-loop steps of an optimize_emissions_inverse result, fading with step."""
   fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
   for i, traj in enumerate(res['U_traj']):
     if i % 50 == 0:
@@ -65,11 +75,12 @@ def plot_updates(res, save=False):
     plt.savefig(FIGURES_DIR / "emis_updates.pdf", transparent=True)
 
 def plot_rmse_comparison_single(
-    results_list,       # List of dictionaries
-    baseline_error_list,     # Single float value
-    agents,
-    save=False
-):
+    results_list: list[dict],       # List of dictionaries
+    baseline_error_list: list[float],     # Single float value
+    agents: list[str],
+    save: bool = False
+) -> None:
+    """5-panel NRMSE-vs-update-step comparison, one panel per single-forcing agent experiment."""
     layout = [
         ["Left", "Left", "Right1", "Right2"],
         ["Left", "Left", "Right3", "Right4"]
@@ -134,7 +145,8 @@ def plot_rmse_comparison_single(
 
     return
 
-def plot_rmse_comparison_multi(results, baseline_error, save=False):
+def plot_rmse_comparison_multi(results: dict, baseline_error: float, save: bool = False) -> None:
+    """3-panel figure: NRMSE-vs-step (left) plus optimal WMGHG and aerosol emissions trajectories (right, via _plot_agents)."""
     layout = [
         ["Left", "Left", "Right1", "Right1", "Right1"],
         ["Left", "Left", "Right2", "Right2", "Right2"]
@@ -207,7 +219,7 @@ def plot_rmse_comparison_multi(results, baseline_error, save=False):
 
 # --- Helper Functions ---
 
-def _plot_agents(x_data, config, cmap):
+def _plot_agents(x_data: np.ndarray, config: dict, cmap) -> None:
     """Handles multi-axis plotting, coloring, and unified legends."""
     base_ax = config['ax']
     lines = []
@@ -265,7 +277,8 @@ def _plot_agents(x_data, config, cmap):
     _add_textbox(last_ax, config['title'], 0.02, 0.93)
     base_ax.margins(x=0, y=0.1)
 
-def _add_textbox(ax, text, x, y):
+def _add_textbox(ax, text: str, x: float, y: float) -> None:
+    """Bold boxed annotation at axes-fraction coords (x, y)."""
     ax.text(
         x, y, text, transform=ax.transAxes,
         ha="left", va="top", fontsize=16, fontweight="bold",
@@ -273,7 +286,9 @@ def _add_textbox(ax, text, x, y):
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
     )
 
-def plot_emissions_grid(opt_emissions, target_emissions, years, targets, groups, save=False):
+def plot_emissions_grid(
+    opt_emissions: list, target_emissions: list, years: list, targets: list[str], groups: list, save: bool = False
+) -> None:
     """
     Plots a 2x4 grid.
     Top Row: Optimal Emissions (nested list structure)
@@ -379,7 +394,8 @@ def plot_emissions_grid(opt_emissions, target_emissions, years, targets, groups,
 
     return
 
-def plot_co2_sulfur(co2, sulfur, save=False):
+def plot_co2_sulfur(co2: list, sulfur: list, save: bool = False) -> None:
+    """4-row CO2 (left axis) vs. Sulfur (right axis) time series, one row per experiment (Tier 1/DAMIP/GeoMIP/All)."""
     fig, axes = plt.subplots(4, 1, figsize=(10, 5/3*4), sharex=True, sharey=True, constrained_layout=True)
 
     cmap = cm.batlowWS
@@ -450,7 +466,7 @@ def plot_co2_sulfur(co2, sulfur, save=False):
     return
 
 from scipy.ndimage import gaussian_filter1d
-def highlight_opposite_slopes(ax, x, y1, y2, min_length=10, sigma=1):
+def highlight_opposite_slopes(ax, x: np.ndarray, y1: np.ndarray, y2: np.ndarray, min_length: int = 10, sigma: float = 1) -> None:
     """
     Highlights regions with opposite slopes, using smoothing to handle noise.
     """
@@ -483,21 +499,21 @@ def highlight_opposite_slopes(ax, x, y1, y2, min_length=10, sigma=1):
 
 def plot_stacked_results_ppt(
     # --- Inputs for Top Row (Ground Truth) ---
-    target_years,            # List of arrays or single array corresponding to target_emissions
+    target_years: list,            # List of arrays or single array corresponding to target_emissions
 
     # --- Inputs for Middle Row (Optimized) ---
-    opt_emissions_history,   # List of arrays: history of optimized emission curves
+    opt_emissions_history: list,   # List of arrays: history of optimized emission curves
 
     # --- Inputs for Bottom Row (Preds vs Truth) ---
-    results,                 # Dictionary containing 'preds_traj'
-    pred_scenario=None,      # Specific scenario name to plot (optional)
+    results: dict,                 # Dictionary containing 'preds_traj'
+    pred_scenario: str | None = None,      # Specific scenario name to plot (optional)
 
     # --- Styling Options ---
-    opt_start_year=2024,     # Start year for optimized emissions x-axis
-    max_lines=11,            # Max lines to plot for fading history
-    save=False,
-    save_path=None
-):
+    opt_start_year: int = 2024,     # Start year for optimized emissions x-axis
+    max_lines: int = 11,            # Max lines to plot for fading history
+    save: bool = False,
+    save_path: str | None = None
+) -> None:
     """
     Vertical Stack Plot (3 Rows):
     1. Ground Truth Emissions (Top)
@@ -645,23 +661,23 @@ def plot_stacked_results_ppt(
 
 def plot_stacked_results(
     # --- Inputs for Top Row (Ground Truth) ---
-    target_emissions,        # List of arrays (or nested list)
-    target_years,            # List of arrays or single array corresponding to target_emissions
+    target_emissions: list,        # List of arrays (or nested list)
+    target_years: list,            # List of arrays or single array corresponding to target_emissions
 
     # --- Inputs for Middle Row (Optimized) ---
-    opt_emissions_history,   # List of arrays: history of optimized emission curves
-    opt_temp_history,
+    opt_emissions_history: list,   # List of arrays: history of optimized emission curves
+    opt_temp_history: list,
 
     # --- Inputs for Bottom Row (Preds vs Truth) ---
-    results,                 # Dictionary containing 'preds_traj'
-    pred_scenario=None,      # Specific scenario name to plot (optional)
+    results: dict,                 # Dictionary containing 'preds_traj'
+    pred_scenario: str | None = None,      # Specific scenario name to plot (optional)
 
     # --- Styling Options ---
-    opt_start_year=2024,     # Start year for optimized emissions x-axis
-    max_lines=11,            # Max lines to plot for fading history
-    save=False,
-    save_path=None
-):
+    opt_start_year: int = 2024,     # Start year for optimized emissions x-axis
+    max_lines: int = 11,            # Max lines to plot for fading history
+    save: bool = False,
+    save_path: str | None = None
+) -> None:
     """
     Vertical Stack Plot (3 Rows):
     1. Ground Truth Emissions (Top)
@@ -1026,6 +1042,7 @@ def plot_grouped_improvement_bars(baseline_results: dict,
                                   save: bool = False,
                                   figname: str = '',
                                   n_plots: int=1) -> None:
+    """Grouped horizontal bar chart of % NRMSE improvement (optimized vs. baseline), grouped by test scenario."""
 
     # 0. Handle Axis Creation (Backward Compatibility)
     # ----------------------------------------------
@@ -1316,7 +1333,7 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
     plt.show()
 
 
-def get_global_value(data_dict, scenario_name):
+def get_global_value(data_dict: dict, scenario_name: str) -> float:
     """
     Helper to search for a scenario name within the nested dictionary structure
     {'scenario_set': {'scenario': {'global': value}}} and return the global value.
@@ -1338,6 +1355,11 @@ def plot_scenario_difference_bars(baseline_results: dict,
                                   x_labels: list[str] = None,
                                   save: bool = False,
                                   figname: str = 'scenario_differences') -> None:
+    """
+    Per-scenario bar chart of global NRMSE across baseline + multiple optimized
+    variants (18-scenario layout, 9 per row). Superseded by plot_scenario_difference_bars2
+    (the only one actually called from 5a_paper_plots.ipynb) - candidate for Phase 5 removal.
+    """
 
     # 1. Setup Data & Layout
     # ----------------------
@@ -1570,6 +1592,10 @@ def plot_scenario_difference_bars2(baseline_results: dict,
                                   group_labels: list[str] = None,
                                   save: bool = False,
                                   figname: str = 'scenario_differences') -> None:
+    """
+    Per-scenario bar chart of global NRMSE across baseline + multiple optimized
+    variants, with optional group separators/labels. Used by 5a_paper_plots.ipynb.
+    """
 
     # 1. Setup Data & Layout
     # ----------------------
@@ -1749,3 +1775,678 @@ def plot_scenario_difference_bars2(baseline_results: dict,
 
     if save:
         plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
+
+# ==================================================================
+# Part 1: FaIR scenario plots (moved from run_fair.py)
+# ==================================================================
+
+def plot_emissions(emis_dict: dict, agent: str, experiment_id: str, MIP: str = 'ScenarioMIP_tier1') -> None:
+    """Plot per-scenario emissions time series for one agent (colors/line styles from run_fair.colors)."""
+    fig, ax = plt.subplots(figsize=(14,4), constrained_layout=True)
+    for tag in emis_dict.keys():
+        if MIP in ['ScenarioMIP_tier1','ScenarioMIP_tier2','GeoMIP']:
+            if tag == 'historical':
+                years = np.arange(1750, 2024)
+                ls = '-'
+            elif 'ext' not in tag:
+                years = np.arange(2024, 2151)
+                ls = '-'
+            else:
+                years = np.arange(2024, 2501)
+                ls = '--'
+        elif MIP == 'DECK':
+            if 'abrupt' in tag:
+                years = np.arange(1750, 2051)
+                ls = '--'
+            elif '1pct' in tag:
+                years = np.arange(1750, 1901)
+                ls = '-'
+        elif MIP == 'CS3':
+            if tag == 'historical':
+                years = np.arange(1750, 2006)
+                ls = '-'
+            else:
+                years = np.arange(2006, 2151)
+                ls = '-'
+        elif MIP == 'Optimal':
+            years = np.arange(1750, 2501)
+            ls = '-'
+        else:
+            raise ValueError(f'Error: type {MIP} not recognized.')
+
+        if MIP == 'DECK':
+            ax.semilogy(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=run_fair.colors[tag])
+        else:
+            ax.plot(years, emis_dict[tag][agent], label=tag, ls=ls, lw=2, c=run_fair.colors[tag])
+
+    units = {'CO2':'Gt',
+             'CH4':'Mt',
+             'N2O':'Mt',
+             'Sulfur':'Mt',
+             'BC':'Mt'}
+
+    ax.legend()
+    ax.set_xlabel('Year')
+    ax.set_ylabel(f'{agent} emissions ({units[agent]})')
+    ax.set_title(f'{experiment_id} scenarios')
+    #ax.set_xlim([1750,2500])
+    plt.grid(True, alpha=0.3)
+
+    return
+
+def plot_delT(delT_dict: dict, scen_to_plot: list, experiment_id: str, MIP: str = 'ScenarioMIP') -> None:
+    """Plot per-scenario GMST anomaly time series (colors/line styles from run_fair.colors)."""
+    fig, ax = plt.subplots(figsize=(10,5), constrained_layout=True)
+    for tag in scen_to_plot:
+        if MIP in ['ScenarioMIP','GeoMIP']:
+            if tag == 'historical':
+                years = np.arange(1750, 2024)
+                ls = '-'
+            elif 'ext' not in tag:
+                years = np.arange(2024, 2151)
+                ls = '-'
+            else:
+                years = np.arange(2024, 2501)
+                ls = '--'
+        elif MIP == 'DECK':
+            if 'abrupt' in tag:
+                years = np.arange(1750, 2051)
+                ls = '--'
+            elif '1pct' in tag:
+                years = np.arange(1750, 1901)
+                ls = '-'
+        elif MIP == 'CS3':
+            if tag == 'historical':
+                years = np.arange(1750, 2006)
+                ls = '-'
+            else:
+                years = np.arange(2006, 2151)
+                ls = '-'
+        elif MIP == 'Optimal':
+            years = np.arange(1750, 2501)
+            ls = '-'
+        else:
+            raise ValueError(f'Error: type {MIP} not recognized.')
+
+        ax.plot(years, delT_dict[tag], label=tag, ls=ls, lw=2, c=run_fair.colors[tag])
+
+    ax.legend()
+    ax.set_xlabel('Year')
+    ax.set_ylabel(r'$\overline{\Delta T}(t)$')
+    ax.set_title(f'{experiment_id} scenarios')
+
+    return
+
+# ==================================================================
+# Part 2a: JAX SCM calibration plots (moved from utils_FaIR_JAX.py)
+# ==================================================================
+
+def plot_FaIR_v_JAX(delT_dict_FaIR: dict, delT_dict_JAX: dict) -> None:
+    """Overlay FaIR (dashed) vs. JAX SCM (solid) GMST per scenario, for calibration sanity checks."""
+    fig, ax = plt.subplots(constrained_layout=True)
+    for i, scen in enumerate(delT_dict_JAX):
+        if scen in utils_FaIR_JAX.needs_historical:
+            ax.plot(delT_dict_JAX[scen][274:], c=f"C{i}", label=scen)
+            ax.plot(delT_dict_FaIR[scen], ls='--', c=f"C{i}", label=scen)
+        else:
+            ax.plot(delT_dict_JAX[scen], c=f"C{i}", label=scen)
+            ax.plot(delT_dict_FaIR[scen], ls='--', c=f"C{i}", label=scen)
+
+    ax.set_xlabel('Year')
+    ax.set_ylabel(r'$\overline{\Delta T}(t)$ [$^\circ$ C]')
+    #fig.legend()
+
+def plot_calibration_results(
+    conc_dict: dict | None,
+    emis_dict: dict | None,
+    target_dict: dict,
+    theta0: jnp.ndarray,
+    theta_opt: jnp.ndarray,
+    dt: float = 0.1,
+    calib: str = "Climate",
+    mode: str = 'FaIR',
+) -> None:
+    """
+    Plots the model performance before and after optimization.
+
+    Args:
+        conc_dict: {scenario: (3, T)} Input concentrations (Used in 'Climate' mode).
+        emis_dict: {scenario: (5, T)} Input emissions (Used in both modes).
+        target_dict: {scenario: (T,)} Target data.
+                     If mode='Climate', this is Temperature (K).
+                     If mode='Carbon', this is CO2 Concentration (ppm).
+        mode: "Climate" (Conc -> Temp) or "Carbon" (Emis -> Conc).
+    """
+    # 1. Prepare Data
+    # Use target_dict for keys/lengths as it is required in both modes
+    scenario_names = list(target_dict.keys())
+    n_scens = len(scenario_names)
+
+    # Determine maximum time length
+    if calib == 'Climate':
+      max_len = max([target_dict[s].shape[0] for s in scenario_names])
+    else:
+      max_len = max([target_dict[s].shape[1] for s in scenario_names])
+
+    # Initialize padded arrays
+    # Conc: (N_scen, 3, Max_T), Emis: (N_scen, 5, Max_T), Target: (N_scen, Max_T)
+    conc_matrix = jnp.zeros((n_scens, 3, max_len))
+    emis_matrix = jnp.zeros((n_scens, 5, max_len))
+    target_matrix = jnp.zeros((n_scens, max_len))
+    loss_mask = jnp.zeros((n_scens, max_len))
+
+    # Fill arrays
+    for i, name in enumerate(scenario_names):
+        # Handle inputs based on availability
+        if conc_dict is not None and name in conc_dict:
+            c_data = conc_dict[name]
+            conc_matrix = conc_matrix.at[i, :, :c_data.shape[1]].set(c_data)
+
+        if emis_dict is not None and name in emis_dict:
+            e_data = emis_dict[name]
+            emis_matrix = emis_matrix.at[i, :, :e_data.shape[1]].set(e_data)
+
+        t_data = target_dict[name]
+        if calib == 'Climate':
+          curr_len = t_data.shape[0]
+          target_matrix = target_matrix.at[i, :curr_len].set(t_data)
+        else:
+          curr_len = t_data.shape[1]
+          target_matrix = target_matrix.at[i, :curr_len].set(t_data[0,:])
+        loss_mask = loss_mask.at[i, :curr_len].set(1.0)
+
+    # 2. Setup Vmap Inputs
+    T_steps = max_len
+    years_template = jnp.arange(T_steps, dtype=jnp.float32)
+    years_batch = jnp.tile(years_template, (n_scens, 1))
+
+    params_initial = utils_FaIR_JAX.params_from_theta(theta0, utils_FaIR_JAX.FAIR_PARAMS)
+    params_optimized = utils_FaIR_JAX.params_from_theta(theta_opt, utils_FaIR_JAX.FAIR_PARAMS)
+
+    # 3. Generate Predictions based on Mode
+    if calib == "Carbon":
+        # Emissions -> Concentrations (CO2)
+        # vmap over simulate_temp(years, emissions, params, dt)
+        vmap_model = jax.vmap(utils_FaIR_JAX.simulate_temp, in_axes=(0, 0, None, None, None))
+
+        # Helper to extract just the CO2 ppm from the full output dict
+        def get_preds(params):
+            res_dict = vmap_model(years_batch, emis_matrix, mode, params, dt)
+            return res_dict["Catm_ppm"]
+
+        preds_init = get_preds(params_initial)
+        preds_opt = get_preds(params_optimized)
+        ylabel = r'$CO_2$ Concentration (ppm)'
+
+    elif calib == "Climate":
+        # Concentrations -> Temperature
+        # vmap over simulate_temp_prescribed_conc(years, conc, emis, params, dt)
+        vmap_model = jax.vmap(utils_FaIR_JAX.simulate_temp_prescribed_conc, in_axes=(0, 0, 0, None, None))
+
+        preds_init = vmap_model(years_batch, conc_matrix, emis_matrix, params_initial, dt)
+        preds_opt = vmap_model(years_batch, conc_matrix, emis_matrix, params_optimized, dt)
+        ylabel = r'$\Delta T$ (K)'
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # 4. Plotting
+    fig, axes = plt.subplots(1, n_scens, figsize=(6 * n_scens, 5), sharey=True)
+    if n_scens == 1: axes = [axes]
+
+    for i, name in enumerate(scenario_names):
+        ax = axes[i]
+        actual_len = int(jnp.sum(loss_mask[i]))
+        years = jnp.arange(actual_len)
+
+        # Plot Data
+        ax.plot(years, target_matrix[i, :actual_len], color='black', label='Target (Data)', lw=2)
+        ax.plot(years, preds_init[i, :actual_len], color='tab:blue', linestyle=':', label='SCM (Pre-Opt)', lw=2)
+        ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--', label='SCM (Post-Opt)', lw=2)
+
+        ax.set_title(f'Scenario: {name}')
+        ax.set_xlabel('Years')
+        ax.grid(alpha=0.3)
+
+    axes[0].set_ylabel(ylabel)
+    axes[0].legend()
+    plt.tight_layout()
+    plt.show()
+
+def plot_model_comparison(emis_dict: dict, target_dict: dict, theta0: jnp.ndarray, mode: str = 'FaIR', dt: float = 0.1) -> None:
+    """
+    Plots a comparison between:
+    1. The 'True' target temperature data.
+    2. The simulation using optimized parameters (theta0).
+    3. The simulation using default parameters for the specified mode (e.g., MESM defaults).
+
+    Args:
+        emis_dict: {scenario: (5, T)} Input emissions.
+        target_dict: {scenario: (T,)} Target Temperature data.
+        theta0: Optimized parameter vector.
+        mode: 'FaIR' or 'MESM'. Determines the default parameters compared against.
+    """
+    # 1. Parameter Setup
+    # Select the correct base parameters for the mode to reconstruct theta0
+    if mode == 'FaIR':
+        base_params = utils_FaIR_JAX.FAIR_PARAMS
+    elif mode == 'MESM':
+        base_params = utils_FaIR_JAX.MESM_PARAMS
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    params_opt = utils_FaIR_JAX.params_from_theta(theta0, base_params=base_params)
+
+    # 2. Prepare Data (Padding and Batching)
+    scenario_names = list(target_dict.keys())
+    n_scens = len(scenario_names)
+
+    # Determine maximum time length (looking at target data)
+    lengths = [target_dict[s].shape[0] for s in scenario_names]
+    max_len = max(lengths)
+
+    # Initialize padded arrays
+    emis_matrix = jnp.zeros((n_scens, 5, max_len))
+    target_matrix = jnp.zeros((n_scens, max_len))
+    loss_mask = jnp.zeros((n_scens, max_len))
+
+    for i, name in enumerate(scenario_names):
+        # Emissions
+        if name in emis_dict:
+            e_data = emis_dict[name]
+            # Clamp to max_len if necessary
+            curr_len_e = min(e_data.shape[1], max_len)
+            emis_matrix = emis_matrix.at[i, :, :curr_len_e].set(e_data[:, :curr_len_e])
+
+        # Targets
+        t_data = target_dict[name]
+        curr_len_t = min(t_data.shape[0], max_len)
+        target_matrix = target_matrix.at[i, :curr_len_t].set(t_data[:curr_len_t])
+
+        # Store valid length for plotting
+        loss_mask = loss_mask.at[i, :curr_len_t].set(1.0)
+
+    # 3. Setup Vmap Inputs
+    years_template = jnp.arange(max_len, dtype=jnp.float32)
+    years_batch = jnp.tile(years_template, (n_scens, 1))
+
+    # 4. Run Simulations
+    # Vmap signature: (years, emis, mode, params, dt)
+    vmap_model = jax.vmap(utils_FaIR_JAX.simulate_temp, in_axes=(0, 0, None, None, None))
+
+    # Run A: Optimized Parameters
+    res_opt = vmap_model(years_batch, emis_matrix, mode, params_opt, dt)
+    preds_opt = res_opt["GMST"]
+
+    # Run B: Default Mode Parameters
+    # We pass params=None so simulate_temp uses the defaults for 'mode'
+    res_default = vmap_model(years_batch, emis_matrix, mode, None, dt)
+    preds_default = res_default["GMST"]
+
+    # 5. Plotting
+    fig, axes = plt.subplots(1, n_scens, figsize=(6 * n_scens, 5), sharey=True)
+    if n_scens == 1: axes = [axes]
+
+    for i, name in enumerate(scenario_names):
+        ax = axes[i]
+        actual_len = int(jnp.sum(loss_mask[i]))
+        years = jnp.arange(actual_len)
+
+        # Plot Truth
+        ax.plot(years, target_matrix[i, :actual_len], color='black', label='Target (Data)', lw=2)
+
+        # Plot Default
+        ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--',
+                label='Default (FaIR)', lw=2)
+
+        # Plot MESM calibration
+        ax.plot(years, preds_default[i, :actual_len], color='tab:blue', linestyle=':',
+                label=f'Calibrated ({mode})', lw=2)
+
+        ax.set_title(f'Scenario: {name}')
+        ax.set_xlabel('Years')
+        ax.grid(alpha=0.3)
+
+    axes[0].set_ylabel(r'$\Delta T$ (K)')
+    axes[0].legend()
+    plt.tight_layout()
+    plt.show()
+
+# ==================================================================
+# Part 3/4: inverse-optimization & emulator evaluation plots (moved from utils_inverse.py)
+# ==================================================================
+
+def plot_mlp_predictions(params: list[dict], Xs: jnp.ndarray, y: jnp.ndarray, metric: str = "NRMSE", title_prefix: str = "MLP fit") -> None:
+    """Plot an MLP's prediction vs. truth for one scenario, titled with its NRMSE."""
+    yhat = utils_inverse.mlp_forward(params, Xs)
+    loss_val = utils_inverse._nrmse(yhat, y)
+
+    plt.figure(figsize=(8,3))
+    plt.plot(np.asarray(y),    label="truth", alpha=0.8)
+    plt.plot(np.asarray(yhat), label="pred",  alpha=0.8)
+    plt.legend(); plt.xlabel("time step"); plt.ylabel("target")
+    plt.title(f"{title_prefix} - {metric.upper()}: {loss_val:.4f}")
+    plt.tight_layout(); plt.show()
+
+def plot_inverse_results(
+    results: dict,
+    baseline_error: float,                  # 1) dashed reference line
+    active_agents: tuple | None = None,              # 4) only plot these agents’ emissions
+    agent_units: dict | None = None,                # optional: {'CO2':'GtCO₂/yr','CH4':'MtCH₄/yr'}
+    max_lines: int = 11,                    # 7) up to 12 emissions curves
+    pred_scenario: str | None = None,
+    baseline_preds: jnp.ndarray | None = None,
+) -> None:
+    """
+    Multipanel plot of an optimize_emissions_inverse `results` dict:
+      (a) NRMSE vs update step
+      (b) Optimal emissions profiles (one subplot per active agent)
+      (c) Training temperature trajectory
+      (d) Predictions vs Truth
+    """
+    errors = jnp.asarray(results["errors"])
+    U_traj = results["U_traj"]
+    preds_traj = results.get("preds_traj", [])
+
+    # --- helpers to read U_traj --------------------------------
+    def _agents_in_state(state):
+        if isinstance(state, (tuple, list)) and len(state) == 2:
+            return ("CO2", "CH4")
+        if isinstance(state, dict):
+            return tuple(state.keys())
+        raise ValueError("Unrecognized U_traj state format.")
+
+    def _get_series(state, agent):
+        if isinstance(state, (tuple, list)):
+            if agent == "CO2": return jnp.asarray(state[0]).reshape(-1)
+            if agent == "CH4": return jnp.asarray(state[1]).reshape(-1)
+            raise KeyError(f"Agent {agent} not found in tuple state.")
+        return jnp.asarray(state[agent]).reshape(-1)
+
+    # Figure out which agents exist in this run
+    present_agents = _agents_in_state(U_traj[0])
+    if active_agents is None:
+        active_agents = present_agents
+    else:
+        active_agents = tuple(a for a in active_agents if a in present_agents)
+
+    # Units
+    if agent_units is None:
+        agent_units = {"CO2": "Gt/yr", "CH4": "Mt/yr", "N2O": "Mt/yr", "Sulfur":"Mt/yr", "BC": "Mt/yr"}
+
+    n_update_steps = int(results.get("updates_done", max(0, errors.shape[0] - 1)))
+
+    # years length
+    if len(active_agents) == 0:
+        probe_agent = present_agents[0]
+    else:
+        probe_agent = active_agents[0]
+    T = int(_get_series(U_traj[-1], probe_agent).shape[0])
+
+    # --- DYNAMIC SUBPLOTS ---
+    # Rows: 1 (NRMSE) + N (Agents) + 1 (TrainTemp) + 1 (Preds)
+    n_agents = len(active_agents)
+    n_rows = 3 + n_agents
+
+    # Adjust figure height based on number of rows to maintain aspect ratio
+    fig_height = 2.5 * n_rows
+    fig, axes = plt.subplots(
+        nrows=n_rows, ncols=1,
+        figsize=(9, fig_height),
+        constrained_layout=True
+    )
+
+    # Handle single axis case (unlikely but safe)
+    if n_rows == 1: axes = [axes]
+
+    # Assign axes
+    ax_err = axes[0]
+    ax_emis_list = axes[1 : 1 + n_agents] # Slice for emissions
+    ax_train = axes[-2]
+    ax_pred = axes[-1]
+
+    # Share x-axis between all emissions plots and the training temperature
+    for ax in ax_emis_list:
+        ax.sharex(ax_train)
+
+    # ----- Panel (a): scaled RMSE vs update step --------------------------------
+    x_err = jnp.arange(errors.shape[0])
+    ax_err.semilogy(x_err, errors, label="NRMSE")
+    ax_err.axhline(float(baseline_error), ls="--", c='r', lw=1.5, label=f"Baseline emulator (avg.)")
+    ax_err.set_xlim(0, n_update_steps)
+    ax_err.set_xlabel("Update step")
+    ax_err.set_ylabel("NRMSE")
+    ax_err.text(
+        0.015, 0.93, "NRMSE vs. Update Step", transform=ax_err.transAxes,
+        ha="left", va="top", fontsize=16, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+    )
+    ax_err.grid(True, alpha=0.3)
+    ax_err.legend(loc="best")
+
+    # ----- Panel (b): Optimal emissions (One subplot per agent) -----------------
+    n_total = len(U_traj)
+    if n_total <= max_lines:
+        sel_steps = np.arange(n_total, dtype=int)
+    else:
+        sel_steps = np.unique(np.linspace(0, n_total - 1, num=max_lines, dtype=int))
+
+    # Iterate over agents and their corresponding axes
+    for idx, ag in enumerate(active_agents):
+        ax_curr = ax_emis_list[idx]
+        has_any = False
+
+        for i in sel_steps:
+            state = U_traj[i]
+            alpha = 0.3 + 0.7 * (i / max(1, len(U_traj) - 1))
+            series = _get_series(state, ag)
+            ax_curr.plot(series, alpha=alpha, label=f"Step {i}")
+            has_any = True
+
+        ax_curr.set_xlim(0, T)
+        unit = agent_units.get(ag, "units/yr")
+        ax_curr.set_ylabel(f"{ag} ({unit})")
+
+        ax_curr.text(
+            0.015, 0.93, f"Optimal {ag}", transform=ax_curr.transAxes,
+            ha="left", va="top", fontsize=16, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
+        )
+
+        ax_curr.grid(True, alpha=0.3)
+        # Turn off x-tick labels for all emissions plots (shared with bottom)
+        ax_curr.tick_params(axis="x", labelbottom=False)
+
+        if has_any and idx == 0:
+            # Only put legend on the first emissions plot to avoid clutter
+            ax_curr.legend(ncol=3, fontsize=8, loc="best")
+
+    # ----- Panel (c): Training temperature trajectory -------------------------
+    train_temp_traj = results.get("train_temp_traj", [])
+    if len(train_temp_traj) > 0:
+        M_all = len(train_temp_traj)
+        if M_all <= max_lines:
+            sel_train = np.arange(M_all, dtype=int)
+        else:
+            sel_train = np.unique(np.linspace(0, M_all - 1, num=max_lines, dtype=int))
+
+        for k, i in enumerate(sel_train):
+            temp_list = train_temp_traj[i]
+            if temp_list is None or len(temp_list) == 0: continue
+            y_train = np.asarray(temp_list[0])
+            if y_train.ndim > 1: y_plot = y_train[:, 0]
+            else: y_plot = y_train
+
+            alpha = 0.3 + 0.7 * (k / max(1, len(sel_train) - 1))
+            ax_train.plot(y_plot, alpha=alpha, label=f"Step {i}")
+
+        ax_train.set_xlabel("Year")
+        ax_train.set_ylabel(r"$\overline{\Delta T}(t)$ ($^\circ$C)")
+        ax_train.grid(True, alpha=0.3)
+        ax_train.set_xlim(0, T)
+        ax_train.text(
+            0.015, 0.93, r"$\overline{\Delta T}(t)$ from Optimal Emissions", transform=ax_train.transAxes,
+            ha="left", va="top", fontsize=16, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
+        )
+
+    # ----- Panel (d): Predictions vs Truth ------------------------------------
+    if pred_scenario is None:
+        target_scen = preds_traj[0][0][0] if len(preds_traj) > 0 else "Unknown"
+    else:
+        target_scen = pred_scenario
+
+    def _find_scen_idx(step_list, name):
+        for j, (sc, _, _) in enumerate(step_list):
+            if sc == name: return j
+        return None
+
+    N_all = len(preds_traj)
+    if N_all > 0:
+        if N_all <= max_lines:
+            sel_pred = np.arange(N_all, dtype=int)
+        else:
+            sel_pred = np.unique(np.linspace(0, N_all - 1, num=max_lines, dtype=int))
+
+        last_ytrue = None
+        for k, i in enumerate(sel_pred):
+            step_list = preds_traj[i]
+            j = _find_scen_idx(step_list, target_scen)
+            if j is None: continue
+            _, yhat, ytrue = step_list[j]
+            yhat, ytrue = jnp.asarray(yhat), jnp.asarray(ytrue)
+
+            alpha = 0.3 + 0.7 * (k / max(1, len(sel_pred) - 1))
+            ax_pred.plot(yhat, alpha=alpha, label=(f"Step {i}"))
+            last_ytrue = ytrue
+
+        if last_ytrue is not None:
+            ax_pred.plot(last_ytrue, ls="--", c="C3", label=f"truth: {target_scen}")
+            if baseline_preds is not None:
+                ax_pred.plot(baseline_preds, ls="-.", c="C2", label=f"Baseline Emulator")
+            ax_pred.set_xlim(0, int(last_ytrue.shape[0]) - 1)
+
+    ax_pred.text(
+        0.015, 0.93, f"Predictions vs Truth ({target_scen})", transform=ax_pred.transAxes,
+        ha="left", va="top", fontsize=16, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
+    )
+    ax_pred.set_xlabel("Year")
+    ax_pred.set_ylabel(r"$\overline{\Delta T}(t)$ ($^\circ$C)")
+    ax_pred.grid(True, alpha=0.3)
+    ax_pred.legend(ncol=3, loc="best", fontsize=8)
+
+    return
+
+def plot_baseline_pred_delT(baseline_results: dict, baseline_pred_delT: dict, ground_truth_delT: dict) -> None:
+    """Grid of per-scenario truth-vs-prediction GMST plots (titled with NRMSE) for the 'All' eval set."""
+    test_set = 'All'
+    N_scens = len(baseline_results[test_set])
+    rows = int(np.ceil(N_scens / 3))
+    cols = 3
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 3.5*rows), constrained_layout=True)
+    axes = axes.ravel()
+
+    for i, scen in enumerate(baseline_results[test_set]):
+        if scen == 'mean':
+            continue
+        ax = axes[i]
+        ax.plot(ground_truth_delT[test_set][scen],  label="truth", alpha=0.9)
+        ax.plot(baseline_pred_delT[test_set][scen],  label="prediction", ls="--", alpha=0.9)
+        ax.set_title(f"{scen} - NRMSE={baseline_results[test_set][scen]:.3f}")
+        ax.set_xlabel("time step")
+        ax.set_ylabel("GMST (K)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+    return
+
+def plot_zonal_predictions(results: dict, preds: dict, truths: dict, lat_coords: np.ndarray, eval_set: str = 'Tier 1') -> "matplotlib.figure.Figure":
+    """
+    Plots baseline emulator predictions vs ground truth at t=0, T/2, and T.
+    Includes a secondary axis (twinx) showing the Zonal NRMSE profile.
+    """
+    scenarios = list(preds[eval_set].keys())
+    n_scens = len(scenarios)
+
+    # 1. Determine Shared Axis Limits
+    # Flatten all arrays to find global min/max for Temperature
+    all_p = np.concatenate([p.flatten() for p in preds[eval_set].values()])
+    all_t = np.concatenate([t.flatten() for t in truths[eval_set].values()])
+    t_min, t_max = min(all_p.min(), all_t.min()), max(all_p.max(), all_t.max())
+
+    # Determine global limits for NRMSE (secondary axis)
+    all_nrmse = []
+    for s in scenarios:
+        if 'zonal' in results[eval_set][s]:
+            all_nrmse.append(results[eval_set][s]['zonal'])
+    if all_nrmse:
+        all_nrmse = np.concatenate(all_nrmse)
+        n_min, n_max = 0, max(all_nrmse.max() * 1.1, 0.1) # Start at 0, add buffer
+    else:
+        n_min, n_max = 0, 1
+
+    # 2. Setup Plot
+    fig, axes = plt.subplots(n_scens, 3, sharey='row',
+                             figsize=(16, 4.5 * n_scens),
+                             constrained_layout=True)
+    if n_scens == 1: axes = np.expand_dims(axes, 0) # Ensure 2D array
+
+    # 3. Plotting Loop
+    for i, scen in enumerate(scenarios):
+        y_pred = preds[eval_set][scen]
+        y_true = truths[eval_set][scen]
+
+        # Metrics
+        glob_nrmse_t_series = results[eval_set][scen]['global_t']
+        zonal_nrmse = results[eval_set][scen]['zonal'] # (N_lat,)
+
+        T = y_true.shape[0]
+        time_steps = [0, T//2, T-1]
+
+        for j, t in enumerate(time_steps):
+            ax = axes[i, j]
+
+            # --- Primary Axis: Temperature ---
+            ax.plot(lat_coords, y_true[t], color=cm.batlowS(0), ls='-', label='MESM temp. anomaly', lw=1.5, alpha=0.8)
+            ax.plot(lat_coords, y_pred[t], color=cm.lajollaS(2), ls='--', label='Emulated temp. anomaly', lw=1.5, alpha=0.9)
+
+            ax.set_ylim(t_min, t_max)
+            ax.set_xlabel("Latitude")
+            if j == 0:
+                ax.set_ylabel("Temp. anomaly [K]")
+                ax.text(-0.25, 0.5, scen, transform=ax.transAxes,
+                        rotation=90, va='center', ha='right', fontsize=14, fontweight='bold')
+
+            # --- Secondary Axis: NRMSE ---
+            #ax2 = ax.twinx()
+            #ax2.plot(lat_coords, zonal_nrmse, 'g:', label='Zonal NRMSE', lw=1.5, alpha=0.6)
+            #ax2.set_ylim(n_min, n_max)
+            #ax2.tick_params(axis='y', labelcolor='tab:green')
+
+            #if j == 2:
+            #    ax2.set_ylabel("Zonal NRMSE", color='tab:green')
+            #else:
+            #    ax2.set_yticklabels([]) # Hide ticks on inner plots
+
+            # Titles and Legends
+            current_glob_nrmse = glob_nrmse_t_series[t]
+            if j == 0:
+                ax.set_title('Scenario start', fontsize=16)
+            elif j == 1:
+                ax.set_title('Scenario middle', fontsize=16)
+            elif j == 2:
+                ax.set_title('Scenario end', fontsize=16)
+            #ax.set_title(f"Year {t} | Global NRMSE: {current_glob_nrmse:.4f}")
+
+            if j == 0:
+                # Combined legend
+                lines, labels = ax.get_legend_handles_labels()
+                #lines2, labels2 = ax2.get_legend_handles_labels()
+                #ax.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
+                ax.legend(lines, labels, loc='upper left', fontsize=14)
+
+            ax.set_xlim([-89, 89])
+            ax.grid(True, alpha=0.3)
+
+    return fig
