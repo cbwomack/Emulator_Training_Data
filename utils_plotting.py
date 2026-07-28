@@ -12,6 +12,9 @@ import seaborn as sns
 from cmcrameri import cm
 import matplotlib.ticker as ticker
 import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+from collections import defaultdict
+from sklearn.metrics import r2_score
 
 ## Local
 from paths import FIGURES_DIR
@@ -1775,6 +1778,205 @@ def plot_scenario_difference_bars2(baseline_results: dict,
 
     if save:
         plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
+
+
+def plot_individual_effects_summary(
+    y_true_ind_effects: dict,
+    y_hat_baseline: dict,
+    y_hat_ind_effects: dict,
+    train_scenarios_ind_effects: list[str],
+    ppt: bool = True,
+    save: bool = False,
+    figname: str = 'individual_effects_ppt4',
+) -> None:
+  """Plot the multi-agent "individual effects" summary figure.
+
+  Left column: SCM-projected vs. baseline- and optimal-emulator ("Opt. All") predicted
+  temperature trajectories, one row per single-driver scenario (M-GHG, M-aer, G6sulfur).
+  Right panel: emulator-fit scatter/regression across all three scenarios pooled together,
+  with R^2 scores per emulator configuration.
+
+  Only 'Opt. All' is drawn against the baseline (the other entries of
+  train_scenarios_ind_effects are computed upstream but intentionally skipped here, matching
+  the original figure design).
+  """
+  i_ppt = 0
+
+  layout = [
+          ["Left1", "Left1", "Left1", "Left1", "Left1", "Right", "Right", "Right"],
+          ["Left2", "Left2", "Left2", "Left2", "Left2", "Right", "Right", "Right"],
+          ["Left3", "Left3", "Left3", "Left3", "Left3", "Right", "Right", "Right"],
+      ]
+
+  plot_map = {"Left1":"M_GHG", "Left2":"M_AER", "Left3":"G6sulfur"}
+  color_map = {'Opt. Tier 1':cm.actonS(2), 'Opt. DAMIP':cm.actonS(4), 'Opt. GeoMIP': cm.actonS(6), 'Opt. All':cm.osloS(2)}
+  labels = [r"(a) Medium emissions, greenhouse gases only (DAMIP: $\it{M}$-$\it{GHG}$)",
+            r"(b) Medium emissions, aerosols only (DAMIP: $\it{M}$-$\it{aer}$)",
+            r"(c) High emissions with sulfur injection (GeoMIP: $\it{G6sulfur}$)"]
+  plot_len = len(y_true_ind_effects["All"]["M_GHG"])
+  x_vals = np.arange(1850, 2151)
+
+  if ppt:
+      figsize = (16.81, 7)
+  else:
+      figsize = (17.8, 7)
+
+  fig, ax_dict = plt.subplot_mosaic(
+      layout,
+      figsize=figsize,
+      constrained_layout=True,
+      gridspec_kw={"wspace": 0.001, "hspace": 0.001}
+  )
+
+  for j, ax_label in enumerate(plot_map):
+      ax_plot = ax_dict[ax_label]
+      scen_plot = plot_map[ax_label]
+
+      ax_plot.plot(x_vals, y_true_ind_effects['All'][scen_plot][100:plot_len], label='SCM-projected', c='black', ls='--', lw=2, alpha = 0.8)
+      ax_plot.plot(x_vals, y_hat_baseline['All'][scen_plot][100:plot_len], label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
+
+      for i, train in enumerate(reversed(train_scenarios_ind_effects)):
+          train_label = train
+          if train in ['Opt. Tier 2','Opt. DECK', 'Opt. CS3']:
+              continue
+          if train not in ['Opt. All']:
+              continue
+          alpha = 0.6
+          zorder = 0
+          ls = (0, (5, 4))
+          if train == 'Opt. All':
+              alpha = 1
+              zorder = 10
+              ls = '-'
+          elif train == 'Opt. Tier 1':
+              train_label = 'Opt. Prio. 1'
+          ax_plot.plot(x_vals, y_hat_ind_effects[train]['All'][scen_plot][100:plot_len], alpha=alpha, label=train_label, zorder=zorder, lw=2, ls=ls, color=color_map[train])
+
+      if ax_label != "Left3":
+          ax_plot.sharex(ax_dict["Left3"])
+          ax_plot.sharey(ax_dict["Left3"])
+          ax_plot.tick_params(labelbottom=False)
+
+      ax_plot.grid(linestyle='--', alpha=0.3, zorder=0)
+
+      ax_plot.text(
+              0.015, 0.915, labels[j], transform=ax_plot.transAxes,
+              ha="left", va="top", fontsize=14, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+            )
+      ax_plot.set_ylim([-4.2, 5.2])
+
+  ax_plot.set_xlim([1850, 2150])
+  ax_plot.set_xlabel("Year")
+
+  ax_dict["Left2"].legend(ncol=2,
+                    frameon=True,
+                    fancybox=True,
+                    framealpha=0.8,
+                    facecolor='white',
+                    edgecolor='#cccccc',
+                    fontsize=12)
+
+  fig.supylabel(r'Temperature anomaly [$^\circ$C]', fontsize=16)
+
+  ax_plot = ax_dict['Right']
+
+  scenario_legend_handles = {}
+  marker_legend_handles = []
+  scenarios = ["M_GHG","M_AER","G6sulfur"]
+  model_performance = defaultdict(lambda: {'true': [], 'pred': [], 'color': None})
+
+  step = 15
+  size = 35
+  markers = ['o','s','d']
+  base_color = cm.lipariS(5)
+
+  for j, scen_plot in enumerate(scenarios):
+      y_true = y_true_ind_effects['All'][scen_plot][100:plot_len]
+      y_pred_base = y_hat_baseline['All'][scen_plot][100:plot_len]
+      ax_plot.scatter(y_true[::step], y_pred_base[::step],
+                      marker=markers[j], color=base_color, s=size,
+                      facecolor='white', linewidths=1, alpha=0.4)
+
+      model_performance['Baseline Em.']['true'].extend(y_true)
+      model_performance['Baseline Em.']['pred'].extend(y_pred_base)
+      model_performance['Baseline Em.']['color'] = base_color
+
+      for i, train in enumerate(reversed(train_scenarios_ind_effects)):
+              if train in ['Opt. Tier 2','Opt. DECK', 'Opt. CS3']:
+                  continue
+              y_pred = y_hat_ind_effects[train]['All'][scen_plot][100:plot_len]
+
+              model_performance[train]['true'].extend(y_true)
+              model_performance[train]['pred'].extend(y_pred)
+              model_performance[train]['color'] = color_map[train]
+
+  emulator_handles = [Line2D([0], [0], ls='--', color='k', lw=2, label=f"Ideal fit (1:1)")]
+  for name, data in model_performance.items():
+      markeredgewidth = 1
+      ls = (0, (5, 4))
+      if name not in ['Baseline Em.','Opt. All']:
+          continue
+      if name == 'Opt. All' or name == 'Baseline Em.':
+          markeredgewidth = 1.75
+          ls = '-'
+      elif name == 'Opt. Tier 1':
+          name = 'Opt. Prio. 1'
+      sns.regplot(
+          x=np.array(data['true']),
+          y=np.array(data['pred']),
+          scatter=False,
+          ci=95,
+          color=data['color'],
+          ax=ax_plot,
+          truncate=False,
+          line_kws={'linewidth': 1.5, 'zorder': 11, 'linestyle':ls}
+      )
+      score = r2_score(data['true'], data['pred'])
+      handle = Line2D([0], [0], ls=ls, color=data['color'], lw=2, label=f"{name} ($R^2={score:.2f}$)")
+      emulator_handles.append(handle)
+
+  scenario_handles = []
+  scen_labels = [r'$\it{M}$-$\it{GHG}$',r'$\it{M}$-$\it{aer}$',r'$\it{G6sulfur}$']
+  for marker, label in zip(markers, scen_labels):
+      handle = Line2D([0], [0], marker=marker, color='w', label=label,
+                      markerfacecolor='white', markeredgecolor='k', markersize=8)
+      scenario_handles.append(handle)
+
+  scen_legend = ax_plot.legend(handles=scenario_handles, loc='lower right', title='Scenario', fontsize=12, title_fontsize=12)
+  ax_plot.add_artist(scen_legend)
+
+  emu_legend = ax_plot.legend(handles=emulator_handles,
+                              loc='upper left', fontsize=12,
+                              bbox_to_anchor=(0.019893604239317852,
+                                              0.6345526951619422,
+                                              0.43059349211779896,
+                                              0.2872407910360216),
+                              title='Emulator configuration',
+                              mode='expand',
+                              title_fontsize=12,
+                              borderaxespad=0)
+  shift = [65, 2, 26, 0, 3, 6]
+  for i, text in enumerate(emu_legend.get_texts()):
+      text.set_horizontalalignment('right')
+      text.set_x(shift[i])
+
+  ax_plot.grid(linestyle='--', alpha=0.3, zorder=0)
+  ax_plot.set_ylabel(r'Emulated temperature anomaly [$^\circ$C]')
+  ax_plot.set_xlabel(r'SCM-projected temperature anomaly [$^\circ$C]')
+  ax_plot.axline((0, 0), slope=1, color='black', alpha=0.8, linestyle='--', linewidth=1.5, zorder=0)
+  ax_plot.set_xlim([-1.5, 5.175])
+  ax_plot.set_ylim([-4.5, 6.5])
+  final_handles = list(scenario_legend_handles.values()) + marker_legend_handles
+
+  ax_plot.text(
+              0.03, 0.975, '(d) Emulator fit', transform=ax_plot.transAxes,
+              ha="left", va="top", fontsize=14, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+            )
+
+  if save:
+      plt.savefig(FIGURES_DIR / f'{figname}.pdf')
 
 # ==================================================================
 # Part 1: FaIR scenario plots (moved from run_fair.py)

@@ -5,6 +5,7 @@ import utils_FaIR_JAX
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
+import xarray as xr
 
 # JAX
 import jax
@@ -2315,3 +2316,293 @@ def generate_target_data(scenarios_dict: dict, data_dir: str = "./", opt: bool =
 
     individual_dicts = [target_sets[k] for k in scenarios_dict]
     return target_sets, *individual_dicts, output_dim, lat_coords
+# ==================================================================
+# Part 5: notebook-facing data-prep for 5a_paper_plots.ipynb figures
+# Each function loads/aggregates exactly what one utils_plotting figure call
+# needs, so 5a_paper_plots.ipynb itself only ever does "load data" then
+# "plot data" - no data construction happens in the notebook directly.
+# ==================================================================
+
+def load_fig1_tier1_scenarios(agents: list[str] = ['CO2']) -> dict:
+    """
+    Tier-1 calibration emissions for Figure 1's tier1-scenarios panel
+    (utils_plotting.plot_tier1). Returns {'years', 'tier1', 'group'}, one
+    entry per Tier-1 scenario.
+    """
+    _, emis_dict_calib_JAX, _, _ = utils_FaIR_JAX.generate_calib_data(agents)
+    group = ['historical', 'H-ext', 'M', 'ML', 'L', 'VLHO', 'VLLO-ext']
+    years = [np.arange(1750, 2024), np.arange(2024, 2501), np.arange(2024, 2151),
+              np.arange(2024, 2151), np.arange(2024, 2151), np.arange(2024, 2151),
+              np.arange(2024, 2501)]
+    tier1 = [emis_dict_calib_JAX[scen][0] for scen in group]
+    return {"years": years, "tier1": tier1, "group": group}
+
+
+def load_fig2_data(
+    agents: list[str] = ['CO2'],
+    path: str = 'checkpoints/co2/inverse_H-ext_constant_co2_only.pkl',
+) -> dict:
+    """
+    Optimal CO2 emissions trajectory vs. its H-ext target (Figure 2) for
+    utils_plotting.plot_stacked_results / plot_stacked_results_ppt.
+    Returns {'target_emissions', 'years', 'opt_emissions', 'opt_temp', 'opt_results'}.
+    """
+    _, emis_dict_calib_JAX, _, _ = utils_FaIR_JAX.generate_calib_data(agents)
+    opt_results = load_inverse_ckpt(path)
+
+    opt_emissions = [series['CO2'] for series in opt_results['U_traj']]
+    opt_temp = [series[-1] for series in opt_results['train_temp_traj']]
+    target_emissions = [emis_dict_calib_JAX['H-ext'][0].copy()]
+    years = np.arange(2024, 2501)
+
+    return {
+        "target_emissions": target_emissions,
+        "years": years,
+        "opt_emissions": opt_emissions,
+        "opt_temp": opt_temp,
+        "opt_results": opt_results,
+    }
+
+
+def load_fig3_single_forcing_data(agents: list[str] = ['co2', 'ch4', 'n2o', 'Sulfur', 'BC']) -> dict:
+    """
+    Per-agent single-forcing inverse vs. baseline NRMSE (Figure 3) for
+    utils_plotting.plot_rmse_comparison_single.
+    Returns {'results_inverse', 'results_baseline', 'labels'}.
+    """
+    results_inverse, results_baseline = [], []
+    for a in agents:
+        path_inverse = f'checkpoints/{a}/inverse_constant_tier1_{a}_only.pkl'
+        path_baseline = f'checkpoints/{a}/baseline_{a}_only.pkl'
+        results_inverse.append(load_inverse_ckpt(path_inverse))
+        with open(path_baseline, "rb") as f:
+            results_baseline.append(pickle.load(f)['Tier 1']['mean'])
+
+    labels = ['(a) CO$_2$', '(b) CH$_4$', '(c) N$_2$O', '(d) Sulfur', '(e) BC']
+    return {"results_inverse": results_inverse, "results_baseline": results_baseline, "labels": labels}
+
+
+def load_fig4_multi_forcing_data(
+    path_inverse: str = 'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
+    path_baseline: str = 'checkpoints/multi/baseline_all_agents_subset.pkl',
+) -> dict:
+    """
+    Multi-agent inverse vs. baseline NRMSE (Figure 4) for
+    utils_plotting.plot_rmse_comparison_multi. Returns {'results', 'baseline_error'}.
+    """
+    results = load_inverse_ckpt(path_inverse)
+    with open(path_baseline, "rb") as f:
+        baseline_error = pickle.load(f)['Tier 1']['mean']
+    return {"results": results, "baseline_error": baseline_error}
+
+
+def regenerate_fig5_all_agents_cache(
+    save_path: str = 'data/plotting/optimal_all_agents_subset.pkl',
+) -> dict:
+    """
+    Recompute the all-agents optimal-emulator NRMSE summary used by the
+    Figure-5 performance-summary bar chart and overwrite `save_path`'s cache.
+
+    Not called by default from the notebook - load_fig5_data() reads the
+    existing cache instead. Call this only to refresh
+    data/plotting/optimal_all_agents_subset.pkl after new inverse-optimization
+    checkpoints are produced upstream (Phase 3 scripts).
+    """
+    agents = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
+    active_agents = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')
+
+    params0, _ = generate_init_params_and_train_data(
+        agents, active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=1, verbose=False
+    )
+    eval_sets, *_ = generate_eval_data(agents, CS3=True, DAMIP=False, GeoMIP=False)
+
+    training_paths = [
+        'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
+        'checkpoints/multi/inverse_constant_tier2_all_agents_subset.pkl',
+        'checkpoints/multi/inverse_constant_DECK_all_agents_subset.pkl',
+        'checkpoints/multi/inverse_constant_CS3_all_agents_subset.pkl',
+        'checkpoints/multi/inverse_constant_all_all_agents_subset.pkl',
+    ]
+    train_scenarios = ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All']
+    optimal_results_all = evaluate_optimal_emulator(
+        training_paths=training_paths,
+        train_scenarios=train_scenarios,
+        eval_sets=eval_sets,
+        params0=params0,
+        active_agents=active_agents,
+        inactive_mode="zeros",
+        historical_name="historical",
+        key=jax.random.PRNGKey(0),
+        K=400,
+        lr=5e-2,
+        weight_decay=1e-2,
+    )
+
+    with open(save_path, "wb") as f:
+        pickle.dump(optimal_results_all, f)
+
+    return optimal_results_all
+
+
+def load_fig5_data(
+    baseline_path_co2: str = 'data/plotting/baseline_co2_only.pkl',
+    optimal_path_co2: str = 'data/plotting/optimal_co2_only.pkl',
+    baseline_path_all: str = 'data/plotting/baseline_all_agents_subset.pkl',
+    optimal_path_all: str = 'data/plotting/optimal_all_agents_subset.pkl',
+) -> dict:
+    """
+    Load the cached baseline/optimal-emulator NRMSE summaries (Figure 5:
+    performance summary across optimization priorities) for
+    utils_plotting.plot_vertical_stacked_bars.
+    """
+    def _load(path):
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+
+    return {
+        "baseline_results_list": [_load(baseline_path_co2), _load(baseline_path_all)],
+        "optimized_results_list": [_load(optimal_path_co2), _load(optimal_path_all)],
+        "train_scenarios": ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
+        "test_scenarios": ['Tier 1', 'Tier 2', 'DECK', 'CS3'],
+        "x_labels": ['Opt. Priority 1', 'Opt. Priority 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
+        "leg_labels": ['Priority 1', 'Priority 2', 'DECK', 'CS3'],
+        "weights": [7, 5, 2, 2],
+        "figname": 'performance_summary',
+    }
+
+
+def regenerate_fig6_individual_effects_cache(save_dir: str = 'data/plotting') -> dict:
+    """
+    Recompute the per-agent baseline/optimal-emulator predictions used by the
+    individual-effects figure (M-GHG / M-aer / G6sulfur scenarios) and
+    overwrite their caches under `save_dir`.
+
+    Not called by default from the notebook - load_fig6_data() reads the
+    existing cache instead. Call this only to refresh the cache after new
+    inverse-optimization checkpoints are produced upstream (Phase 3 scripts).
+    """
+    agents = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
+    active_agents = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')
+
+    params0, _ = generate_init_params_and_train_data(
+        agents, active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=1, verbose=False
+    )
+    eval_sets_ind_effects, *_ = generate_eval_data(agents, CS3=True, DAMIP=True, GeoMIP=True)
+
+    _, y_hat_baseline, y_true_ind_effects = generate_and_eval_baseline_emulator(
+        eval_sets_ind_effects["Tier 1"], eval_sets_ind_effects, save_path=None,
+        verbose=False, hidden_sizes=[16]
+    )
+
+    training_paths_ind_effects = [
+        'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
+        'checkpoints/multi/inverse_constant_DAMIP_all_agents.pkl',
+        'checkpoints/multi/inverse_constant_GeoMIP_all_agents.pkl',
+        'checkpoints/multi/inverse_constant_all_all_agents.pkl',
+    ]
+    train_scenarios_ind_effects = ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All']
+    _, y_hat_ind_effects = evaluate_optimal_emulator(
+        training_paths=training_paths_ind_effects,
+        train_scenarios=train_scenarios_ind_effects,
+        eval_sets=eval_sets_ind_effects,
+        params0=params0,
+        active_agents=active_agents,
+        inactive_mode="zeros",
+        historical_name="historical",
+        key=jax.random.PRNGKey(0),
+        K=400,
+        lr=5e-2,
+        weight_decay=1e-2,
+        ind_effects=True,
+    )
+
+    os.makedirs(save_dir, exist_ok=True)
+    with open(f'{save_dir}/y_hat_baseline_ind_effects.pkl', "wb") as f:
+        pickle.dump(y_hat_baseline, f)
+    with open(f'{save_dir}/y_true_ind_effects.pkl', "wb") as f:
+        pickle.dump(y_true_ind_effects, f)
+    with open(f'{save_dir}/y_hat_ind_effects.pkl', "wb") as f:
+        pickle.dump(y_hat_ind_effects, f)
+
+    return {
+        "y_true_ind_effects": y_true_ind_effects,
+        "y_hat_baseline": y_hat_baseline,
+        "y_hat_ind_effects": y_hat_ind_effects,
+        "train_scenarios_ind_effects": train_scenarios_ind_effects,
+    }
+
+
+def load_fig6_data(save_dir: str = 'data/plotting') -> dict:
+    """
+    Load the cached per-agent baseline/optimal-emulator predictions for the
+    individual-effects figure (utils_plotting.plot_individual_effects_summary).
+    """
+    def _load(name):
+        with open(f'{save_dir}/{name}.pkl', 'rb') as f:
+            return pickle.load(f)
+
+    return {
+        "y_true_ind_effects": _load('y_true_ind_effects'),
+        "y_hat_baseline": _load('y_hat_baseline_ind_effects'),
+        "y_hat_ind_effects": _load('y_hat_ind_effects'),
+        "train_scenarios_ind_effects": ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All'],
+    }
+
+
+def load_fig7_emic_data() -> dict:
+    """
+    Load MESM (EMIC) zonal-validation summary data for the Figure-7 emic
+    summary bar chart (utils_plotting.plot_scenario_difference_bars2):
+    baseline/optimal MESM NRMSE summaries, the optimized CO2 trajectories
+    used to drive MESM, and the MESM ensemble-mean global temperature
+    response for the optimized-emissions runs.
+    """
+    with open('data/plotting/baseline_co2_only_MESM.pkl', 'rb') as f:
+        baseline_MESM = pickle.load(f)
+
+    opt_MESM = []
+    for IC in ['constant', 'sine', 'both']:
+        with open(f'data/plotting/optimal_co2_only_MESM_{IC}.pkl', 'rb') as f:
+            opt_MESM.append(pickle.load(f))
+
+    co2_data = []
+    for IC in ['constant', 'sine']:
+        with open(f'checkpoints/co2/inverse_{IC}_all_co2_only_MESM.pkl', 'rb') as f:
+            res = pickle.load(f)
+        co2_data.append(res['U_traj'][-1]['CO2'])
+
+    lat_coords = np.linspace(-88, 88, 46)
+    lat_weights = np.cos(np.deg2rad(lat_coords))
+    lat_weights = np.maximum(lat_weights, 1e-6)
+    lat_weights = lat_weights / np.sum(lat_weights)
+
+    global_mean_temp = []
+    for scen in ['opt_all', 'opt_all_sine']:
+        path = f'data/MESM/emis_driven/zonal_data/optimized/ZONALANN.{scen}*.nc'
+        ds = xr.open_mfdataset(path, combine='nested', concat_dim='member', parallel=True, coords='minimal')
+        ensemble_mean = ds['DT2M'].mean(dim='member').compute().values
+        global_mean_temp.append(np.average(ensemble_mean, weights=lat_weights, axis=1))
+
+    scenario_keys = ['historical', 'H-ext', 'M', 'ML', 'L', 'VLLO-ext', 'VLHO',
+                      'H-ext-OS', 'M-ext', 'ML-ext', 'L-ext', 'VLHO-ext',
+                      '2xCO2', '1pctCO2', 'AA', 'CT']
+    x_labels = [r'$\it{historical}$', r'$\it{H}$-$\it{ext}$', r'$\it{M}$', r'$\it{ML}$', r'$\it{L}$',
+                 r'$\it{VLLO}$-$\it{ext}$', r'$\it{VLHO}$', r'$\it{H}$-$\it{ext}$-$\it{OS}$',
+                 r'$\it{M}$-$\it{ext}$', r'$\it{ML}$-$\it{ext}$', r'$\it{L}$-$\it{ext}$',
+                 r'$\it{VLHO}$-$\it{ext}$', r'$\it{abrupt}$-$\it{2xCO2}$', r'$\it{1pctCO2}$',
+                 r'$\it{AA}$', r'$\it{CT}$']
+    legend_labels = ['Const.', 'Sine', 'Both']
+    separator_indices = [6, 11, 13]
+    group_labels = ['Priority 1', 'Prioriity 2', 'DECK', 'CS3']
+
+    return {
+        "baseline_results": baseline_MESM,
+        "optimized_results_list": opt_MESM,
+        "scenario_keys": scenario_keys,
+        "legend_labels": legend_labels,
+        "co2_data": co2_data,
+        "global_mean_temp": global_mean_temp,
+        "x_labels": x_labels,
+        "separator_indices": separator_indices,
+        "group_labels": group_labels,
+    }
