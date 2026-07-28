@@ -1145,7 +1145,13 @@ def generate_train_test(agents, mode='FaIR'):
 
   return emis_dict_train_FaIR, emis_dict_test_FaIR, emis_dict_train_JAX, emis_dict_test_JAX, delT_dict_train_FaIR, delT_dict_test_FaIR, delT_dict_train_JAX, delT_dict_test_JAX
 
-def calibrate_inverse(filepath, emis_dict_JAX, delT_dict_FaIR, theta0, dt, n_steps, target: str = "CO2"):
+def calibrate_inverse(filepath, emis_dict_JAX, delT_dict_FaIR, theta0, dt, n_steps, target: str = "CO2", learning_rate: float = 1e-2):
+  """
+  Note: theta's entries span very different natural scales (e.g. ch4_rT ~ 4e-2,
+  ch4_ra ~ 1e-4 vs. r0 ~ 35), so a single learning_rate can be stable for one
+  `target` group and diverge for another (observed for target='CH4' at the
+  default 1e-2 - use a smaller learning_rate, e.g. 1e-4, for that target).
+  """
 
   def loss_theta(theta):
     return loss_fn(
@@ -1157,7 +1163,7 @@ def calibrate_inverse(filepath, emis_dict_JAX, delT_dict_FaIR, theta0, dt, n_ste
 
   loss_and_grad = jax.value_and_grad(loss_theta)
 
-  optimizer = optax.adam(learning_rate=1e-2)
+  optimizer = optax.adam(learning_rate=learning_rate)
   opt_state = optimizer.init(theta0)
 
   theta = theta0
