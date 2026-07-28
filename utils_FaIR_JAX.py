@@ -7,6 +7,9 @@ import pickle
 
 import numpy as np
 
+## Local
+from paths import DATA_DIR
+
 # JAX
 import jax
 import jax.numpy as jnp
@@ -825,7 +828,7 @@ def generate_JAX_data(agents, DECK=True, CS3=False, DAMIP=False, GeoMIP=False):
     emis_dicts.append(emis_dict_DAMIP)
 
   if GeoMIP:
-    path_GEO = 'data/GeoMIP/emis_G6sulfur.pickle'
+    path_GEO = str(DATA_DIR / 'GeoMIP' / 'emis_G6sulfur.pickle')
     with open(path_GEO, "rb") as f:
         emis_GEO = pickle.load(f)
     emis_dict_GEO = {'G6sulfur': emis_GEO}

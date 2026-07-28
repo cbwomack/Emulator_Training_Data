@@ -1,0 +1,22 @@
+name: project2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - numpy
+  - pandas=2.3.2
+  - scipy=1.16.2
+  - scikit-learn=1.7.2
+  - matplotlib=3.10.0
+  - seaborn=0.13.2
+  - xarray=2025.6.1
+  - netcdf4=1.7.2
+  - cmcrameri=1.9
+  - fair=2.2.2
+  - ipykernel=6.29.5
+  - pytest
+  - pip
+  - pip:
+      - jax==0.8.0
+      - jaxlib==0.8.0
+      - optax==0.2.6

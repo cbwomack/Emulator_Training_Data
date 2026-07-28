@@ -17,19 +17,25 @@ from fair.interface import fill, initialise
 ## Misc.
 from typing import Dict, Iterable, Tuple, Optional
 
+## Local
+from paths import DATA_DIR
+
 # ----------------------------
 # Constants and Configurations
 # ----------------------------
 
 DEFAULT_SCENARIO = 'ssp245'
-FAIR_PARAMS_CSV   = 'data/FaIR/calibrated_constrained_parameters_median.csv'
-FAIR_SPECIES_CSV  = 'data/FaIR/species_configs_properties_1.4.1.csv'
-VOLCANIC_FORCING = 'data/FaIR/volcanic_ERF_monthly_175001-201912.csv'
+FAIR_PARAMS_CSV   = str(DATA_DIR / 'FaIR' / 'calibrated_constrained_parameters_median.csv')
+FAIR_SPECIES_CSV  = str(DATA_DIR / 'FaIR' / 'species_configs_properties_1.4.1.csv')
+VOLCANIC_FORCING = str(DATA_DIR / 'FaIR' / 'volcanic_ERF_monthly_175001-201912.csv')
 SPECIES = ['CO2','CH4','N2O','Sulfur','BC','Aerosol-radiation interactions','Aerosol-cloud interactions']
-_PROPERTIES = read_properties(filename=FAIR_SPECIES_CSV)[1]
+_PROPERTIES = None  # lazily loaded on first use, see _species_properties()
 
 def _species_properties(input_mode: str) -> Dict[str, dict]:
     """Copy baseline species properties and set CO2 input_mode."""
+    global _PROPERTIES
+    if _PROPERTIES is None:
+        _PROPERTIES = read_properties(filename=FAIR_SPECIES_CSV)[1]
     props = {s: dict(_PROPERTIES[s]) for s in SPECIES}
     props["CO2"]["input_mode"] = input_mode
     props["CH4"]["input_mode"] = input_mode
@@ -187,8 +193,8 @@ def load_scenarioMIP_CMIP7(agents: list) -> Dict[str, Dict[str, np.ndarray]]:
     tag_post = ''
     for a in agents:
         tag_post += '_' + a
-    filepath_tier1 = f'data/FaIR_IO/emissions/ScenarioMIP_tier1{tag_post}.pkl'
-    filepath_tier2 = f'data/FaIR_IO/emissions/ScenarioMIP_tier2{tag_post}.pkl'
+    filepath_tier1 = str(DATA_DIR / 'FaIR_IO' / 'emissions' / f'ScenarioMIP_tier1{tag_post}.pkl')
+    filepath_tier2 = str(DATA_DIR / 'FaIR_IO' / 'emissions' / f'ScenarioMIP_tier2{tag_post}.pkl')
 
     if os.path.exists(filepath_tier1) and os.path.exists(filepath_tier2):
         with open(filepath_tier1, 'rb') as f:
@@ -207,7 +213,7 @@ def load_scenarioMIP_CMIP7(agents: list) -> Dict[str, Dict[str, np.ndarray]]:
         tags_tier1 = ['H-ext','M','ML','L','VLLO-ext','VLHO']
         tags_tier2 = ['H-ext-OS','M-ext','ML-ext','L-ext','VLHO-ext']
         tags_all   = tags_tier1 + tags_tier2
-        data_path  = "data/FaIR/extensions_1750-2500.csv"
+        data_path  = str(DATA_DIR / 'FaIR' / 'extensions_1750-2500.csv')
         emis_df    = pd.read_csv(data_path)
 
         # Indices for emissions dataset
@@ -266,7 +272,7 @@ def get_delT(emis_dict, scenarios, agents, MIP='ScenarioMIP_tier1'):
     tag_post = ''
     for a in agents:
         tag_post += '_' + a
-    filepath = f'data/FaIR_IO/delT/{MIP}{tag_post}.pkl'
+    filepath = str(DATA_DIR / 'FaIR_IO' / 'delT' / f'{MIP}{tag_post}.pkl')
 
     if os.path.exists(filepath):
         with open(filepath, 'rb') as f:
@@ -640,7 +646,7 @@ def solve_G3(emis_dict_tier1, verbose=False):
 
 def load_geoMIP_CMIP6(agents=None, emis_dict_tier1=None, verbose=False):
 
-    geoMIP_filepath = 'data/saved_emissions/emis_dict_geoMIP.pkl'
+    geoMIP_filepath = str(DATA_DIR / 'saved_emissions' / 'emis_dict_geoMIP.pkl')
 
     if os.path.exists(geoMIP_filepath):
         with open(geoMIP_filepath, 'rb') as f:
@@ -669,15 +675,15 @@ def load_geoMIP_CMIP6(agents=None, emis_dict_tier1=None, verbose=False):
 
 def load_CS3(agents=None, emis_dict_tier1=None):
 
-    CS3_filepath = 'data/saved_emissions/emis_dict_CS3.pkl'
+    CS3_filepath = str(DATA_DIR / 'saved_emissions' / 'emis_dict_CS3.pkl')
 
     if os.path.exists(CS3_filepath):
         with open(CS3_filepath, 'rb') as f:
             emis_dict_CS3 = pickle.load(f)
 
     else:
-        filepath_AA = 'data/CS3_outlook25/edaily.e5_AA_20250717.fordata'
-        filepath_CT = 'data/CS3_outlook25/edaily.e5_CT_20250712.fordata'
+        filepath_AA = str(DATA_DIR / 'CS3_outlook25' / 'edaily.e5_AA_20250717.fordata')
+        filepath_CT = str(DATA_DIR / 'CS3_outlook25' / 'edaily.e5_CT_20250712.fordata')
         emis_df_AA = pd.read_csv(filepath_AA, sep=r'\s+', usecols=[1,4,7,8,12])
         emis_df_CT = pd.read_csv(filepath_CT, sep=r'\s+', usecols=[1,4,7,8,12])
 

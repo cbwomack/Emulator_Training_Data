@@ -13,6 +13,9 @@ from cmcrameri import cm
 import matplotlib.ticker as ticker
 import matplotlib.colors as mcolors
 
+## Local
+from paths import FIGURES_DIR
+
 ## Setup plots
 plt.rcParams['figure.figsize'] = [12, 4]
 plt.rcParams.update({'font.size': 16})
@@ -29,7 +32,7 @@ def plot_init(res, save=False):
   ax.set_xlabel('Year')
   ax.set_xlim([0, len(res['U_traj'][0]['CO2'])])
   if save:
-    plt.savefig("Figures/init_emis.pdf", transparent=True)
+    plt.savefig(FIGURES_DIR / "init_emis.pdf", transparent=True)
 
 def plot_tier1(years, tier1, group, save=False):
   fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
@@ -42,7 +45,7 @@ def plot_tier1(years, tier1, group, save=False):
   ax.legend(loc='upper left', fontsize=14)
 
   if save:
-    plt.savefig("Figures/tier1.pdf", transparent=True)
+    plt.savefig(FIGURES_DIR / "tier1.pdf", transparent=True)
 
 def plot_updates(res, save=False):
   fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
@@ -59,7 +62,7 @@ def plot_updates(res, save=False):
   ax.set_xlim([0, len(res['U_traj'][0]['CO2'])])
   ax.legend()
   if save:
-    plt.savefig("Figures/emis_updates.pdf", transparent=True)
+    plt.savefig(FIGURES_DIR / "emis_updates.pdf", transparent=True)
 
 def plot_rmse_comparison_single(
     results_list,       # List of dictionaries
@@ -127,7 +130,7 @@ def plot_rmse_comparison_single(
     fig.supxlabel('Update iteration no.', fontsize=18)
 
     if save:
-      plt.savefig('Figures/fig03_single_forcing.pdf')
+      plt.savefig(FIGURES_DIR / 'fig03_single_forcing.pdf')
 
     return
 
@@ -198,7 +201,7 @@ def plot_rmse_comparison_multi(results, baseline_error, save=False):
     axd["Right2"].xaxis.set_major_locator(plt.MaxNLocator(5))
 
     if save:
-        plt.savefig('Figures/fig05_multi_forcing.pdf')
+        plt.savefig(FIGURES_DIR / 'fig05_multi_forcing.pdf')
 
     return
 
@@ -372,7 +375,7 @@ def plot_emissions_grid(opt_emissions, target_emissions, years, targets, groups,
     fig.supxlabel('Year')
 
     if save:
-      plt.savefig('Figures/co2_multi_target.pdf')
+      plt.savefig(FIGURES_DIR / 'co2_multi_target.pdf')
 
     return
 
@@ -442,7 +445,7 @@ def plot_co2_sulfur(co2, sulfur, save=False):
     )
 
     if save:
-      plt.savefig('Figures/co2_sulfur_compare.pdf', bbox_inches='tight')
+      plt.savefig(FIGURES_DIR / 'co2_sulfur_compare.pdf', bbox_inches='tight')
 
     return
 
@@ -1005,7 +1008,7 @@ def plot_single_heatmap(baseline_results: dict,
   fig.supylabel('Test dataset')
 
   if save:
-    plt.savefig(f'Figures/{figname}.pdf')
+    plt.savefig(FIGURES_DIR / f'{figname}.pdf')
 
   return
 
@@ -1197,7 +1200,7 @@ def plot_grouped_improvement_bars(baseline_results: dict,
     if is_standalone:
         ax.set_xlabel('Emulator Configuration', fontsize=14)
         if save:
-            plt.savefig(f'Figures/{figname}.pdf', bbox_inches='tight')
+            plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
         plt.show()
 
 def plot_vertical_stacked_bars(baseline_results_list: list[dict],
@@ -1308,7 +1311,7 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
     fig.supylabel(r'Performance change from baseline emulator [\%]', fontsize=16)
 
     if save:
-        plt.savefig(f'Figures/{figname}.pdf', bbox_inches='tight')
+        plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
 
     plt.show()
 
@@ -1554,7 +1557,7 @@ def plot_scenario_difference_bars(baseline_results: dict,
     fig.supylabel(r'Performance change from baseline emulator [\%]', fontsize=16, y=0.39)
 
     if save:
-        plt.savefig(f'Figures/{figname}.pdf', bbox_inches='tight')
+        plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
 
 def plot_scenario_difference_bars2(baseline_results: dict,
                                   optimized_results_list: list[dict],
@@ -1745,4 +1748,4 @@ def plot_scenario_difference_bars2(baseline_results: dict,
     fig.supxlabel(r'Performance change from baseline emulator [\%]', fontsize=18)
 
     if save:
-        plt.savefig(f'Figures/{figname}.pdf', bbox_inches='tight')
+        plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')

@@ -1,13 +1,9 @@
 *spatial_anomaly.nc4
-/Committee_Meeting_Figs/
+/archive/
 /data/*
-/old/
-/basic_run_example/
 /emulator_training/
 /checkpoints/
 /Figures/
-/.ipynb_checkpoints/
-/__pycache__/
 
 # Exceptions
 !/data/CS3_outlook25/
@@ -15,3 +11,62 @@
 !/data/FaIR_IO/
 !/data/GeoMIP/
 !/data/saved_emissions/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+.Python
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# pyenv
+.python-version
+
+# OS
+.DS_Store
