@@ -1351,241 +1351,6 @@ def get_global_value(data_dict: dict, scenario_name: str) -> float:
                 return np.nan
     return np.nan
 
-def plot_scenario_difference_bars(baseline_results: dict,
-                                  optimized_results_list: list[dict],
-                                  scenario_keys: list[str],
-                                  legend_labels: list[str],
-                                  co2_data: list[np.array],
-                                  global_mean_temp: list[np.array],
-                                  x_labels: list[str] = None,
-                                  save: bool = False,
-                                  figname: str = 'scenario_differences') -> None:
-    """
-    Per-scenario bar chart of global NRMSE across baseline + multiple optimized
-    variants (18-scenario layout, 9 per row). Superseded by plot_scenario_difference_bars2
-    (the only one actually called from 5a_paper_plots.ipynb) - candidate for Phase 5 removal.
-    """
-
-    # 1. Setup Data & Layout
-    # ----------------------
-    # specific constraint: 18 scenarios total, 9 per row
-    n_total = len(scenario_keys)
-    if n_total != 18:
-        print(f"Warning: Expected 18 scenarios, got {n_total}. Splitting evenly.")
-
-    x_positions = np.arange(n_total // 2)
-    separators = (x_positions[:-1] + x_positions[1:]) / 2
-    separators = separators[5:]
-
-    mid_point = 9
-    row_assignments = [scenario_keys[:mid_point], scenario_keys[mid_point:]]
-    if x_labels and len(x_labels) == n_total:
-        row_labels = [x_labels[:mid_point], x_labels[mid_point:]]
-    else:
-        row_labels = row_assignments
-
-    # Create 2 rows of subplots
-    layout = [
-        ["Top1", "Top2"],
-        ["Bottom1", "Bottom1"],
-        ["Bottom2", "Bottom2"]
-    ]
-
-    fig, axd = plt.subplot_mosaic(
-        layout,
-        figsize=(15, 9.5),
-        constrained_layout=True,
-    )
-    axd["Top2"].sharex(axd["Top1"])
-    axd["Top2"].sharey(axd["Top1"])
-    axd["Bottom2"].sharey(axd["Bottom1"])
-
-    axes_co2 = [axd["Top1"], axd['Top2']]
-    axes_bar = [axd["Bottom1"], axd["Bottom2"]]
-
-    t_min = np.min(global_mean_temp)
-    t_max = np.max(global_mean_temp)
-
-    for i, co2 in enumerate(co2_data):
-      axes_co2[i].plot(np.arange(1750, 2501), co2, lw=1.5, c=cm.actonS(2), label='Emissions')
-      axes_co2[i].grid(axis='y', linestyle='--', alpha=0.3, zorder=0, c=cm.actonS(2))
-      axes_co2[i].grid(axis='x', linestyle='--', alpha=0.3, zorder=0)
-      axes_co2[i].tick_params(axis='y', labelcolor=cm.actonS(2))
-
-      ax_temp = axes_co2[i].twinx()
-      ax_temp.plot(np.arange(1751, 2501), global_mean_temp[i], lw=1.5, ls='--', c=cm.actonS(4), label='Global mean temperature', zorder=0)
-      ax_temp.grid(linestyle='--', alpha=0.3, zorder=0, c=cm.actonS(4))
-      ax_temp.set_ylim(t_min - 0.75, t_max + 0.75)
-      ax_temp.tick_params(axis='y', labelcolor=cm.actonS(4))
-
-      if i == 0:
-        ax_temp.tick_params(labelright=False)
-        axes_co2[i].set_ylabel(r'Emissions [GtCO$_2$/yr]',  fontsize=16, c=cm.actonS(2))
-        axes_co2[i].text(
-              0.02, 0.94, r"(a) Optimized emissions and resulting $\overline{\Delta T}(t)$ (const. IC)", transform=axes_co2[i].transAxes,
-              ha="left", va="top", fontsize=15, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-        lines_1, labels_1 = axes_co2[i].get_legend_handles_labels()
-        lines_2, labels_2 = ax_temp.get_legend_handles_labels()
-        lines = lines_1 + lines_2
-        labels = labels_1 + labels_2
-        ax_temp.legend(lines, labels, frameon=True, loc='lower left',
-                    fancybox=True,
-                    framealpha=0.8,
-                    facecolor='white',
-                    edgecolor='#cccccc',
-                    fontsize=12)
-
-      elif i == 1:
-        axes_co2[i].tick_params(labelleft=False)
-        ax_temp.set_ylabel(r"$\overline{\Delta T}(t)$ [$^\circ$C]", fontsize=16, rotation=270, labelpad=15, c=cm.actonS(4))
-        axes_co2[i].text(
-              0.02, 0.94, r"(b) Optimized emissions and resulting $\overline{\Delta T}(t)$ (sine IC)", transform=axes_co2[i].transAxes,
-              ha="left", va="top", fontsize=15, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-
-    axes_co2[0].set_xlim([1750,2500])
-
-    n_opts = len(optimized_results_list)
-    total_group_width = 0.8
-    bar_width = total_group_width / n_opts
-
-    # Generate colors (using a generic map, easier to swap back to your custom cm.actonS later)
-    #colors = plt.cm.viridis(np.linspace(0, 1, n_opts))
-    colors = [cm.osloS(i + 2) for i in range (n_opts)]
-
-    # 2. Plotting Loop
-    # ----------------
-    for row_idx, ax_row in enumerate(axes_bar):
-        current_scenarios = row_assignments[row_idx]
-        current_labels = row_labels[row_idx]
-        x_positions = np.arange(len(current_scenarios))
-
-        # Iterate through each optimized result set (each creates one bar per scenario)
-        for opt_idx, opt_dict in enumerate(optimized_results_list):
-
-            # Calculate data for this specific optimizer across the current row's scenarios
-            diff_values = []
-            for scen in current_scenarios:
-                base_val = get_global_value(baseline_results, scen)
-                opt_val = get_global_value(opt_dict, scen)
-
-                # Logic: Percent Improvement = ((Baseline - Optimized) / Baseline) * 100
-                if np.isnan(base_val) or np.isnan(opt_val) or base_val == 0:
-                    diff_values.append(0)
-                else:
-                    # Positive value indicates the Optimized result is lower (better) than Baseline
-                    pct_change = ((base_val - opt_val) / base_val) * 100
-                    diff_values.append(pct_change)
-
-            # offset bars so they center around the tick
-            offset = (opt_idx - n_opts / 2) * bar_width + (bar_width / 2)
-
-            bars = ax_row.bar(x_positions + offset,
-                       diff_values,
-                       label=legend_labels[opt_idx],
-                       width=bar_width,
-                       color=colors[opt_idx],
-                       edgecolor='black',
-                       linewidth=0.7,
-                       zorder=3)
-
-            # Annotation Loop (Labels & Hatching)
-            for bar, val in zip(bars, diff_values):
-                # 1. Apply hatching if value is less than -50
-                if val < -70:
-                    bar.set_hatch('//')
-
-                # 2. Format text
-                label_text = f"{val:.1f}"
-
-                # 3. Determine Y position (Logic from original code)
-                if val < 0:
-                    # For negative bars, place label just above the zero line
-                    y_pos = 2
-                    va = 'bottom'
-                else:
-                    # For positive bars, place label just above the bar
-                    y_pos = val + 2
-                    va = 'bottom'
-
-                # 4. Add text
-                ax_row.text(bar.get_x() + bar.get_width() / 2,
-                            y_pos,
-                            label_text,
-                            ha='center',
-                            va=va,
-                            fontsize=7,
-                            color=colors[opt_idx], # Match the bar color
-                            fontweight='bold',
-                            zorder=4)
-
-        # 3. Minimal Styling (No textboxes, legends, etc.)
-        # -----------------------------------------------
-        ax_row.set_xticks(x_positions)
-        ax_row.set_xticklabels(current_labels,
-                               ha='center')
-        ax_row.tick_params(axis='x', pad=85, length=0, labelsize=12)
-
-        # Simple grid and spine cleanup
-        ax_row.grid(axis='y', linestyle='--', alpha=0.3, zorder=0)
-        ax_row.spines['top'].set_visible(False)
-        ax_row.spines['right'].set_visible(False)
-        ax_row.spines['bottom'].set_position('zero') # Zero line for positive/negative diffs
-        ax_row.spines['bottom'].set_color('#4a5568')
-        ax_row.set_ylim([-70, 90])
-
-        for x in separators:
-            ax_row.axvline(x, color='black', linestyle='--', linewidth=0.8, alpha=0.6, zorder=0)
-
-    axes_bar[0].legend(title='Emulator IC',
-                    loc='lower left',
-                    bbox_to_anchor=(0, -0.04),
-                    title_fontsize=14,
-                    #ncol=3,
-                    frameon=True,
-                    fancybox=True,
-                    framealpha=0.8,
-                    facecolor='white',
-                    edgecolor='#cccccc',
-                    fontsize=12)
-
-    axes_bar[0].text(
-              0.01, 1, r"(c) MESM emulator performance summary", transform=axes_bar[0].transAxes,
-              ha="left", va="top", fontsize=15, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-
-    axes_bar[1].text(
-              0.01, 0.975, r"ScenarioMIP", transform=axes_bar[1].transAxes,
-              ha="left", va="top", fontsize=16, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-    axes_bar[1].text(
-              0.665, 0.975, r"DECK", transform=axes_bar[1].transAxes,
-              ha="left", va="top", fontsize=16, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-    axes_bar[1].text(
-              0.77, 0.975, r"CS3", transform=axes_bar[1].transAxes,
-              ha="left", va="top", fontsize=16, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-    axes_bar[1].text(
-              0.875, 0.975, r"Optimized", transform=axes_bar[1].transAxes,
-              ha="left", va="top", fontsize=16, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-
-    fig.get_layout_engine().set(h_pad=0.15)
-    fig.supxlabel('Scenario', fontsize=16)
-    fig.supylabel(r'Performance change from baseline emulator [\%]', fontsize=16, y=0.39)
-
-    if save:
-        plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
-
 def plot_scenario_difference_bars2(baseline_results: dict,
                                   optimized_results_list: list[dict],
                                   scenario_keys: list[str],
@@ -2109,6 +1874,7 @@ def plot_calibration_results(
     dt: float = 0.1,
     calib: str = "Climate",
     mode: str = 'FaIR',
+    base_params: dict | None = None,
 ) -> None:
     """
     Plots the model performance before and after optimization.
@@ -2120,7 +1886,14 @@ def plot_calibration_results(
                      If mode='Climate', this is Temperature (K).
                      If mode='Carbon', this is CO2 Concentration (ppm).
         mode: "Climate" (Conc -> Temp) or "Carbon" (Emis -> Conc).
+        base_params: params dict supplying every theta field not tuned during
+            calibration. Defaults to utils_FaIR_JAX.FAIR_PARAMS; pass
+            utils_FaIR_JAX.MESM_PARAMS when plotting an MESM calibration
+            (matches the base_params now threaded through
+            utils_FaIR_JAX.calibrate_carbon_cycle/calibrate_climate_sensitivity).
     """
+    if base_params is None:
+        base_params = utils_FaIR_JAX.FAIR_PARAMS
     # 1. Prepare Data
     # Use target_dict for keys/lengths as it is required in both modes
     scenario_names = list(target_dict.keys())
@@ -2164,8 +1937,8 @@ def plot_calibration_results(
     years_template = jnp.arange(T_steps, dtype=jnp.float32)
     years_batch = jnp.tile(years_template, (n_scens, 1))
 
-    params_initial = utils_FaIR_JAX.params_from_theta(theta0, utils_FaIR_JAX.FAIR_PARAMS)
-    params_optimized = utils_FaIR_JAX.params_from_theta(theta_opt, utils_FaIR_JAX.FAIR_PARAMS)
+    params_initial = utils_FaIR_JAX.params_from_theta(theta0, base_params)
+    params_optimized = utils_FaIR_JAX.params_from_theta(theta_opt, base_params)
 
     # 3. Generate Predictions based on Mode
     if calib == "Carbon":

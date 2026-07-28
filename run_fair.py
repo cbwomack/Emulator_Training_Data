@@ -14,7 +14,7 @@ from fair.io import read_properties
 from fair.interface import fill, initialise
 
 ## Misc.
-from typing import Dict, Iterable, Tuple, Optional
+from typing import Dict, Iterable, Tuple
 
 ## Local
 from paths import DATA_DIR
@@ -164,27 +164,6 @@ def run_fair(f: FAIR, years: Iterable[int], layer: int = 0) -> Tuple[list, np.nd
     T = f.temperature.sel(timebounds=slice(tmin, tmax)).loc[dict(layer=layer)].values[:,0,:]
     T_mean = T.mean(axis=1)
     return t, T, T_mean, ECS
-
-# ----------------------
-# Misc. Helper Functions
-# ----------------------
-
-def impulse_profile(n_steps: int, dt: float, magnitude: float = 1.0) -> np.ndarray:
-    """Single-timestep impulse of area `magnitude`. Unused elsewhere - candidate for Phase 5 removal."""
-    v = np.zeros(n_steps)
-    v[0] = magnitude / dt   # integrates to 'magnitude'
-    return v
-
-def white_noise_profile(n_steps: int, sigma: float = 1.0, seed: Optional[int] = None) -> np.ndarray:
-    """Gaussian white noise of length n_steps. Unused elsewhere - candidate for Phase 5 removal."""
-    rng = np.random.default_rng(seed)
-    return rng.normal(0.0, sigma, size=n_steps)
-
-def ensure_all_agents(d: dict, n_steps: int) -> dict:
-    """Zero-fill any SPECIES missing from d. Unused elsewhere - candidate for Phase 5 removal."""
-    for a in SPECIES:
-        d.setdefault(a, np.zeros(n_steps))
-    return d
 
 # -------------
 # CMIP7 Helpers

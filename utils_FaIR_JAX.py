@@ -728,16 +728,14 @@ def run_scenarios(emis_by_agent_dict: dict, mode: str = 'FaIR', params: dict | N
     return outputs
 
 
-def calc_nrmse(T_model: jnp.ndarray, T_true: jnp.ndarray, min_range: float = 1) -> jnp.ndarray:
-  """RMSE(T_model, T_true) normalized by max(range(T_true), min_range)."""
+def calc_nrmse(T_model: jnp.ndarray, T_true: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+  """RMSE(T_model, T_true) normalized by max(|T_true|), eps floor - same convention
+  as utils_inverse._nrmse (which delegates here), so calibration loss and emulator-
+  evaluation loss use one shared NRMSE definition."""
   diff = T_model - T_true
   rmse = jnp.sqrt(jnp.mean(diff**2))
-
-  true_range = jnp.max(T_true) - jnp.min(T_true)
-  scale = jnp.maximum(true_range, min_range) # somewhat arbitrary, prevents loss from exploding
-  # also shifts priority slighty towards larger scenarios
-
-  return rmse / scale
+  max_abs = jnp.maximum(jnp.max(jnp.abs(T_true)), eps)
+  return rmse / max_abs
 
 def mean_nrmse_from_outputs(
     delT_dict_JAX: dict,
@@ -1072,17 +1070,21 @@ def calibrate_carbon_cycle(
     n_steps: int,
     learning_rate: float = 1e-2,
     mode: str = 'FaIR',
+    base_params: dict = FAIR_PARAMS,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Calibrates 'r0', 'rC', 'rT', 'a', 'tau' to match target CO2 concentrations.
     Ignores Temperature output/errors. Checkpoints theta to `filepath` every step.
+    Non-tuned theta fields (everything outside the "Carbon" mask) are pulled from
+    `base_params` - typically FAIR_PARAMS; pass MESM_PARAMS explicitly when this
+    is one step of an MESM calibration (see scripts/2c_calibrate_MESM.py).
     Returns (theta_opt, final_loss).
     """
     # Pre-pad data for JAX (similar to run_scenarios)
     scen_names = list(emis_dict_JAX.keys())
 
     def loss_carbon(theta):
-        params = params_from_theta(theta, FAIR_PARAMS)
+        params = params_from_theta(theta, base_params)
         # Run standard forward model
         res_dict = run_scenarios(emis_dict_JAX, params=params, dt=dt, mode=mode)
 
@@ -1113,7 +1115,7 @@ def calibrate_carbon_cycle(
             print(f"Step {step} | Loss (Conc MSE): {loss:.4f}")
 
     with open(filepath, 'wb') as f: pickle.dump(theta, f)
-    return theta, params_from_theta(theta)
+    return theta, params_from_theta(theta, base_params)
 
 # ----------------------------------------
 # Mode B: Calibrate Climate (Conc -> Temp)
@@ -1127,19 +1129,22 @@ def calibrate_climate_sensitivity(
     dt: float,
     n_steps: int,
     learning_rate: float = 1e-2,
+    base_params: dict = FAIR_PARAMS,
 ) -> tuple[jnp.ndarray, dict]:
     """
     Calibrates the thermal response params (d, q) to match target GMST given
     prescribed concentrations (via simulate_temp_prescribed_conc), bypassing the
-    carbon cycle entirely. Params are built against MESM_PARAMS (this function is
-    only used for the MESM-calibrated SCM). Checkpoints theta to `filepath`.
+    carbon cycle entirely. Non-tuned theta fields (everything outside the
+    "Climate" mask) are pulled from `base_params` - typically FAIR_PARAMS; pass
+    MESM_PARAMS explicitly when this is one step of an MESM calibration (see
+    scripts/2c_calibrate_MESM.py). Checkpoints theta to `filepath`.
     Returns (theta_opt, params_opt).
     """
     scen_names = list(emis_dict_JAX.keys())
 
     # Helper to vmap the new prescribed function
     def run_prescribed_batch(theta):
-        params = params_from_theta(theta, MESM_PARAMS)
+        params = params_from_theta(theta, base_params)
         losses = []
         for scen in scen_names:
             # We need both Emis (for Aerosols) and Conc (for GHGs)
@@ -1171,7 +1176,7 @@ def calibrate_climate_sensitivity(
             print(f"Step {step} | Loss (Temp MSE): {loss:.4f}")
 
     with open(filepath, 'wb') as f: pickle.dump(theta, f)
-    return theta, params_from_theta(theta)
+    return theta, params_from_theta(theta, base_params)
 
 # ----------------
 # Train/test split

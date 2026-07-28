@@ -375,12 +375,6 @@ def fit_scaler(X: jnp.ndarray, eps: float = 1e-8) -> tuple[jnp.ndarray, tuple[jn
     Xs = (X - mu) / sd
     return Xs, (mu, sd)
 
-def fit_scaler_no_center(X: jnp.ndarray, eps: float = 1e-8) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-    """Per-column rescale X by RMS without subtracting the mean. Returns (Xs, (0, scale))."""
-    scale = jnp.sqrt(jnp.mean(X**2, axis=0) + eps)
-    Xs = X / scale
-    return Xs, (jnp.zeros_like(scale), scale)
-
 def apply_scaler(X: jnp.ndarray, stats: tuple[jnp.ndarray, jnp.ndarray]) -> jnp.ndarray:
     """Apply a (mu, sd) scaler fit elsewhere (e.g. by fit_scaler) to X."""
     mu, sd = stats
@@ -535,15 +529,6 @@ def train_mlp_sgd(
     (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
     return paramsK, losses
 
-def eval_on_tests_mlp(params: list[dict], test_scaled_list: list) -> jnp.ndarray:
-    """Mean MSE of an MLP over a list of (X, y, name) test sets."""
-    if not test_scaled_list:
-        return jnp.array(0.0, dtype=jnp.float32)
-
-    errs = [_mse(mlp_forward(params, X), y) for (X, y, _) in test_scaled_list]
-
-    return jnp.mean(jnp.stack(errs))
-
 # ==================================================================
 # Part 3/4: core bilevel inverse optimization (shared by single- and
 # multi-agent, FaIR- and MESM-calibrated experiments)
@@ -654,23 +639,6 @@ def build_train(
 
     N = min(X.shape[0], y.shape[0])
     return [(X[:N], y[:N], "opt_scen")]
-
-def build_dataset_no_history(
-    emis_dict: dict, scenarios: list[str], agents: tuple = AGENTS_DEFAULT, mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0)
-) -> list[tuple[jnp.ndarray, jnp.ndarray, str]]:
-    """
-    Build features/targets without prepending historical emissions.
-    Uses a sentinel historical_name that won't be found in the dict.
-
-    Note: appears unused elsewhere in the codebase, and the call below passes a
-    positional `scenarios` arg that build_dataset_from_runfair_dict's signature
-    doesn't accept as a second positional (it would collide with the
-    `historical_name` kwarg below) - this function raises TypeError if called
-    as written. Left as-is here; see Phase 5 dead-code/bug notes.
-    """
-    return build_dataset_from_runfair_dict(
-        emis_dict, scenarios, historical_name="__NONE__", agents=agents, mode=mode, ema_windows_years=ema_windows_years
-    )
 
 def build_valid(
     emis_dict_valid: dict,
@@ -1405,9 +1373,10 @@ def evaluate_emulator_nrmse(
     return avg_nrmse_over_tests(params, test_scaled)
 
 def _nrmse(yhat: jnp.ndarray, ytrue: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
-    """RMSE(yhat, ytrue) normalized by max(|ytrue|)."""
-    max_abs = jnp.maximum(jnp.max(jnp.abs(ytrue)), eps)
-    return jnp.sqrt(jnp.mean((yhat - ytrue) ** 2)) / max_abs
+    """RMSE(yhat, ytrue) normalized by max(|ytrue|) - delegates to
+    utils_FaIR_JAX.calc_nrmse so calibration and emulator-evaluation loss share
+    one NRMSE implementation."""
+    return utils_FaIR_JAX.calc_nrmse(yhat, ytrue, eps=eps)
 
 # --- helper: apply train stats to a test dataset list[(X, y, scen)] ---------
 def _apply_stats_to_test(test_dataset: list, stats: tuple[jnp.ndarray, jnp.ndarray]) -> list:
@@ -2702,6 +2671,13 @@ def load_fig7_emic_data() -> dict:
     baseline/optimal MESM NRMSE summaries, the optimized CO2 trajectories
     used to drive MESM, and the MESM ensemble-mean global temperature
     response for the optimized-emissions runs.
+
+    Uses parallel=False in open_mfdataset (Phase 5 fix): this call used to
+    use parallel=True and was flagged as an "intermittent" NetCDF4/dask
+    failure, but scripts/4b_process_MESM_data.py's identical call turned out
+    to fail deterministically with parallel=True in practice - same
+    underlying dask-worker/netCDF4-file-handle issue, just not actually
+    intermittent. parallel=False only changes read concurrency, not values.
     """
     with open('data/plotting/baseline_co2_only_MESM.pkl', 'rb') as f:
         baseline_MESM = pickle.load(f)
@@ -2725,7 +2701,7 @@ def load_fig7_emic_data() -> dict:
     global_mean_temp = []
     for scen in ['opt_all', 'opt_all_sine']:
         path = f'data/MESM/emis_driven/zonal_data/optimized/ZONALANN.{scen}*.nc'
-        ds = xr.open_mfdataset(path, combine='nested', concat_dim='member', parallel=True, coords='minimal')
+        ds = xr.open_mfdataset(path, combine='nested', concat_dim='member', parallel=False, coords='minimal')
         ensemble_mean = ds['DT2M'].mean(dim='member').compute().values
         global_mean_temp.append(np.average(ensemble_mean, weights=lat_weights, axis=1))
 
