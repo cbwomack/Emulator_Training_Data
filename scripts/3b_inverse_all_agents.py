@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for 3b_inverse_all_agents.ipynb: runs the all-forcing-agent bilevel inverse-optimization
 experiments used to build checkpoints/multi/inverse_*.pkl checkpoints. Runs

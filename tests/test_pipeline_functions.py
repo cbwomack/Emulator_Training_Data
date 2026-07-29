@@ -1,3 +1,11 @@
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Tier 2: the most-reused notebook-facing pipeline functions in utils_inverse.py
 (reuse counts from the Phase 4 planning pass: generate_eval_data in 12 files,

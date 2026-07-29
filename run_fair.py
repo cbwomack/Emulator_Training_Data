@@ -1,3 +1,11 @@
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 # Imports
 
 ## Standard
@@ -696,6 +704,13 @@ def generate_and_save_scenario_data(save_path: str | None = None) -> dict:
     return data
 
 
+# --------------------------------------------------------
+# Plotting color/label lookup, shared across utils_plotting.py
+# --------------------------------------------------------
+# Consistent short scenario tags (used to key `colors` below) and their
+# plotting colors, so every figure across the paper colors the same
+# scenario the same way. `snames_short` is only scaffolding to build
+# `colors` positionally; `colors` itself is what utils_plotting.py imports.
 snames_short = ['historical','H-ext','H-ext-OS',
                 'M','M-ext','ML','ML-ext','L',
                 'L-ext','VLLO-ext','VLHO','VLHO-ext',

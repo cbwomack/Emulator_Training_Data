@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for 2b_optimize_GeoMIP.ipynb: solves for the sulfur
 injection profile that cools the H-ext scenario to match M-ext (a G6-sulfur

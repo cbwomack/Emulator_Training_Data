@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for 4c_evaluate_MESM_emulator.ipynb: trains and evaluates the
 vector-output (zonal-temperature) MLP emulator against MESM output, once on
@@ -74,6 +82,7 @@ OPT_DIAGNOSTICS_PATH = f"data/plotting/optimal_co2_only_MESM_{OPT_ICS[-1]}_diagn
 
 
 def build_eval_sets():
+    """Assemble the Tier 1/Tier 2/DECK/CS3 emissions and MESM zonal-temperature target sets used to evaluate the baseline emulator."""
     agents = ["CO2"]
     scenarios_eval = {
         "Tier 1": ["historical", "H-ext", "L", "M", "ML", "VLHO", "VLLO-ext"],
@@ -107,6 +116,7 @@ def build_eval_sets():
 
 
 def build_opt_sets(eval_emis_sets, eval_targets_sets):
+    """Build the CO2-only-optimized (constant+sine IC) training set from checkpoints/co2/, plus the existing eval sets merged in under the 'optimized' key."""
     emis_dict_opt = {}
     for IC in OPT_ICS:
         opt_path = f"checkpoints/co2/inverse_{IC}_{OPT_GROUP}_co2_only_MESM.pkl"

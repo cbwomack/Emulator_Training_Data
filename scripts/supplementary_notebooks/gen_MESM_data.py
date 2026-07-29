@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for supplementary_notebooks/gen_MESM_data.ipynb: writes CO2
 emissions input files (MESM's plain-text ascii format) for every scenario the
@@ -34,6 +42,7 @@ OUT_DIR = Path("data/MESM/emis_driven/MESM_inputs")
 
 
 def write_emissions_file(co2_array: np.ndarray, filepath: str, hist: np.ndarray | None = None) -> None:
+    """Write one scenario's CO2 trajectory to MESM's plain-text ascii input format."""
     if hist is not None:
         co2_array = np.concatenate([hist, co2_array])
 
@@ -52,6 +61,7 @@ def write_emissions_file(co2_array: np.ndarray, filepath: str, hist: np.ndarray 
 
 
 def write_scenario_inputs() -> None:
+    """Write every ScenarioMIP/DECK/CS3 scenario's CO2 emissions to a MESM input file, prepending historical data where MESM needs it."""
     emis_dict_tier1_JAX, emis_dict_tier2_JAX, emis_dict_DECK_JAX, emis_dict_CS3_JAX = utils_FaIR_JAX.generate_JAX_data(
         AGENTS, CS3=True
     )
@@ -79,6 +89,7 @@ def write_scenario_inputs() -> None:
 
 
 def write_optimized_inputs() -> None:
+    """Write the sine-IC inverse-optimized CO2 trajectory to a MESM input file, for the 'optimized' MESM-driving experiment."""
     groups = ["all"]
     for group in groups:
         opt_path = f"checkpoints/co2/inverse_sine_{group}_co2_only_MESM.pkl"

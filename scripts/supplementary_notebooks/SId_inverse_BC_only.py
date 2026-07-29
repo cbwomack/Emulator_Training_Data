@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for supplementary_notebooks/SId_inverse_BC_only.ipynb: runs the BC-only bilevel inverse-optimization
 experiments used to build checkpoints/BC/inverse_*.pkl checkpoints. Runs

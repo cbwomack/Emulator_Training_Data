@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for 4b_process_MESM_data.ipynb: for every (experiment, scenario)
 pair, takes the ensemble mean over the 30-member initial-condition ensemble of
@@ -45,6 +53,7 @@ SCENARIOS = {
 
 
 def process_scenario(exp_label: str, scen: str) -> None:
+    """Ensemble-mean one scenario's zonal-temperature NetCDF files and pickle the result."""
     path = f"data/MESM/emis_driven/zonal_data/{exp_label}/ZONALANN.{scen}*.nc"
     files = sorted(glob.glob(path))
     if not files:

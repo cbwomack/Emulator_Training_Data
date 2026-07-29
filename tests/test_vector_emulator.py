@@ -1,3 +1,11 @@
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Tier 3: vector-target (zonal-output) emulator coverage, converted from the
 old root-level test_vector_emulator.py (a #%%-cell script, not a real pytest

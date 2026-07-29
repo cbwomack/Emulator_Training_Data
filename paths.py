@@ -1,3 +1,11 @@
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """Repo-root-relative paths, so imports and file I/O work regardless of the caller's cwd."""
 from pathlib import Path
 

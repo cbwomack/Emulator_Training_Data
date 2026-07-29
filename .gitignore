@@ -4,6 +4,7 @@
 /emulator_training/
 /checkpoints/
 /Figures/
+/docs/
 
 # Exceptions
 !/data/CS3_outlook25/

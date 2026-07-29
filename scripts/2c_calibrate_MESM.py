@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for 2c_calibrate_MESM.ipynb: calibrates the JAX SCM against
 MESM ensemble output in two *sequential* phases - carbon cycle (emis -> conc,
@@ -58,6 +66,7 @@ CARBON_FILEPATH = "data/JAX_calibration/calib_MESM_emis_to_conc.pkl"
 
 
 def _calculate_ensemble_average(file_pattern: str) -> np.ndarray | None:
+    """Mean over every MESM ensemble-member file matching `file_pattern` (column 1, whitespace-delimited ascii)."""
     file_list = glob.glob(file_pattern)
     if not file_list:
         print("No files found matching the pattern.")
@@ -67,6 +76,7 @@ def _calculate_ensemble_average(file_pattern: str) -> np.ndarray | None:
 
 
 def run_carbon_cycle(theta0: jnp.ndarray) -> jnp.ndarray:
+    """Phase 1: calibrate the carbon-cycle theta fields against MESM's 1pctCO2 emissions->concentration response."""
     emis_path = str(DATA_DIR / "MESM" / "emis_driven")
     emis_1pct_path = f"{emis_path}/1PRCO2/carbemiss.txt"
 
@@ -92,6 +102,7 @@ def run_carbon_cycle(theta0: jnp.ndarray) -> jnp.ndarray:
 
 
 def run_climate_sensitivity(theta0: jnp.ndarray) -> jnp.ndarray:
+    """Phase 2: calibrate the climate-sensitivity theta fields (d, q), continuing from Phase 1's theta0."""
     conc_path = str(DATA_DIR / "MESM" / "conc_driven")
     conc_1pct_path = f"{conc_path}/1PRCO2/"
 

@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# ============================================================
+# Author: Christopher B. Womack
+# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Responsibility for the final manuscript/code lies entirely with the authors.
+# GAI tools are not listed as authors and do not bear responsibility for the
+# final outcomes.
+# ============================================================
+
 """
 Companion script for 2a_calibrate_FaIR_JAX.ipynb: calibrates the JAX SCM
 against FaIR outputs for each forcing-agent group (CO2, CH4, N2O, Sulfur+BC),
