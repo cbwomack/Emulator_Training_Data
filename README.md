@@ -1,17 +1,17 @@
 # Experiments for identifying the optimal choice of climate emulator training data
 
-In this repository, you'll find a series of experiments that leverage a differentiable simple climate model (SCM) to compute the optimal set of training data for a neural-network climate emulator. This is the companion code to "Optimal scenario design for climate emulation: How to train your emulator" (soon to be submitted).
+In this repository, you'll find a series of experiments that leverage a differentiable Simple Climate Model (SCM) to compute the optimal set of training data for a neural-network climate emulator. This is the companion code to "Optimal scenario design for climate emulation" (in revision at PNAS).
 
 # Usage
 ## Scripts and Notebooks
 All code for the differentiable SCM, and emulator training and testing, is written in Python, split between `.py` scripts and Jupyter notebooks. A large portion of this code relies on [JAX](https://docs.jax.dev/en/latest/quickstart.html) for optimization and automatic differentiation (autodiff), along with [cmcrameri](https://www.fabiocrameri.ch/colourmaps/) for plotting using accessible color maps.
 
-Every notebook that involves real compute (FaIR data generation, SCM calibration, or the bilevel inverse-optimization used to pick training emissions) follows a two-piece pattern: a `.py` script under `scripts/` that runs and checkpoints the actual computation, so it can be scheduled as a batch job and resumed if interrupted, and a companion notebook of the same name that loads the results and produces the corresponding figures.
+Every notebook that involves real compute (FaIR data generation, SCM calibration, or the optimization used to generate training emissions) follows a two-piece pattern: a `.py` script under `scripts/` that runs and checkpoints the actual computation, so it can be scheduled as a batch job and resumed if interrupted, and a companion notebook of the same name that loads the results and produces the corresponding figures.
 
 Notebooks and scripts are organized as:
 1. `1_generate_FaIR_data`: Generates scenario emissions/temperature data using FaIR (ScenarioMIP tier1/tier2, DECK, GeoMIP, and CS3 "Global Change Outlook 2025" scenarios). This is used throughout the rest of the pipeline.
 2. `2a_calibrate_FaIR_JAX` / `2b_optimize_GeoMIP` / `2c_calibrate_MESM`: (a) Calibrates the differentiable SCM against FaIR. (b) Solves for the sulfur-injection emissions profile required for the GeoMIP scenarios, using the calibrated SCM's autodiff. (c) Calibrates a second, MESM-targeted version of the SCM in two sequential steps - carbon cycle (emissions -> concentrations) first, then climate sensitivity (concentrations -> temperature), continuing from the carbon-cycle result.
-3. `3a_inverse_CO2_only` / `3b_inverse_all_agents`: Uses the differentiable SCM's autodiff to optimize training emissions for a neural-network emulator - single-agent (CO2-only) and multi-agent versions, respectively. The single-agent CH4/N2O/Sulfur/BC variants and an all-agents-subset variant live in `supplementary_notebooks/` (`SIa`-`SIe`).
+3. `3a_inverse_CO2_only` / `3b_inverse_all_agents`: Uses the differentiable SCM's autodiff to optimize training emissions for a neural-network emulator - single-agent (CO2-only) and multi-agent versions, respectively. The single-agent CH4/N2O/Sulfur/BC variants live in `supplementary_notebooks/` (`SIa`-`SIe`).
 4. `4a_inverse_CO2_only_MESM` / `4b_process_MESM_data` / `4c_evaluate_MESM_emulator`: (a) Repeats the CO2-only inverse optimization for the MESM-calibrated SCM. (b) Aggregates MESM's raw zonal-temperature ensemble output into the format the emulator framework expects. (c) Evaluates the resulting zonal-output emulator's performance against MESM.
 5. `5a_paper_plots`: Produces every figure in the manuscript.
 
