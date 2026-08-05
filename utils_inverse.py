@@ -502,15 +502,26 @@ def _mse(pred: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
 
 _tree_map    = _jtree.map
 def train_mlp_sgd(
-    params0: list[dict], Xtr: jnp.ndarray, ytr: jnp.ndarray, K: int = 400, lr: float = 5e-2, weight_decay: float = 1e-2
+    params0: list[dict], Xtr: jnp.ndarray, ytr: jnp.ndarray, K: int = 400, lr: float = 5e-2, weight_decay: float = 1e-2,
+    batch_size: int | None = None, key: jax.random.PRNGKey = jax.random.PRNGKey(0),
 ) -> tuple[list[dict], jnp.ndarray]:
     """
     Train an MLP (mlp_forward) with clipped-gradient SGD + weight decay for K steps,
     scanning the whole loop with jax.lax.scan (checkpointed) for speed/memory.
     Returns (params_final, losses) where losses has one entry per step.
+
+    `batch_size`: default None reproduces the prior behavior exactly - every
+    step uses the complete Xtr/ytr (despite the "SGD" name, this was always
+    full-batch gradient descent with momentum, not minibatch-stochastic; see
+    0a_inner_loop_sgd_pilot). When set to an int, each of the K steps samples
+    `batch_size` rows without replacement from Xtr/ytr using `key` (split
+    fresh every step), making this genuinely stochastic gradient descent in
+    the classical sense. `batch_size >= Xtr.shape[0]` falls back to full-batch.
     """
     pdt = params0[0]["W"].dtype
     Xtr = Xtr.astype(pdt); ytr = ytr.astype(pdt)
+    N = Xtr.shape[0]
+    use_minibatch = batch_size is not None and batch_size < N
 
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -521,20 +532,27 @@ def train_mlp_sgd(
 
     @jax.checkpoint
     def step(carry, _):
-        params, opt_state = carry
+        params, opt_state, step_key = carry
+
+        if use_minibatch:
+            step_key, sample_key = jax.random.split(step_key)
+            idx = jax.random.choice(sample_key, N, shape=(batch_size,), replace=False)
+            Xb, yb = Xtr[idx], ytr[idx]
+        else:
+            Xb, yb = Xtr, ytr
 
         def loss_fn(p):
-            yhat = mlp_forward(p, Xtr)
-            return _mse(yhat, ytr)
+            yhat = mlp_forward(p, Xb)
+            return _mse(yhat, yb)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         grads = _tree_map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=1e6, neginf=-1e6), grads)
         updates, opt_state = optimizer.update(grads, opt_state, params=params)
         params = optax.apply_updates(params, updates)
 
-        return (params, opt_state), loss
+        return (params, opt_state, step_key), loss
 
-    (paramsK, _), losses = jax.lax.scan(step, (params0, opt_state), xs=None, length=K)
+    (paramsK, _, _), losses = jax.lax.scan(step, (params0, opt_state, key), xs=None, length=K)
     return paramsK, losses
 
 # ==================================================================
@@ -959,7 +977,9 @@ def make_inverse_objective_single_train(
     inactive_mode: str = "zeros",
     smoothness_weight: float = 0.0,
     mode: str = 'FaIR',
-    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    batch_size: int | None = None,
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0),
 ) -> callable:
     """
     Build the bilevel objective `objective(U_pytree) -> (loss, aux)` at the heart of
@@ -971,6 +991,14 @@ def make_inverse_objective_single_train(
     penalty on U_pytree. The outer gradient (w.r.t. U_pytree) is obtained by
     differentiating through the entire inner training loop.
     aux = (paramsK, test_s, train_temp_raw) for logging/checkpointing.
+
+    `batch_size`/`key` are forwarded to train_mlp_sgd's inner loop (default
+    None = full-batch, unchanged behavior; see 0a_inner_loop_sgd_pilot).
+    Known limitation of this pilot-stage passthrough: `key` is fixed for the
+    life of one optimize_emissions_inverse call, so every outer step's inner
+    minibatch draws are seeded identically - true per-outer-step-varying
+    minibatches would require threading a key through the outer loop's own
+    JIT'd carry, which is out of scope until 0a's pilot results are in.
     """
     def objective(U_pytree):
         U_eff = _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode)
@@ -1005,7 +1033,8 @@ def make_inverse_objective_single_train(
 
         # 4) Inner training
         paramsK, _ = train_mlp_sgd(
-            params0, Xtr, ytr, K=K_inner, lr=lr_inner, weight_decay=wd_inner
+            params0, Xtr, ytr, K=K_inner, lr=lr_inner, weight_decay=wd_inner,
+            batch_size=batch_size, key=key,
         )
 
         # 5) Average NRMSE across all scenarios, weighted by scenario length
@@ -1113,7 +1142,9 @@ def optimize_emissions_inverse(
     checkpoint_every: int = 50,
     resume_if_exists: bool = True,
     preds_every: int = 50,
-    ema_windows_years: tuple = (5.0, 30.0, 50.0)
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    batch_size: int | None = None,
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0),
 ) -> dict:
     """
     The core bilevel/outer-loop optimizer: finds an emissions trajectory U (one
@@ -1151,7 +1182,8 @@ def optimize_emissions_inverse(
         emis_dict,
         historical_name=historical_name,
         agents=agents,
-        mode=mode
+        mode=mode,
+        ema_windows_years=ema_windows_years,
     )
 
     if filter_hist:
@@ -1171,6 +1203,8 @@ def optimize_emissions_inverse(
         inactive_mode=inactive_mode,
         smoothness_weight=smoothness_weight,
         mode=mode,
+        batch_size=batch_size,
+        key=key,
         ema_windows_years=ema_windows_years
     )
 
@@ -1247,7 +1281,7 @@ def optimize_emissions_inverse(
         preds_traj = ckpt.get("preds_traj", [])
         train_temp_traj = ckpt.get("train_temp_traj", [])
     else:
-        if not resume_if_exists and os.path.isfile(checkpoint_path):
+        if not resume_if_exists and checkpoint_path and os.path.isfile(checkpoint_path):
             print("Overwriting save data...")
         else:
             print("No save data found, starting fresh...")
@@ -1468,10 +1502,15 @@ def evaluate_baseline_over_multiple_tests(
     return paramsK_base, baseline_results, baseline_preds, ground_truth
 
 def create_baseline(
-    train_s: list, test_s: list, hidden_sizes: list[int] = [16], idx_demo: int | None = None, verbose: bool = False
+    train_s: list, test_s: list, hidden_sizes: list[int] = [16], idx_demo: int | None = None, verbose: bool = False,
+    seed: int = 0
 ) -> list[dict]:
     """
     Train a baseline MLP on `train_s` and report per-scenario NRMSE on `test_s`.
+
+    `seed` controls the MLP's random initialization (default 0 reproduces the
+    prior hardcoded behavior exactly). Used by multi-seed uncertainty sweeps
+    (see 6a_seed_uncertainty_sweep) to vary emulator-training randomness.
     """
 
     def eval_test_nrmse_by_scenario(params, test_list):
@@ -1488,7 +1527,7 @@ def create_baseline(
     Xtr = jnp.concatenate([X for (X, _, _) in train_s], axis=0).astype(jnp.float32)  # (N, 4)
     ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
 
-    key    = jax.random.PRNGKey(0)
+    key    = jax.random.PRNGKey(seed)
     input_dim = Xtr.shape[1]
 
     params0 = init_mlp_params(key, input_dim=input_dim, hidden_sizes=hidden_sizes)
@@ -1691,13 +1730,17 @@ def CS3_hist_modifier(scen_name: str, years_hist: jnp.ndarray, emis_hist_dict: d
 
 def generate_init_params_and_train_data(
     agents: tuple, active_agents: tuple, test_scen: str, hidden_sizes: list[int] = [16],
-    idx_demo: int | None = None, verbose: bool = False, mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0)
+    idx_demo: int | None = None, verbose: bool = False, mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    seed: int = 0
 ) -> tuple[list[dict], dict]:
     """
     Notebook-facing wrapper: build the tier1/tier2 train/test split (via
     utils_FaIR_JAX.generate_train_test), train the initial baseline MLP params
     (create_baseline) used to seed optimize_emissions_inverse, and print a
     gradient sanity check (test_get_grad) for `test_scen`.
+
+    `seed` controls the MLP's random initialization (default 0 reproduces the
+    prior hardcoded behavior exactly); forwarded to create_baseline.
     Returns (params0, emis_dict_train_JAX).
     """
 
@@ -1707,7 +1750,7 @@ def generate_init_params_and_train_data(
     test_data = build_dataset_from_runfair_dict(emis_dict_test_JAX, mode=mode, ema_windows_years=ema_windows_years)
     train_s, test_s, stats = split_and_scale(train_data, test_data)
 
-    params0 = create_baseline(train_s, test_s, hidden_sizes=hidden_sizes, idx_demo=idx_demo, verbose=verbose)
+    params0 = create_baseline(train_s, test_s, hidden_sizes=hidden_sizes, idx_demo=idx_demo, verbose=verbose, seed=seed)
     test_get_grad(test_scen, params0, emis_dict_train_JAX, train_data, test_data, active_agents=active_agents, mode=mode)
 
     return params0, emis_dict_train_JAX
@@ -1752,24 +1795,31 @@ def generate_eval_data(
 
 def generate_and_eval_baseline_emulator(
     emis_dict_train: dict, eval_sets: dict, save_path: str | None = None, verbose: bool = False,
-    hidden_sizes: list[int] = [16], mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0)
+    hidden_sizes: list[int] = [16], mode: str = 'FaIR', ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    seed: int = 0, K: int = 400, lr: float = 5e-2, weight_decay: float = 1e-2,
 ) -> tuple[dict, dict, dict]:
     """
     Notebook-facing wrapper around evaluate_baseline_over_multiple_tests: train
     the baseline emulator on emis_dict_train, evaluate NRMSE on every eval_sets
     entry, optionally pickle baseline_results to save_path, optionally print a
-    per-scenario summary. Returns (baseline_results, baseline_pred_delT, ground_truth_delT).
+    per-scenario summary. `seed` controls the baseline MLP's random
+    initialization (default 0 reproduces the prior hardcoded behavior exactly).
+    `K`/`lr`/`weight_decay` are the baseline's own training hyperparameters
+    (independently tunable from the optimized emulator's - see Stage 6e,
+    data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json);
+    defaults reproduce the prior hardcoded values exactly.
+    Returns (baseline_results, baseline_pred_delT, ground_truth_delT).
     """
 
     paramsK_base, baseline_results, baseline_pred_delT, ground_truth_delT = evaluate_baseline_over_multiple_tests(
     emis_dict_train=emis_dict_train,
     eval_sets=eval_sets,
     historical_name="historical",
-    key=jax.random.PRNGKey(0),
+    key=jax.random.PRNGKey(seed),
     hidden_sizes=hidden_sizes,
-    K=400,
-    lr=5e-2,
-    weight_decay=1e-2,
+    K=K,
+    lr=lr,
+    weight_decay=weight_decay,
     mode=mode,
     ema_windows_years=ema_windows_years
 )
@@ -1802,6 +1852,9 @@ def run_inverse_experiment_setup(
     DAMIP: bool = False,
     GeoMIP: bool = False,
     baseline_save_path: str | None = None,
+    seed: int = 0,
+    baseline_K: int = 400, baseline_lr: float = 5e-2, baseline_weight_decay: float = 1e-2,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
 ) -> dict:
     """
     Shared setup for the 3x/4a/SI_1 inverse-optimization companion scripts and
@@ -1811,18 +1864,39 @@ def run_inverse_experiment_setup(
     (generate_and_eval_baseline_emulator) that every inverse-optimization
     experiment in the notebook is compared against.
 
+    `seed` controls MLP random initialization and is passed to *both*
+    generate_init_params_and_train_data and generate_and_eval_baseline_emulator,
+    so the optimized-emissions emulator and the baseline emulator keep starting
+    from the same initial params within a given seed (the existing fairness
+    property documented in PROGRESS.md) while varying together across seeds
+    (used by 6a_seed_uncertainty_sweep). Default 0 reproduces prior behavior.
+
+    `baseline_K`/`baseline_lr`/`baseline_weight_decay` are the baseline
+    emulator's own, independently-tunable training hyperparameters (see
+    Stage 6e); defaults reproduce the prior hardcoded values exactly.
+
+    `ema_windows_years` is forwarded to both generate_init_params_and_train_data
+    and generate_and_eval_baseline_emulator so the baseline emulator's features
+    can be matched to whatever EMA convention the caller needs to compare
+    against (e.g. Figure 4's optimized-emulator re-evaluation - see
+    regenerate_fig4_co2_only_cache). Default reproduces the prior hardcoded
+    value exactly.
+
     Returns a dict with keys: agents, active_agents, mode, params0,
     emis_dict_train_JAX, eval_sets, baseline_results, baseline_pred_delT,
     ground_truth_delT. Pass this dict straight into run_inverse_experiment.
     """
     params0, emis_dict_train_JAX = generate_init_params_and_train_data(
         agents, active_agents, test_scen, hidden_sizes=hidden_sizes,
-        idx_demo=idx_demo, verbose=verbose, mode=mode,
+        idx_demo=idx_demo, verbose=verbose, mode=mode, seed=seed,
+        ema_windows_years=ema_windows_years,
     )
     eval_sets, *_ = generate_eval_data(agents, CS3=CS3, DAMIP=DAMIP, GeoMIP=GeoMIP)
     baseline_results, baseline_pred_delT, ground_truth_delT = generate_and_eval_baseline_emulator(
         eval_sets["Tier 1"], eval_sets, save_path=baseline_save_path,
-        verbose=verbose, hidden_sizes=hidden_sizes, mode=mode,
+        verbose=verbose, hidden_sizes=hidden_sizes, mode=mode, seed=seed,
+        K=baseline_K, lr=baseline_lr, weight_decay=baseline_weight_decay,
+        ema_windows_years=ema_windows_years,
     )
     return {
         "agents": agents,
@@ -1883,6 +1957,8 @@ def run_inverse_experiment(
     smoothness_weight: float = 0.0,
     active_agents: tuple[str, ...] | None = None,
     mode: str | None = None,
+    batch_size: int | None = None,
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0),
 ) -> dict:
     """
     Run one optimize_emissions_inverse experiment against `group` - either
@@ -1933,6 +2009,8 @@ def run_inverse_experiment(
         checkpoint_every=checkpoint_every,
         resume_if_exists=resume_if_exists,
         preds_every=preds_every,
+        batch_size=batch_size,
+        key=key,
     )
 
 # ==================================================================
@@ -2504,27 +2582,12 @@ def load_fig3_single_forcing_data(agents: list[str] = ['co2', 'ch4', 'n2o', 'Sul
     labels = ['(a) CO$_2$', '(b) CH$_4$', '(c) N$_2$O', '(d) Sulfur', '(e) BC']
     return {"results_inverse": results_inverse, "results_baseline": results_baseline, "labels": labels}
 
-
-def load_fig4_multi_forcing_data(
-    path_inverse: str = 'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
-    path_baseline: str = 'checkpoints/multi/baseline_all_agents_subset.pkl',
-) -> dict:
-    """
-    Multi-agent inverse vs. baseline NRMSE (Figure 4) for
-    utils_plotting.plot_rmse_comparison_multi. Returns {'results', 'baseline_error'}.
-    """
-    results = load_inverse_ckpt(path_inverse)
-    with open(path_baseline, "rb") as f:
-        baseline_error = pickle.load(f)['Tier 1']['mean']
-    return {"results": results, "baseline_error": baseline_error}
-
-
-def regenerate_fig5_all_agents_cache(
+def regenerate_fig4_all_agents_cache(
     save_path: str = 'data/plotting/optimal_all_agents_subset.pkl',
 ) -> dict:
     """
     Recompute the all-agents optimal-emulator NRMSE summary used by the
-    Figure-5 performance-summary bar chart and overwrite `save_path`'s cache.
+    Figure-4 performance-summary bar chart and overwrite `save_path`'s cache.
 
     Not called by default from the notebook - load_fig5_data() reads the
     existing cache instead. Call this only to refresh
@@ -2566,15 +2629,102 @@ def regenerate_fig5_all_agents_cache(
 
     return optimal_results_all
 
+def regenerate_fig4_co2_only_cache(
+    checkpoint_dir: str = 'checkpoints/co2_retuned',
+    baseline_save_path: str = 'data/plotting/baseline_co2_only_retuned.pkl',
+    optimal_save_path: str = 'data/plotting/optimal_co2_only_retuned.pkl',
+    K_inner: float = 400, lr_inner: float = 5e-2, wd_inner: float = 1e-2,
+    baseline_K: int = 400, baseline_lr: float = 5e-2, baseline_weight_decay: float = 1e-2,
+    seed: int = 0,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+) -> tuple[dict, dict]:
+    """
+    Recompute the CO2-only baseline/optimal-emulator NRMSE summaries used by
+    the Figure-4 performance-summary bar chart's "(a) CO2-only" panel, and
+    write both to save_path (does NOT overwrite the original
+    data/plotting/{baseline,optimal}_co2_only.pkl - use distinct paths so old
+    and new results stay independently available, matching Stage 0c's
+    checkpoints/co2_retuned/ convention).
 
-def load_fig5_data(
+    `K_inner`/`lr_inner`/`wd_inner` are the *inner-loop* hyperparameters used
+    to train the fresh evaluation-time emulator on each checkpoint's final
+    optimized emissions (evaluate_optimal_emulator's own K/lr/weight_decay) -
+    these should match whatever inner-loop hyperparameters actually produced
+    the checkpoints in `checkpoint_dir` (Stage 0b's best_config_unified.json
+    for checkpoints/co2_retuned/), NOT the baseline's own hyperparameters.
+    `baseline_K`/`baseline_lr`/`baseline_weight_decay` are the baseline
+    emulator's own, separately-tunable hyperparameters (Stage 6e's
+    best_baseline_config_K400.json for the retuned baseline).
+
+    `ema_windows_years` is forwarded to both the baseline's setup (via
+    run_inverse_experiment_setup) and evaluate_optimal_emulator's fresh
+    retrain/eval, so both sides of the comparison use one consistent EMA
+    convention. IMPORTANT (temporary, pending a real fix): the checkpoints
+    in `checkpoint_dir` were themselves produced by optimize_emissions_inverse,
+    which trains on ema_windows_years=(5,30,50) (its own default) but - due to
+    a live bug - always *evaluates* its internal test/error signal on
+    build_valid's hardcoded (5,30,100), regardless of what's passed to it. So
+    (5,30,100) here (this function's own long-standing default) does NOT
+    match what the checkpoints were actually optimized against, and produces
+    an artificially inflated (much worse-looking) NRMSE for the optimized
+    emulator. Passing ema_windows_years=(5,30,50) instead reproduces the
+    Stage 0b/6e "gap survives" numbers (best_config_unified.json /
+    REVISIONS.md's gap-persistence tables) almost exactly - confirmed
+    directly, e.g. CO2-only Tier 1: 0.175 at (5,30,100) vs. 0.0465 at
+    (5,30,50), vs. 0.0420-0.0455 from Stage 0b/6e's own internal scoring.
+    Use (5,30,50) here until optimize_emissions_inverse's build_valid call is
+    fixed to actually respect its own ema_windows_years parameter (then this
+    default should be revisited too).
+
+    Call this only to refresh the cache after new CO2-only inverse-
+    optimization checkpoints are produced upstream (Stage 0c).
+    """
+    setup = run_inverse_experiment_setup(
+        ['CO2'], ('CO2',), mode='FaIR', CS3=True, DAMIP=False, GeoMIP=False,
+        idx_demo=None, seed=seed,
+        baseline_K=baseline_K, baseline_lr=baseline_lr, baseline_weight_decay=baseline_weight_decay,
+        ema_windows_years=ema_windows_years,
+    )
+
+    training_paths = [
+        f'{checkpoint_dir}/inverse_constant_tier1_co2_only.pkl',
+        f'{checkpoint_dir}/inverse_constant_tier2_co2_only.pkl',
+        f'{checkpoint_dir}/inverse_constant_DECK_co2_only.pkl',
+        f'{checkpoint_dir}/inverse_constant_CS3_co2_only.pkl',
+        f'{checkpoint_dir}/inverse_constant_all_co2_only.pkl',
+    ]
+    train_scenarios = ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All']
+    optimal_results_co2 = evaluate_optimal_emulator(
+        training_paths=training_paths,
+        train_scenarios=train_scenarios,
+        eval_sets=setup["eval_sets"],
+        params0=setup["params0"],
+        active_agents=('CO2',),
+        inactive_mode="zeros",
+        historical_name="historical",
+        key=jax.random.PRNGKey(seed),
+        K=K_inner,
+        lr=lr_inner,
+        weight_decay=wd_inner,
+        mode='FaIR',
+        ema_windows_years=ema_windows_years,
+    )
+
+    with open(baseline_save_path, "wb") as f:
+        pickle.dump(setup["baseline_results"], f)
+    with open(optimal_save_path, "wb") as f:
+        pickle.dump(optimal_results_co2, f)
+
+    return setup["baseline_results"], optimal_results_co2
+
+def load_fig4_data(
     baseline_path_co2: str = 'data/plotting/baseline_co2_only.pkl',
     optimal_path_co2: str = 'data/plotting/optimal_co2_only.pkl',
     baseline_path_all: str = 'data/plotting/baseline_all_agents_subset.pkl',
     optimal_path_all: str = 'data/plotting/optimal_all_agents_subset.pkl',
 ) -> dict:
     """
-    Load the cached baseline/optimal-emulator NRMSE summaries (Figure 5:
+    Load the cached baseline/optimal-emulator NRMSE summaries (Figure 4:
     performance summary across optimization priorities) for
     utils_plotting.plot_vertical_stacked_bars.
     """
@@ -2593,6 +2743,18 @@ def load_fig5_data(
         "figname": 'performance_summary',
     }
 
+def load_fig5_multi_forcing_data(
+    path_inverse: str = 'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
+    path_baseline: str = 'checkpoints/multi/baseline_all_agents_subset.pkl',
+) -> dict:
+    """
+    Multi-agent inverse vs. baseline NRMSE (Figure 5) for
+    utils_plotting.plot_rmse_comparison_multi. Returns {'results', 'baseline_error'}.
+    """
+    results = load_inverse_ckpt(path_inverse)
+    with open(path_baseline, "rb") as f:
+        baseline_error = pickle.load(f)['Tier 1']['mean']
+    return {"results": results, "baseline_error": baseline_error}
 
 def regenerate_fig6_individual_effects_cache(save_dir: str = 'data/plotting') -> dict:
     """

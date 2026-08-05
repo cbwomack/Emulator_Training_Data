@@ -73,3 +73,6 @@ dmypy.json
 .DS_Store
 
 PROGRESS.md
+REVISIONS.md
+main.tex
+supplement.tex

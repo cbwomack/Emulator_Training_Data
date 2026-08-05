@@ -43,7 +43,7 @@ def main():
     args = parser.parse_args()
 
     if args.figure in (None, "5"):
-        utils_inverse.regenerate_fig5_all_agents_cache()
+        utils_inverse.regenerate_fig4_all_agents_cache()
         print("Saved data/plotting/optimal_all_agents_subset.pkl")
     if args.figure in (None, "6"):
         utils_inverse.regenerate_fig6_individual_effects_cache()
