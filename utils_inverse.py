@@ -14,6 +14,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import xarray as xr
+import json
+from pathlib import Path
 
 # JAX
 import jax
@@ -2716,6 +2718,90 @@ def regenerate_fig4_co2_only_cache(
         pickle.dump(optimal_results_co2, f)
 
     return setup["baseline_results"], optimal_results_co2
+
+def regenerate_fig4_co2_only_cache_seed_sweep(
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str = 'checkpoints/co2_retuned/seed_sweep',
+    tag: str = 'co2_only',
+    unified_config_path: str = 'data/SI_results/hp_retune/best_config_unified.json',
+    baseline_config_path: str = 'data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json',
+    out_path: str = 'data/SI_results/seed_uncertainty/fig4_seed_spread_co2_only.pkl',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+) -> dict[int, dict]:
+    """
+    Multi-seed companion to regenerate_fig4_co2_only_cache: for each seed,
+    rebuilds that seed's own (baseline_results, optimal_results) pair - the
+    baseline via run_inverse_experiment_setup(seed=seed, ...) (the Stage 0
+    "fairness property" that seeds params0 and the baseline emulator
+    together, so the baseline varies across seeds exactly like the optimized
+    emulator does, no separate baseline-sweep code needed), the optimal
+    emulator via evaluate_optimal_emulator against that seed's own
+    checkpoints_dir/inverse_constant_{group}_{tag}_seed{seed}.pkl checkpoints
+    (written by scripts/0c_regenerate_checkpoints_co2.py's multi-seed mode).
+
+    K_inner/lr_inner/wd_inner and baseline_K/lr/weight_decay are read from
+    Stage 0b/6e's tuned config JSONs by default - the SAME configs
+    0c_regenerate_checkpoints_co2.py used to produce the checkpoints being
+    evaluated here (unlike scripts/6a_seed_uncertainty_sweep.py's older
+    compute_fig4_eval_spread, which still reads 3a_inverse_CO2_only.py's
+    stale, never-retuned per-group EXPERIMENTS dict - that function is left
+    untouched/frozen since REVISIONS.md already marks it superseded).
+
+    Unlike that older prototype (which reused ONE fixed shared baseline for
+    every seed), this caches BOTH baseline and optimal per seed -
+    {seed: {"baseline": ..., "optimal": ...}} - so the plotting layer can
+    compute pct-improvement using each seed's own baseline, not a shared one.
+
+    H-ext is excluded (Figure 2's single-scenario example, not part of
+    Figure 4). Call this only after the multi-seed checkpoints exist on disk
+    (Stage 0c's cluster rerun); raises FileNotFoundError otherwise.
+    """
+    unified_cfg = json.load(open(unified_config_path))["config"]
+    baseline_cfg = json.load(open(baseline_config_path))["config"]
+
+    groups = ['tier1', 'tier2', 'DECK', 'CS3', 'all']
+    train_scenarios = ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All']
+
+    all_results = {}
+    for seed in seeds:
+        setup = run_inverse_experiment_setup(
+            ['CO2'], ('CO2',), mode='FaIR', CS3=True, DAMIP=False, GeoMIP=False,
+            idx_demo=None, seed=seed,
+            baseline_K=baseline_cfg["K"], baseline_lr=baseline_cfg["lr"],
+            baseline_weight_decay=baseline_cfg["weight_decay"],
+            ema_windows_years=ema_windows_years,
+        )
+
+        training_paths = [f'{checkpoint_dir}/inverse_constant_{g}_{tag}_seed{seed}.pkl' for g in groups]
+        for p in training_paths:
+            if not Path(p).exists():
+                raise FileNotFoundError(
+                    f"{p} missing - run scripts/0c_regenerate_checkpoints_co2.py --seed {seed} first"
+                )
+
+        optimal_results = evaluate_optimal_emulator(
+            training_paths=training_paths,
+            train_scenarios=train_scenarios,
+            eval_sets=setup["eval_sets"],
+            params0=setup["params0"],
+            active_agents=('CO2',),
+            inactive_mode="zeros",
+            historical_name="historical",
+            key=jax.random.PRNGKey(seed),
+            K=unified_cfg["K_inner"],
+            lr=unified_cfg["lr_inner"],
+            weight_decay=unified_cfg["wd_inner"],
+            mode='FaIR',
+            ema_windows_years=ema_windows_years,
+        )
+
+        all_results[seed] = {"baseline": setup["baseline_results"], "optimal": optimal_results}
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(all_results, f)
+
+    return all_results
 
 def load_fig4_data(
     baseline_path_co2: str = 'data/plotting/baseline_co2_only.pkl',

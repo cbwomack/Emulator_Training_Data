@@ -1041,21 +1041,34 @@ def plot_single_heatmap(baseline_results: dict,
 
   return
 
-def plot_grouped_improvement_bars(baseline_results: dict,
-                                  optimized_results: dict,
-                                  train_scenarios: list[str],
-                                  test_scenarios: list[str],
-                                  x_labels: list[str],
-                                  leg_labels: list[str],
-                                  weights: list[int],
+def plot_grouped_improvement_bars(baseline_results: dict = None,
+                                  optimized_results: dict = None,
+                                  train_scenarios: list[str] = None,
+                                  test_scenarios: list[str] = None,
+                                  x_labels: list[str] = None,
+                                  leg_labels: list[str] = None,
+                                  weights: list[int] = None,
                                   ax: plt.Axes = None,
                                   long_title: str = '',
                                   show_legend: bool = True,
                                   show_xlabel: bool = True,
                                   save: bool = False,
                                   figname: str = '',
-                                  n_plots: int=1) -> None:
-    """Grouped horizontal bar chart of % NRMSE improvement (optimized vs. baseline), grouped by test scenario."""
+                                  n_plots: int=1,
+                                  seed_baseline_results: list[dict] = None,
+                                  seed_optimized_results: list[dict] = None) -> None:
+    """
+    Grouped horizontal bar chart of % NRMSE improvement (optimized vs. baseline), grouped by test scenario.
+
+    `seed_baseline_results`/`seed_optimized_results` (both optional, default None):
+    when both are given (equal-length lists, one baseline/optimized result dict
+    per seed - each shaped exactly like `baseline_results`/`optimized_results`),
+    the bars show the mean % improvement across seeds with error bars (+/- 1 std),
+    computing pct-improvement per seed against THAT seed's own baseline (not a
+    single shared one). `baseline_results`/`optimized_results` are ignored in this
+    mode. Leaving both at None (the default) reproduces the exact prior
+    single-point-estimate behavior - fully backward-compatible.
+    """
 
     # 0. Handle Axis Creation (Backward Compatibility)
     # ----------------------------------------------
@@ -1064,38 +1077,50 @@ def plot_grouped_improvement_bars(baseline_results: dict,
         is_standalone = True
         fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
 
-    # 1. Organize Data (Your logic preserved)
-    # ---------------------------------------
+    # 1. Organize Data
+    # ----------------
     n_test = len(test_scenarios)
     n_opts = len(train_scenarios)
+    w_arr = np.array(weights)
 
-    base_errors = np.zeros(n_test)
-    opt_errors = np.zeros((n_test, n_opts))
+    seed_mode = seed_baseline_results is not None and seed_optimized_results is not None
 
-    for i, test_key in enumerate(test_scenarios):
-        try:
-            base_errors[i] = baseline_results[test_key]['mean']
-        except KeyError:
-            base_errors[i] = np.nan
+    def _pct_improvement_for(baseline_res, optimized_res):
+        base_errors = np.zeros(n_test)
+        opt_errors = np.zeros((n_test, n_opts))
 
-    for j, train_key in enumerate(train_scenarios):
         for i, test_key in enumerate(test_scenarios):
             try:
-                opt_errors[i, j] = optimized_results[train_key][test_key]['mean']
+                base_errors[i] = baseline_res[test_key]['mean']
             except KeyError:
-                opt_errors[i, j] = np.nan
+                base_errors[i] = np.nan
 
-    w_arr = np.array(weights)
-    avg_base_error = np.average(base_errors, weights=w_arr)
-    avg_opt_errors = np.average(opt_errors, axis=0, weights=w_arr)
+        for j, train_key in enumerate(train_scenarios):
+            for i, test_key in enumerate(test_scenarios):
+                try:
+                    opt_errors[i, j] = optimized_res[train_key][test_key]['mean']
+                except KeyError:
+                    opt_errors[i, j] = np.nan
 
-    # 2. Calculate Percent Improvement
-    # --------------------------------
-    pct_improvement = (base_errors[:, None] - opt_errors) / base_errors[:, None]
-    avg_improvement = (avg_base_error - avg_opt_errors) / avg_base_error
+        avg_base_error = np.average(base_errors, weights=w_arr)
+        avg_opt_errors = np.average(opt_errors, axis=0, weights=w_arr)
 
-    plot_data = np.vstack([pct_improvement, avg_improvement])
-    plot_data = plot_data * 100
+        pct_improvement = (base_errors[:, None] - opt_errors) / base_errors[:, None]
+        avg_improvement = (avg_base_error - avg_opt_errors) / avg_base_error
+
+        return np.vstack([pct_improvement, avg_improvement]) * 100
+
+    pct_std = None
+    if seed_mode:
+        n_seeds = len(seed_baseline_results)
+        stacked = np.stack([
+            _pct_improvement_for(seed_baseline_results[s], seed_optimized_results[s])
+            for s in range(n_seeds)
+        ], axis=0)
+        plot_data = stacked.mean(axis=0)
+        pct_std = stacked.std(axis=0)
+    else:
+        plot_data = _pct_improvement_for(baseline_results, optimized_results)
 
     row_labels = leg_labels + ['Avg.']
     n_rows = len(row_labels)
@@ -1124,6 +1149,8 @@ def plot_grouped_improvement_bars(baseline_results: dict,
 
         bars = ax.bar(x_positions + offset, row_values,
                       width=bar_width,
+                      yerr=pct_std[i] if pct_std is not None else None,
+                      capsize=2,
                       label=label,
                       edgecolor='black',
                       linewidth=0.7,
@@ -1242,10 +1269,20 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
                                weights: list[int],
                                titles: list[str] = None,
                                save: bool = False,
-                               figname: str = 'stacked_comparison') -> None:
+                               figname: str = 'stacked_comparison',
+                               seed_baseline_results_list: list[list[dict] | None] = None,
+                               seed_optimized_results_list: list[list[dict] | None] = None) -> None:
     """
     Creates N vertical subplots using the plot_grouped_improvement_bars logic.
     Assumes baseline_results_list and optimized_results_list have the same length.
+
+    `seed_baseline_results_list`/`seed_optimized_results_list` (optional, default
+    None): one entry per panel, each either None (that panel plots as a normal
+    single point estimate) or a list of per-seed result dicts (that panel plots
+    mean +/- seed spread via plot_grouped_improvement_bars' seed mode) - lets
+    different panels use different modes in the same figure (e.g. a CO2-only
+    panel with seed spread next to a Multi-agent panel that isn't multi-seeded
+    yet). Leaving both at None (the default) is fully backward-compatible.
     """
 
     n_plots = len(baseline_results_list)
@@ -1265,6 +1302,8 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
         curr_base = baseline_results_list[i]
         curr_opt = optimized_results_list[i]
         curr_title = titles[i] if titles and i < len(titles) else ''
+        curr_seed_base = seed_baseline_results_list[i] if seed_baseline_results_list else None
+        curr_seed_opt = seed_optimized_results_list[i] if seed_optimized_results_list else None
 
         # Determine layout flags
         is_first = (i == 0)
@@ -1284,6 +1323,8 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
             show_legend=is_first,
             show_xlabel=is_last,
             save=False,
+            seed_baseline_results=curr_seed_base,
+            seed_optimized_results=curr_seed_opt,
             n_plots=n_plots
         )
 

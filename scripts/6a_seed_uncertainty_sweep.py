@@ -30,6 +30,12 @@ Usage:
 
     # Cheap axis (emulator-only retrains on an already-optimized trajectory):
     python 6a_seed_uncertainty_sweep.py --mode sweep --axis cheap --script 3a_inverse_CO2_only.py --n-cheap-seeds 20
+
+    # Figure-4 seed spread, retuned (2026-08-05+): reads Stage 0b/6e's tuned
+    # configs and checkpoints/co2_retuned/seed_sweep/ (written by
+    # scripts/0c_regenerate_checkpoints_co2.py's multi-seed mode) - the
+    # going-forward replacement for --mode fig4-eval, which is frozen/stale:
+    python 6a_seed_uncertainty_sweep.py --mode fig4-eval-retuned --n-expensive-seeds 5
 """
 import os
 import sys
@@ -323,9 +329,28 @@ def compute_fig4_eval_spread(script_path: Path, seeds: list[int]) -> dict:
     return all_results
 
 
+def compute_fig4_seed_spread_retuned(seeds: list[int]) -> dict:
+    """
+    Thin wrapper around utils_inverse.regenerate_fig4_co2_only_cache_seed_sweep -
+    the retuned, reconciled replacement for compute_fig4_eval_spread above.
+
+    Unlike compute_fig4_eval_spread (which reads 3a_inverse_CO2_only.py's
+    stale, never-retuned per-group EXPERIMENTS dict and checkpoints/co2/
+    seed_sweep/, and reuses one fixed shared baseline for every seed), this
+    reads Stage 0b/6e's tuned config JSONs (best_config_unified.json /
+    best_baseline_config_K400.json - the same ones
+    scripts/0c_regenerate_checkpoints_co2.py's multi-seed mode used to
+    produce checkpoints/co2_retuned/seed_sweep/), and caches a per-seed
+    baseline alongside the per-seed optimal result. compute_fig4_eval_spread
+    itself is left untouched/frozen per REVISIONS.md (already marked
+    superseded) - this is the new, going-forward path.
+    """
+    return utils_inverse.regenerate_fig4_co2_only_cache_seed_sweep(seeds=seeds)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", choices=["pilot", "sweep", "fig4-eval"], default="pilot")
+    parser.add_argument("--mode", choices=["pilot", "sweep", "fig4-eval", "fig4-eval-retuned"], default="pilot")
     parser.add_argument("--axis", choices=["expensive", "cheap"], default="expensive")
     parser.add_argument("--script", default="3a_inverse_CO2_only.py",
                          help="Which existing 3x/SIx companion script's EXPERIMENTS dict to sweep")
@@ -341,6 +366,9 @@ def main():
     script_path = PROJECT_ROOT / "scripts" / args.script
     if args.mode == "fig4-eval":
         compute_fig4_eval_spread(script_path, seeds=list(range(args.n_expensive_seeds)))
+        return
+    if args.mode == "fig4-eval-retuned":
+        compute_fig4_seed_spread_retuned(seeds=list(range(args.n_expensive_seeds)))
         return
 
     if args.axis == "expensive":
