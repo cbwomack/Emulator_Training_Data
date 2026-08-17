@@ -40,6 +40,18 @@ DEFAULT_BASELINE_SAVE_PATH = None
 # PROGRESS.md for the extraction method. Preserved as-is, including known
 # oddities (e.g. duplicate 'all' entries, "2"-suffixed checkpoint tags)
 # rather than silently "fixing" them; those are flagged for Phase 5.
+#
+# tier2/DECK/CS3/all added 2026-08-11 (Phase 0 extension to Sulfur): the
+# original extraction only ever captured H-ext/tier1, but SI Fig 6 and
+# Figure 3 both need the full 6-group set every other agent has. `T`/
+# `filter_hist` per group are copied from the pattern confirmed identical
+# across every agent that does have all 6 groups (CO2/N2O/BC): tier2
+# T=751/filter_hist=True, DECK T=751/False, CS3 T=751/True, all T=751/False
+# - these are experiment-definition fields, not tuned hyperparameters, so
+# they transfer directly. `step_size`/`momentum`/etc. below are placeholders
+# (copied from tier1) - irrelevant in practice, since Stage 0c's checkpoint
+# regeneration overwrites every tunable field with the Stage 0b unified
+# per-agent config and only reads init_cond/T/filter_hist from here.
 EXPERIMENTS = {
     'H-ext':     {
         'group': 'H-ext',
@@ -73,6 +85,78 @@ EXPERIMENTS = {
         'T': 751,
         'filter_hist': False,
         'smoothness_weight': 5e-06,
+        'checkpoint_every': 50,
+        'resume_if_exists': True,
+        'preds_every': 50,
+    },
+    'tier2':     {
+        'group': 'tier2',
+        'tag': 'Sulfur_only',
+        'num_updates': 1000,
+        'step_size': 10000.0,
+        'momentum': 0.9,
+        'nesterov': True,
+        'K_inner': 400,
+        'lr_inner': 0.05,
+        'wd_inner': 0.01,
+        'init_cond': 'constant',
+        'T': 751,
+        'filter_hist': True,
+        'smoothness_weight': 0.0,
+        'checkpoint_every': 50,
+        'resume_if_exists': True,
+        'preds_every': 50,
+    },
+    'DECK':     {
+        'group': 'DECK',
+        'tag': 'Sulfur_only',
+        'num_updates': 1000,
+        'step_size': 10000.0,
+        'momentum': 0.9,
+        'nesterov': True,
+        'K_inner': 400,
+        'lr_inner': 0.05,
+        'wd_inner': 0.01,
+        'init_cond': 'constant',
+        'T': 751,
+        'filter_hist': False,
+        'smoothness_weight': 0.0,
+        'checkpoint_every': 50,
+        'resume_if_exists': True,
+        'preds_every': 50,
+    },
+    'CS3':     {
+        'group': 'CS3',
+        'tag': 'Sulfur_only',
+        'num_updates': 1000,
+        'step_size': 10000.0,
+        'momentum': 0.9,
+        'nesterov': True,
+        'K_inner': 400,
+        'lr_inner': 0.05,
+        'wd_inner': 0.01,
+        'init_cond': 'constant',
+        'T': 751,
+        'filter_hist': True,
+        'smoothness_weight': 0.0,
+        'checkpoint_every': 50,
+        'resume_if_exists': True,
+        'preds_every': 50,
+    },
+    'all':     {
+        'group': 'all',
+        'tag': 'Sulfur_only',
+        'num_updates': 1000,
+        'step_size': 10000.0,
+        'momentum': 0.9,
+        'nesterov': True,
+        'K_inner': 400,
+        'lr_inner': 0.05,
+        'wd_inner': 0.01,
+        'init_cond': 'constant',
+        'T': 751,
+        'filter_hist': False,
+        'smoothness_weight': 0.0,
         'checkpoint_every': 50,
         'resume_if_exists': True,
         'preds_every': 50,

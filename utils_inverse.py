@@ -1612,12 +1612,24 @@ def evaluate_optimal_emulator(
     weight_decay: float = 1e-2,
     mode: str = 'FaIR',
     ind_effects: bool = False,
-    ema_windows_years: tuple = (5.0, 30.0, 100.0)
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+    batch_size: int | None = None,
 ) -> dict | tuple[dict, dict]:
     """
     For each optimize_emissions_inverse checkpoint in `training_paths` (final U in
     the trajectory), train a fresh MLP on the resulting optimal emissions and
     evaluate NRMSE against every eval_sets entry. Returns results_out
+
+    `batch_size` (default None = full-batch) must match whatever batch_size
+    actually produced the checkpoints in `training_paths`, or this fresh
+    eval-side retrain silently diverges from what the checkpoint's own
+    outer-loop optimization was actually driven by (minibatch vs. full-batch
+    SGD behave very differently at the same lr) - found the hard way via
+    Figure 4's multi-agent panel (2026-08-13): the multi-agent Phase 0
+    winning config uses batch_size=16 (unlike CO2-only's batch_size=null),
+    and leaving this at the old hardcoded full-batch default made the
+    "optimized" emulator look 7-27x WORSE than baseline - not a real
+    finding, just a train/eval inconsistency. See REVISIONS.md.
     (results_out[train_label][eval_set][scenario] = NRMSE, plus 'mean'), and also
     y_hat_all (raw predictions) if ind_effects=True.
     """
@@ -1667,11 +1679,26 @@ def evaluate_optimal_emulator(
         ytr = jnp.concatenate([y for (_, y, _) in train_s], axis=0).astype(jnp.float32)
 
         # 5) Inner Training
-        k1, k2 = jax.random.split(key)
-        in_dim = int(Xtr.shape[1])
-
+        # `key` was silently dropped here (train_mlp_sgd's own key defaulted
+        # to PRNGKey(0) regardless) until 2026-08-13 - invisible whenever
+        # batch_size=None (full-batch, no random minibatch sampling happens -
+        # true for CO2-only and every single-forcing agent's tuned config),
+        # but a real bug for the multi-agent case (batch_size=16): every
+        # seed's fresh retrain here drew IDENTICAL minibatches regardless of
+        # `key`. Pass `key` through UNCHANGED (not fold_in'd per path) - the
+        # checkpoints in `training_paths` were themselves each produced by
+        # optimize_emissions_inverse using this SAME raw key=PRNGKey(seed)
+        # for every group within one seed (0c_regenerate_checkpoints_multi_
+        # fig4.py reuses one key across its whole per-seed group loop, never
+        # folding it per group), so matching that exactly (not a derived
+        # variant) is what let seed 0's fresh retrain reproduce its
+        # checkpoint's own stored training error almost exactly (0.039 vs
+        # 0.0389) - confirmed directly; fold_in(key, i) breaks that match
+        # even for seed 0, since it produces a different key than raw
+        # PRNGKey(seed) even when i=0. See REVISIONS.md.
         paramsK, _ = train_mlp_sgd(
-            params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay
+            params0, Xtr, ytr, K=K, lr=lr, weight_decay=weight_decay,
+            batch_size=batch_size, key=key,
         )
 
         results_out[train_label] = {}
@@ -2584,6 +2611,55 @@ def load_fig3_single_forcing_data(agents: list[str] = ['co2', 'ch4', 'n2o', 'Sul
     labels = ['(a) CO$_2$', '(b) CH$_4$', '(c) N$_2$O', '(d) Sulfur', '(e) BC']
     return {"results_inverse": results_inverse, "results_baseline": results_baseline, "labels": labels}
 
+
+_FIG3_AGENT_TAGS = {'co2': 'co2_only', 'ch4': 'ch4_only', 'n2o': 'n2o_only',
+                    'Sulfur': 'Sulfur_only', 'BC': 'BC_only'}
+
+
+def load_fig3_single_forcing_data_seed_sweep(
+    agents: list[str] = ['co2', 'ch4', 'n2o', 'Sulfur', 'BC'],
+    seeds: list[int] = tuple(range(50)),
+) -> dict:
+    """
+    Multi-seed companion to load_fig3_single_forcing_data: kwargs for
+    utils_plotting.plot_rmse_comparison_single with seed_errors_list/
+    seed_baseline_error_list populated - each agent's tier1-group `errors`
+    trajectory and baseline score, loaded across every seed in `seeds` from
+    checkpoints/{agent}_retuned/seed_sweep/ (written by
+    scripts/0c_regenerate_checkpoints_co2.py for CO2, scripts/
+    0c_regenerate_checkpoints_agent.py --agent X for the other four).
+
+    Raises FileNotFoundError if any agent/seed checkpoint is missing, rather
+    than silently falling back to a single point - a partially-seeded
+    Figure 3 would misleadingly look like some agents are simply "more
+    certain" than others when it's really just missing data.
+    """
+    seed_errors_list, seed_baseline_error_list = [], []
+    for a in agents:
+        tag = _FIG3_AGENT_TAGS[a]
+        checkpoint_dir = f'checkpoints/{a}_retuned/seed_sweep'
+        errs, bases = [], []
+        for seed in seeds:
+            ckpt_path = f'{checkpoint_dir}/inverse_constant_tier1_{tag}_seed{seed}.pkl'
+            baseline_path = f'{checkpoint_dir}/baseline_{tag}_seed{seed}.pkl'
+            if not Path(ckpt_path).exists() or not Path(baseline_path).exists():
+                raise FileNotFoundError(
+                    f"{ckpt_path} or {baseline_path} missing - run "
+                    f"scripts/0c_regenerate_checkpoints_agent.py --agent {a} first "
+                    f"(scripts/0c_regenerate_checkpoints_co2.py for co2)"
+                )
+            errs.append(load_inverse_ckpt(ckpt_path))
+            with open(baseline_path, "rb") as f:
+                bases.append(pickle.load(f)['Tier 1']['mean'])
+        seed_errors_list.append(errs)
+        seed_baseline_error_list.append(bases)
+
+    labels = ['(a) CO$_2$', '(b) CH$_4$', '(c) N$_2$O', '(d) Sulfur', '(e) BC']
+    return {"seed_errors_list": seed_errors_list,
+            "seed_baseline_error_list": seed_baseline_error_list,
+            "labels": labels}
+
+
 def regenerate_fig4_all_agents_cache(
     save_path: str = 'data/plotting/optimal_all_agents_subset.pkl',
 ) -> dict:
@@ -2803,6 +2879,184 @@ def regenerate_fig4_co2_only_cache_seed_sweep(
 
     return all_results
 
+
+def regenerate_fig4_all_agents_cache_seed_sweep(
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str = 'checkpoints/multi_fig4/seed_sweep',
+    tag: str = 'multi_fig4',
+    unified_config_path: str = 'data/SI_results/hp_retune/multi/best_config_unified.json',
+    baseline_config_path: str = 'data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json',
+    out_path: str = 'data/SI_results/seed_uncertainty/fig4_seed_spread_all_agents.pkl',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+) -> dict[int, dict]:
+    """
+    Multi-agent analog of regenerate_fig4_co2_only_cache_seed_sweep, for
+    Figure 4's multi-agent panel - reads checkpoints/multi_fig4/seed_sweep/
+    (scripts/0c_regenerate_checkpoints_multi_fig4.py), the group set
+    {tier1, tier2, DECK, CS3, all} matching CO2-only's own convention
+    exactly (required since plot_vertical_stacked_bars shares one
+    train_scenarios/test_scenarios/x_labels axis across every panel).
+
+    Supersedes checkpoints/multi/*_subset*.pkl - the pre-2026-08-13,
+    January-dated checkpoint family load_fig4_data/load_fig5_multi_
+    forcing_data/regenerate_fig6_individual_effects_cache previously
+    defaulted to, deprecated per user direction (2026-08-13) after being
+    found to have wildly inconsistent per-group update counts (1,401 to
+    20,001). See REVISIONS.md Session Log for the full discovery.
+
+    Uses active_agents=('CO2','CH4','N2O','Sulfur','BC') - the only
+    structural difference from the CO2-only version besides paths/defaults.
+    """
+    unified_cfg = json.load(open(unified_config_path))["config"]
+    baseline_cfg = json.load(open(baseline_config_path))["config"]
+
+    agents = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
+    active_agents = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')
+    groups = ['tier1', 'tier2', 'DECK', 'CS3', 'all']
+    train_scenarios = ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All']
+
+    all_results = {}
+    for seed in seeds:
+        setup = run_inverse_experiment_setup(
+            agents, active_agents, mode='FaIR', CS3=True, DAMIP=False, GeoMIP=False,
+            idx_demo=None, seed=seed,
+            baseline_K=baseline_cfg["K"], baseline_lr=baseline_cfg["lr"],
+            baseline_weight_decay=baseline_cfg["weight_decay"],
+            ema_windows_years=ema_windows_years,
+        )
+
+        training_paths = [f'{checkpoint_dir}/inverse_constant_{g}_{tag}_seed{seed}.pkl' for g in groups]
+        for p in training_paths:
+            if not Path(p).exists():
+                raise FileNotFoundError(
+                    f"{p} missing - run scripts/0c_regenerate_checkpoints_multi_fig4.py "
+                    f"--seed {seed} first"
+                )
+
+        optimal_results = evaluate_optimal_emulator(
+            training_paths=training_paths,
+            train_scenarios=train_scenarios,
+            eval_sets=setup["eval_sets"],
+            params0=setup["params0"],
+            agents=agents,
+            active_agents=active_agents,
+            inactive_mode="zeros",
+            historical_name="historical",
+            key=jax.random.PRNGKey(seed),
+            K=unified_cfg["K_inner"],
+            lr=unified_cfg["lr_inner"],
+            weight_decay=unified_cfg["wd_inner"],
+            mode='FaIR',
+            ema_windows_years=ema_windows_years,
+            batch_size=unified_cfg["batch_size"],
+        )
+
+        all_results[seed] = {"baseline": setup["baseline_results"], "optimal": optimal_results}
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(all_results, f)
+
+    return all_results
+
+_AGENT_SEED_SWEEP_TAGS = {"CH4": "ch4_only", "N2O": "n2o_only", "Sulfur": "Sulfur_only", "BC": "BC_only"}
+
+
+def regenerate_SI_extended_results_cache_seed_sweep(
+    agent: str,
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str | None = None,
+    tag: str | None = None,
+    unified_config_path: str | None = None,
+    baseline_config_path: str = None,
+    out_path: str | None = None,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+) -> dict[int, dict]:
+    """
+    Per-agent (CH4/N2O/Sulfur/BC) analog of regenerate_fig4_co2_only_cache_seed_sweep,
+    for SI Fig 6 (extended results, 5 panels CO2/CH4/N2O/Sulfur/BC) instead of
+    Figure 4. For each seed, rebuilds that seed's own (baseline_results,
+    optimal_results) pair - the baseline via run_inverse_experiment_setup(seed=seed,
+    ...) (same Stage 0 fairness property as the CO2 version), the optimal emulator
+    via evaluate_optimal_emulator against that seed's own
+    checkpoints/{agent_lower}_retuned/seed_sweep/inverse_constant_{group}_{tag}_seed{seed}.pkl
+    checkpoints (written by scripts/0c_regenerate_checkpoints_agent.py --agent {agent}).
+
+    `unified_config_path`/`baseline_config_path` default to Stage 0b/0c's own
+    per-agent config JSONs (data/SI_results/hp_retune/{agent}/best_config_unified.json
+    - `baseline_config_path` has no built-in default and must be supplied
+    explicitly, since Stage C's transfer check resolves it per agent, not a
+    fixed path shared across agents).
+
+    Unlike Fig 4's CO2-only cache, this includes all 5 non-H-ext groups
+    (tier1/tier2/DECK/CS3/all) - H-ext is excluded here too, matching Fig 4's
+    convention (H-ext is Figure 2's single-scenario example, not part of the
+    grouped-bar figures).
+    """
+    if baseline_config_path is None:
+        raise ValueError(
+            "baseline_config_path must be given explicitly - Stage C's transfer "
+            "check (scripts/6e_baseline_transfer_check.py) decides, per agent, "
+            "whether to reuse CO2's tuned config or that agent's own dense-search winner."
+        )
+    agent_lower = agent if agent in ("Sulfur", "BC") else agent.lower()
+    if checkpoint_dir is None:
+        checkpoint_dir = f"checkpoints/{agent_lower}_retuned/seed_sweep"
+    if tag is None:
+        tag = _AGENT_SEED_SWEEP_TAGS[agent]
+    if unified_config_path is None:
+        unified_config_path = f"data/SI_results/hp_retune/{agent}/best_config_unified.json"
+    if out_path is None:
+        out_path = f"data/SI_results/seed_uncertainty/SI_extended_seed_spread_{agent}.pkl"
+
+    unified_cfg = json.load(open(unified_config_path))["config"]
+    baseline_cfg = json.load(open(baseline_config_path))["config"]
+
+    groups = ['tier1', 'tier2', 'DECK', 'CS3', 'all']
+    train_scenarios = ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All']
+
+    all_results = {}
+    for seed in seeds:
+        setup = run_inverse_experiment_setup(
+            [agent], (agent,), mode='FaIR', CS3=True, DAMIP=False, GeoMIP=False,
+            idx_demo=None, seed=seed,
+            baseline_K=baseline_cfg["K"], baseline_lr=baseline_cfg["lr"],
+            baseline_weight_decay=baseline_cfg["weight_decay"],
+            ema_windows_years=ema_windows_years,
+        )
+
+        training_paths = [f'{checkpoint_dir}/inverse_constant_{g}_{tag}_seed{seed}.pkl' for g in groups]
+        for p in training_paths:
+            if not Path(p).exists():
+                raise FileNotFoundError(
+                    f"{p} missing - run scripts/0c_regenerate_checkpoints_agent.py "
+                    f"--agent {agent} --seed {seed} first"
+                )
+
+        optimal_results = evaluate_optimal_emulator(
+            training_paths=training_paths,
+            train_scenarios=train_scenarios,
+            eval_sets=setup["eval_sets"],
+            params0=setup["params0"],
+            active_agents=(agent,),
+            inactive_mode="zeros",
+            historical_name="historical",
+            key=jax.random.PRNGKey(seed),
+            K=unified_cfg["K_inner"],
+            lr=unified_cfg["lr_inner"],
+            weight_decay=unified_cfg["wd_inner"],
+            mode='FaIR',
+            ema_windows_years=ema_windows_years,
+        )
+
+        all_results[seed] = {"baseline": setup["baseline_results"], "optimal": optimal_results}
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(all_results, f)
+
+    return all_results
+
 def load_fig4_data(
     baseline_path_co2: str = 'data/plotting/baseline_co2_only.pkl',
     optimal_path_co2: str = 'data/plotting/optimal_co2_only.pkl',
@@ -2830,19 +3084,28 @@ def load_fig4_data(
     }
 
 def load_fig5_multi_forcing_data(
-    path_inverse: str = 'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
-    path_baseline: str = 'checkpoints/multi/baseline_all_agents_subset.pkl',
+    path_inverse: str = 'checkpoints/multi_fig4/seed_sweep/inverse_constant_tier1_multi_fig4_seed0.pkl',
+    path_baseline: str = 'checkpoints/multi_fig4/seed_sweep/baseline_multi_fig4_seed0.pkl',
 ) -> dict:
     """
     Multi-agent inverse vs. baseline NRMSE (Figure 5) for
     utils_plotting.plot_rmse_comparison_multi. Returns {'results', 'baseline_error'}.
+
+    Defaults updated 2026-08-14 to checkpoints/multi_fig4/ (seed 0) - the
+    original checkpoints/multi/*_subset*.pkl family is deprecated (dated
+    January 2026, wildly inconsistent per-group update counts). See
+    REVISIONS.md Session Log.
     """
     results = load_inverse_ckpt(path_inverse)
     with open(path_baseline, "rb") as f:
         baseline_error = pickle.load(f)['Tier 1']['mean']
     return {"results": results, "baseline_error": baseline_error}
 
-def regenerate_fig6_individual_effects_cache(save_dir: str = 'data/plotting') -> dict:
+def regenerate_fig6_individual_effects_cache(
+    save_dir: str = 'data/plotting',
+    unified_config_path: str = 'data/SI_results/hp_retune/multi/best_config_unified.json',
+    baseline_config_path: str = 'data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json',
+) -> dict:
     """
     Recompute the per-agent baseline/optimal-emulator predictions used by the
     individual-effects figure (M-GHG / M-aer / G6sulfur scenarios) and
@@ -2851,25 +3114,51 @@ def regenerate_fig6_individual_effects_cache(save_dir: str = 'data/plotting') ->
     Not called by default from the notebook - load_fig6_data() reads the
     existing cache instead. Call this only to refresh the cache after new
     inverse-optimization checkpoints are produced upstream (Phase 3 scripts).
+
+    Checkpoint paths and hyperparameters updated 2026-08-14: previously read
+    ALL FOUR training_paths from checkpoints/multi/ - 'Opt. Tier 1' from the
+    now-deprecated *_subset* family (Jan 2026, inconsistent update counts),
+    and 'Opt. DAMIP'/'Opt. GeoMIP'/'Opt. All' from the OTHER, separately-
+    stale checkpoints/multi/ family (3b_inverse_all_agents.py's EXPERIMENTS
+    dict, pre-Phase-0 - the exact staleness Stage 6c(b) originally
+    surfaced). Now split across this session's two fresh multi-agent
+    checkpoint families: 'Opt. Tier 1' from checkpoints/multi_fig4/ (matches
+    Figure 4's own tier1 group exactly), 'Opt. DAMIP'/'Opt. GeoMIP'/
+    'Opt. All' from checkpoints/multi_retuned/ (Stage 6c(b)'s family - the
+    only one with DAMIP/GeoMIP-active checkpoints; its 'all' group trains on
+    the full DAMIP+GeoMIP-inclusive scenario mix, appropriate for this
+    figure's own DAMIP/GeoMIP/individual-effects theme, unlike Figure 4's
+    'all' which deliberately excludes DAMIP/GeoMIP for CO2-only comparability
+    - see 0c_regenerate_checkpoints_multi_fig4.py's own docstring). Also now
+    uses the tuned multi-agent unified/baseline configs (K_inner/lr_inner/
+    wd_inner/batch_size, baseline K/lr/weight_decay) instead of the old
+    hardcoded K=400/lr=5e-2/weight_decay=1e-2 defaults - required since
+    evaluate_optimal_emulator's batch_size must match batch_size=16 used to
+    produce these checkpoints (see the batch_size/key fixes in that
+    function's own docstring, REVISIONS.md).
     """
     agents = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
     active_agents = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')
 
+    unified_cfg = json.load(open(unified_config_path))["config"]
+    baseline_cfg = json.load(open(baseline_config_path))["config"]
+
     params0, _ = generate_init_params_and_train_data(
-        agents, active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=1, verbose=False
+        agents, active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=None, verbose=False
     )
     eval_sets_ind_effects, *_ = generate_eval_data(agents, CS3=True, DAMIP=True, GeoMIP=True)
 
     _, y_hat_baseline, y_true_ind_effects = generate_and_eval_baseline_emulator(
         eval_sets_ind_effects["Tier 1"], eval_sets_ind_effects, save_path=None,
-        verbose=False, hidden_sizes=[16]
+        verbose=False, hidden_sizes=[16],
+        K=baseline_cfg["K"], lr=baseline_cfg["lr"], weight_decay=baseline_cfg["weight_decay"],
     )
 
     training_paths_ind_effects = [
-        'checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl',
-        'checkpoints/multi/inverse_constant_DAMIP_all_agents.pkl',
-        'checkpoints/multi/inverse_constant_GeoMIP_all_agents.pkl',
-        'checkpoints/multi/inverse_constant_all_all_agents.pkl',
+        'checkpoints/multi_fig4/seed_sweep/inverse_constant_tier1_multi_fig4_seed0.pkl',
+        'checkpoints/multi_retuned/seed_sweep/inverse_sine_DAMIP_all_agents_seed0.pkl',
+        'checkpoints/multi_retuned/seed_sweep/inverse_sine_GeoMIP_all_agents_seed0.pkl',
+        'checkpoints/multi_retuned/seed_sweep/inverse_sine_all_all_agents_seed0.pkl',
     ]
     train_scenarios_ind_effects = ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All']
     _, y_hat_ind_effects = evaluate_optimal_emulator(
@@ -2881,9 +3170,10 @@ def regenerate_fig6_individual_effects_cache(save_dir: str = 'data/plotting') ->
         inactive_mode="zeros",
         historical_name="historical",
         key=jax.random.PRNGKey(0),
-        K=400,
-        lr=5e-2,
-        weight_decay=1e-2,
+        K=unified_cfg["K_inner"],
+        lr=unified_cfg["lr_inner"],
+        weight_decay=unified_cfg["wd_inner"],
+        batch_size=unified_cfg["batch_size"],
         ind_effects=True,
     )
 
@@ -3134,4 +3424,55 @@ def load_SI_extended_results_data(agent_lower_list: list[str] = ['co2', 'ch4', '
         "weights": [7, 5, 2, 2],
         "titles": None,
         "figname": 'SI_extended_results',
+    }
+
+
+def load_SI_extended_results_data_seed_sweep(
+    agent_lower_list: list[str] = ['co2', 'ch4', 'n2o', 'Sulfur', 'BC'],
+    co2_cache_path: str = 'data/SI_results/seed_uncertainty/fig4_seed_spread_co2_only.pkl',
+    other_cache_path_template: str = 'data/SI_results/seed_uncertainty/SI_extended_seed_spread_{agent}.pkl',
+) -> dict:
+    """
+    Multi-seed companion to load_SI_extended_results_data: kwargs for
+    utils_plotting.plot_vertical_stacked_bars with seed_baseline_results_list/
+    seed_optimized_results_list populated for all 5 agents - CO2 reuses Figure
+    4's already-built cache (data/SI_results/seed_uncertainty/fig4_seed_spread_co2_only.pkl,
+    same {seed: {"baseline":..., "optimal":...}} shape); CH4/N2O/Sulfur/BC use
+    their own Stage E caches from regenerate_SI_extended_results_cache_seed_sweep.
+
+    Raises FileNotFoundError if any agent's cache is missing, rather than
+    silently falling back to a single-point estimate for that panel - a
+    partially-seeded SI Fig 6 would misleadingly look like some agents are
+    simply "more certain" than others when it's really just missing data.
+    """
+    _agent_map = {'co2': 'CO2', 'ch4': 'CH4', 'n2o': 'N2O', 'Sulfur': 'Sulfur', 'BC': 'BC'}
+    seed_baseline_results_list, seed_optimized_results_list = [], []
+    for agent_lower in agent_lower_list:
+        agent = _agent_map[agent_lower]
+        cache_path = co2_cache_path if agent == 'CO2' else other_cache_path_template.format(agent=agent)
+        if not Path(cache_path).exists():
+            raise FileNotFoundError(
+                f"{cache_path} missing for agent {agent} - run "
+                f"regenerate_SI_extended_results_cache_seed_sweep (or, for CO2, "
+                f"regenerate_fig4_co2_only_cache_seed_sweep) first"
+            )
+        with open(cache_path, 'rb') as f:
+            cache = pickle.load(f)
+        seeds_sorted = sorted(cache)
+        seed_baseline_results_list.append([cache[s]["baseline"] for s in seeds_sorted])
+        seed_optimized_results_list.append([cache[s]["optimal"] for s in seeds_sorted])
+
+    n = len(agent_lower_list)
+    return {
+        "baseline_results_list": [None] * n,   # unused - every panel is in seed mode
+        "optimized_results_list": [None] * n,  # unused - every panel is in seed mode
+        "seed_baseline_results_list": seed_baseline_results_list,
+        "seed_optimized_results_list": seed_optimized_results_list,
+        "train_scenarios": ['Opt. Tier 1', 'Opt. Tier 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
+        "test_scenarios": ['Tier 1', 'Tier 2', 'DECK', 'CS3'],
+        "x_labels": ['Opt. Priority 1', 'Opt. Priority 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
+        "leg_labels": ['Priority 1', 'Priority 2', 'DECK', 'CS3'],
+        "weights": [7, 5, 2, 2],
+        "titles": None,
+        "figname": 'SI_extended_results_seed_spread',
     }

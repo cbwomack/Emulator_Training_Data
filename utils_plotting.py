@@ -91,9 +91,26 @@ def plot_rmse_comparison_single(
     results_list: list[dict],       # List of dictionaries
     baseline_error_list: list[float],     # Single float value
     agents: list[str],
-    save: bool = False
+    save: bool = False,
+    seed_errors_list: list[list[dict] | None] = None,
+    seed_baseline_error_list: list[list[float] | None] = None,
 ) -> None:
-    """5-panel NRMSE-vs-update-step comparison, one panel per single-forcing agent experiment."""
+    """5-panel NRMSE-vs-update-step comparison, one panel per single-forcing agent experiment.
+
+    `seed_errors_list`/`seed_baseline_error_list` (both optional, default None):
+    one entry per panel (same order as `agents`), each either None (that panel
+    plots the single-run line from `results_list`/`baseline_error_list`, exact
+    prior behavior) or a list of per-seed values - `seed_errors_list[i]` a list
+    of per-seed result dicts (each shaped like `results_list[i]`, i.e. with an
+    "errors" key), `seed_baseline_error_list[i]` a list of per-seed baseline
+    floats. When given, that panel plots the mean trajectory across seeds with
+    a shaded min-max band (min/max rather than mean +/- std, since NRMSE is
+    non-negative and a log y-axis can't render a negative lower bound - matches
+    the mean +/- min-max spread convention already used for this pipeline's
+    other seed-uncertainty plots, e.g. 0a_bilevel_scaled_plots.ipynb) instead
+    of a single line. Leaving both at None (the default) is fully
+    backward-compatible - reproduces the exact prior output.
+    """
     layout = [
         ["Left", "Left", "Right1", "Right2"],
         ["Left", "Left", "Right3", "Right4"]
@@ -112,14 +129,35 @@ def plot_rmse_comparison_single(
     axes = [axd["Left"], axd["Right1"], axd["Right2"], axd["Right3"], axd["Right4"]]
 
     for i, ax in enumerate(axes):
-        result = results_list[i]
-        baseline_error = baseline_error_list[i]
-        errors = jnp.asarray(result["errors"])
-        x_err = jnp.arange(errors.shape[0])
+        seed_errs = seed_errors_list[i] if seed_errors_list else None
+        seed_base = seed_baseline_error_list[i] if seed_baseline_error_list else None
 
-        # --- Plotting ---
-        ax.loglog(x_err, errors, label="Optimized emulator", lw=2, color=cmap(0))
-        ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
+        # --- Plotting: optimized-emulator trajectory ---
+        if seed_errs is not None:
+            stacked = jnp.stack([jnp.asarray(r["errors"]) for r in seed_errs], axis=0)
+            mean_errors = jnp.mean(stacked, axis=0)
+            min_errors = jnp.min(stacked, axis=0)
+            max_errors = jnp.max(stacked, axis=0)
+            x_err = jnp.arange(mean_errors.shape[0])
+            ax.loglog(x_err, mean_errors, label=f"Optimized emulator\n(mean, n={len(seed_errs)})", lw=2, color=cmap(0))
+            ax.fill_between(np.asarray(x_err), np.asarray(min_errors), np.asarray(max_errors),
+                             color=cmap(0), alpha=0.2, linewidth=0)
+        else:
+            result = results_list[i]
+            errors = jnp.asarray(result["errors"])
+            x_err = jnp.arange(errors.shape[0])
+            ax.loglog(x_err, errors, label="Optimized emulator", lw=2, color=cmap(0))
+
+        # --- Plotting: baseline lower bound ---
+        if seed_base is not None:
+            base_arr = np.asarray(seed_base, dtype=float)
+            base_mean, base_min, base_max = float(base_arr.mean()), float(base_arr.min()), float(base_arr.max())
+            ax.axhline(base_mean, ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound (mean)")
+            if base_max > base_min:
+                ax.axhspan(base_min, base_max, color=cm.lipariS(5), alpha=0.15, linewidth=0)
+        else:
+            baseline_error = baseline_error_list[i]
+            ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
 
         ax.margins(x=0, y=0)
         #ax.xaxis.set_major_locator(plt.MaxNLocator(, prune='lower'))
