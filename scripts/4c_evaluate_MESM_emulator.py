@@ -9,44 +9,57 @@
 
 """
 Companion script for 4c_evaluate_MESM_emulator.ipynb: trains and evaluates the
-vector-output (zonal-temperature) MLP emulator against MESM output, once on
-the baseline (ScenarioMIP tier1) training set and once on the CO2-only
-inverse-optimized ("all", constant+sine initial conditions) training set from
-checkpoints/co2/. Writes the pickles the notebook needs to reload and plot.
-Runs standalone so it can be scheduled.
+vector-output (zonal-temperature) MLP emulator against MESM output - once on
+the baseline (ScenarioMIP tier1) training set, and once each on three CO2-only
+inverse-optimized ("all") training sets (constant-IC-only, sine-IC-only, and
+both combined) from checkpoints/co2/. Writes the pickles the notebook needs to
+reload and plot. Runs standalone so it can be scheduled.
 
-Fixes one portability bug and preserves two other pre-existing quirks as-is,
-flagged rather than silently fixed:
+Fixes two portability/correctness bugs and preserves one pre-existing
+execution-order quirk, flagged rather than silently changed:
 
 1. Fixed: the notebook hardcoded an absolute
    /Users/chriswomack/Documents/PhD/Project 2/data/MESM/emis_driven path for
    the DECK ensemble text files - same class of bug as 2c_calibrate_MESM, now
-   uses paths.DATA_DIR.
-2. Fixed (execution order): the notebook's cell order doesn't match its real
-   dependency order - the cell that injects an 'optimized' eval set into
+   uses paths.DATA_DIR (indirectly, via utils_inverse.build_MESM_baseline_
+   eval_sets(), which this script's build_eval_sets() now delegates to -
+   promoted there so MESM HP-search/seed-sweep scripts can reuse the same
+   eval-set construction without duplicating it).
+2. Fixed (three genuinely distinct optimized-side training runs, not one
+   mislabeled file): the original notebook produced the constant-only,
+   sine-only, and combined "both" results as three separate one-off manual
+   runs, saving each under its own optimal_co2_only_MESM_{IC}.pkl filename.
+   Once this got scripted, only the combined case was ever actually trained -
+   the save-path line looped `for IC in ['constant', 'sine']: ...` to build
+   the combined training set, then reused the loop's *last* value of IC for
+   the filename (`optimal_co2_only_MESM_{IC}.pkl` -> always "..._sine.pkl"),
+   which silently overwrote whatever the real sine-only run had produced with
+   a copy of the combined result instead. utils_inverse.build_MESM_opt_eval_
+   sets(ic_list=...) now genuinely trains each of the three variants
+   (IC_VARIANTS below) from its own emissions trajectory/ground truth, so all
+   three output files are real, distinct runs again - confirmed the combined
+   ("both") variant's numbers match the original manual run to 5 decimal
+   places on every Tier1/Tier2/DECK/CS3 scenario but one, validating this
+   reproduces the intended computation rather than just resolving the
+   filename collision. The real sine-only result has no surviving copy (its
+   only save location was overwritten by the bug) and had to be retrained
+   from scratch here rather than recovered.
+3. NOT changed (preserved as-is): the notebook's cell order doesn't match its
+   real dependency order - the cell that injects an 'optimized' eval set into
    eval_emis_sets/eval_targets_sets (originally cell 6, "# Run after
    optimization") reads eval_emis_opt_sets/eval_targets_opt_sets, which are
    only defined two cells *later* (originally cell 11). The notebook only
    ever ran correctly because a human executed the cells out of visual order
-   (3, 4, 5, 11, 6, 7, 8, 9, 12, 13, 14, 15 - confirmed by cell 7's own
-   printed "optimized Mean Global NRMSE" line, which only appears if
-   eval_emis_sets already contains 'optimized' by the time cell 7 runs).
-   This script uses that real dependency order, not the notebook's visual
-   top-to-bottom order.
-3. NOT fixed (preserved as-is, flagged for Phase 5): the saved optimal-
-   emulator-results filename bakes in a loop-variable leak. The notebook
-   loops `for IC in ['constant', 'sine']: ...` to build the combined
-   constant+sine optimized training set, then later saves the *combined*
-   result to a filename built from the *last* value IC happened to hold
-   (`optimal_co2_only_MESM_{IC}.pkl` -> always "..._sine.pkl", regardless of
-   the fact the result is the combined training run, not a sine-only one).
-   This script reproduces that exact (mislabeled-but-functional) filename
-   rather than "fixing" it to something like "..._combined.pkl", since that
-   would be a silent, unrequested rename of an artifact other code may
-   already reference.
+   (3, 4, 5, 11, 6, 7, 8, 9, 12, 13, 14, 15). This script uses that real
+   dependency order, not the notebook's visual top-to-bottom order. Unlike
+   the single-combined-run version, the baseline emulator here is no longer
+   evaluated against any 'optimized' eval-set entry at all (there's no longer
+   one canonical choice, now that there are three, and Figure 7's plot never
+   read that entry anyway - utils_inverse.load_fig7_emic_data's scenario_keys
+   cover only Tier1/Tier2/DECK/CS3).
 
-Also saves a *_diagnostics.pkl pair (lat_coords + preds/truths) alongside the
-literal baseline/optimal result pickles the original notebook cells produced,
+Also saves a *_diagnostics.pkl pair (lat_coords + preds/truths) alongside each
+literal baseline/optimal result pickle the original notebook cells produced,
 since the notebook's own plot_zonal_predictions calls need preds/truths that
 the original notebook cells never persisted to disk (they only existed as
 in-memory variables in the same kernel session) - same pattern used for
@@ -64,95 +77,46 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.chdir(PROJECT_ROOT)
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import numpy as np
-
 import utils_inverse
-from paths import DATA_DIR
 
 EVAL_DIR = "data/MESM/emis_driven/zonal_data_mean/"
 BASELINE_PATH = "data/plotting/baseline_co2_only_MESM.pkl"
 BASELINE_DIAGNOSTICS_PATH = "data/plotting/baseline_co2_only_MESM_diagnostics.pkl"
 OPT_GROUP = "all"
-OPT_ICS = ["constant", "sine"]
-# Reproduces the notebook's loop-variable-leak filename (see module docstring,
-# point 3) - always the *last* IC in OPT_ICS, regardless of what the saved
-# result actually contains (the combined constant+sine training run).
-OPT_PATH = f"data/plotting/optimal_co2_only_MESM_{OPT_ICS[-1]}.pkl"
-OPT_DIAGNOSTICS_PATH = f"data/plotting/optimal_co2_only_MESM_{OPT_ICS[-1]}_diagnostics.pkl"
 
 
 def build_eval_sets():
-    """Assemble the Tier 1/Tier 2/DECK/CS3 emissions and MESM zonal-temperature target sets used to evaluate the baseline emulator."""
-    agents = ["CO2"]
-    scenarios_eval = {
-        "Tier 1": ["historical", "H-ext", "L", "M", "ML", "VLHO", "VLLO-ext"],
-        "Tier 2": ["H-ext-OS", "M-ext", "ML-ext", "L-ext", "VLHO-ext"],
-        "DECK": ["1pctCO2", "2xCO2"],
-        "CS3": ["AA", "CT", "historical"],
-    }
+    """Assemble the Tier 1/Tier 2/DECK/CS3 emissions and MESM zonal-temperature target sets used to evaluate the baseline emulator.
 
-    (eval_emis_sets, emis_dict_tier1_JAX, emis_dict_tier2_JAX, emis_dict_CS3_JAX, emis_dict_all_JAX) = (
-        utils_inverse.generate_eval_data(agents, DECK=False, CS3=True, DAMIP=False, GeoMIP=False)
+    Thin wrapper around utils_inverse.build_MESM_baseline_eval_sets(), which
+    this logic was promoted into so HP-search/seed-sweep scripts could reuse
+    it without duplicating it - this function now just adapts that dict
+    return into this script's original positional-tuple shape.
+    """
+    setup = utils_inverse.build_MESM_baseline_eval_sets(eval_dir=EVAL_DIR)
+    return (
+        setup["eval_emis_sets"], setup["eval_targets_sets"],
+        setup["emis_dict_tier1_JAX"], setup["targets_dict_tier1"],
+        setup["output_dim"], setup["lat_coords"],
     )
 
-    (eval_targets_sets, targets_dict_tier1, targets_dict_tier2, targets_dict_DECK, targets_dict_CS3, output_dim, lat_coords) = (
-        utils_inverse.generate_target_data(scenarios_eval, data_dir=EVAL_DIR)
-    )
 
-    emis_path = str(DATA_DIR / "MESM" / "emis_driven")
-    emis_1pct_path = f"{emis_path}/1PRCO2/carbemiss.txt"
-    emis_1pct = np.loadtxt(emis_1pct_path, usecols=(2,), skiprows=2)
-    emis_mat_1pct = np.zeros((5, len(emis_1pct)))
-    emis_mat_1pct[0, :] = emis_1pct
-
-    emis_2xCO2_path = f"{emis_path}/2xCO2/implco2emiss.3100.25.txt"
-    emis_2xCO2 = np.loadtxt(emis_2xCO2_path, usecols=(2,))
-    emis_mat_2xCO2 = np.zeros((5, len(emis_2xCO2)))
-    emis_mat_2xCO2[0, :] = emis_2xCO2
-
-    eval_emis_sets["DECK"] = {"1pctCO2": emis_mat_1pct, "2xCO2": emis_mat_2xCO2}
-
-    return eval_emis_sets, eval_targets_sets, emis_dict_tier1_JAX, targets_dict_tier1, output_dim, lat_coords
-
-
-def build_opt_sets(eval_emis_sets, eval_targets_sets):
-    """Build the CO2-only-optimized (constant+sine IC) training set from checkpoints/co2/, plus the existing eval sets merged in under the 'optimized' key."""
-    emis_dict_opt = {}
-    for IC in OPT_ICS:
-        opt_path = f"checkpoints/co2/inverse_{IC}_{OPT_GROUP}_co2_only_MESM.pkl"
-        with open(opt_path, "rb") as f:
-            res = pickle.load(f)
-        co2_array = res["U_traj"][-1]["CO2"]
-        emis_dict_opt[OPT_GROUP + "_" + IC] = np.zeros((5, len(co2_array)))
-        emis_dict_opt[OPT_GROUP + "_" + IC][0, :] = co2_array.copy()
-
-    eval_emis_opt_sets = {"optimized": emis_dict_opt.copy()}
-    scenarios_train = {"optimized": [OPT_GROUP + "_" + IC for IC in OPT_ICS]}
-
-    eval_targets_opt_sets, targets_dict_opt, _, _ = utils_inverse.generate_target_data(
-        scenarios_train, data_dir=EVAL_DIR, opt=True
-    )
-
-    for key in eval_targets_sets:
-        eval_targets_opt_sets[key] = eval_targets_sets[key].copy()
-        eval_emis_opt_sets[key] = eval_emis_sets[key].copy()
-
-    return eval_emis_opt_sets, eval_targets_opt_sets, emis_dict_opt, targets_dict_opt
+# The three optimized-side training variants Figure 7 compares (Phase 6 fix,
+# see module docstring point 3 below): constant-IC-only, sine-IC-only, and
+# both combined - matching the three one-off manual runs the user originally
+# produced by hand before any of this was scripted. Filename suffix -> ic_list.
+IC_VARIANTS = {"constant": ["constant"], "sine": ["sine"], "both": ["constant", "sine"]}
 
 
 def main():
     eval_emis_sets, eval_targets_sets, emis_dict_tier1_JAX, targets_dict_tier1, output_dim, lat_coords = build_eval_sets()
 
-    eval_emis_opt_sets, eval_targets_opt_sets, emis_dict_opt, targets_dict_opt = build_opt_sets(
-        eval_emis_sets, eval_targets_sets
-    )
-
-    # Inject the 'optimized' eval set into eval_emis_sets/eval_targets_sets
-    # *before* the baseline emulator is trained/evaluated below - this is the
-    # real dependency order (see module docstring, point 2).
-    eval_emis_sets["optimized"] = eval_emis_opt_sets["optimized"].copy()
-    eval_targets_sets["optimized"] = eval_targets_opt_sets["optimized"].copy()
-
+    # Baseline is trained/evaluated once, against only the Tier1/Tier2/DECK/CS3
+    # eval sets - unlike the old single-combined-run version, it does NOT get
+    # an 'optimized' eval-set entry injected, since that entry was never
+    # actually read by Figure 7's plot (utils_inverse.load_fig7_emic_data's
+    # scenario_keys cover only Tier1/Tier2/DECK/CS3) and there's no longer one
+    # canonical "optimized" set to pick, now that there are three.
     results_baseline, preds_baseline, truths_baseline, paramsk_baseline, stats_X_baseline = (
         utils_inverse.generate_and_eval_emulator_vector(
             emis_dict_train=emis_dict_tier1_JAX,
@@ -177,35 +141,43 @@ def main():
         pickle.dump({"preds": preds_baseline, "truths": truths_baseline, "lat_coords": lat_coords}, f)
     print(f"Saved {BASELINE_DIAGNOSTICS_PATH}")
 
-    results_opt, preds_opt, truths_opt, params_opt, stats_X_opt = utils_inverse.generate_and_eval_emulator_vector(
-        emis_dict_train=emis_dict_opt,
-        targets_dict_train=targets_dict_opt,
-        eval_emis_sets=eval_emis_opt_sets,
-        eval_targets_sets=eval_targets_opt_sets,
-        output_dim=output_dim,
-        lat_coords=lat_coords,
-        hidden_sizes=[16],
-        lr=1e-1,
-        weight_decay=1e-2,
-        K=400,
-        verbose=True,
-    )
+    for variant_name, ic_list in IC_VARIANTS.items():
+        opt = utils_inverse.build_MESM_opt_eval_sets(
+            eval_emis_sets, eval_targets_sets, ic_list=ic_list, group=OPT_GROUP, eval_dir=EVAL_DIR
+        )
 
-    with open(OPT_PATH, "wb") as f:
-        pickle.dump(results_opt, f)
-    print(f"Saved {OPT_PATH}")
-    with open(OPT_DIAGNOSTICS_PATH, "wb") as f:
-        pickle.dump({"preds": preds_opt, "truths": truths_opt, "lat_coords": lat_coords}, f)
-    print(f"Saved {OPT_DIAGNOSTICS_PATH}")
+        results_opt, preds_opt, truths_opt, params_opt, stats_X_opt = utils_inverse.generate_and_eval_emulator_vector(
+            emis_dict_train=opt["emis_dict_opt"],
+            targets_dict_train=opt["targets_dict_opt"],
+            eval_emis_sets=opt["eval_emis_opt_sets"],
+            eval_targets_sets=opt["eval_targets_opt_sets"],
+            output_dim=output_dim,
+            lat_coords=lat_coords,
+            hidden_sizes=[16],
+            lr=1e-1,
+            weight_decay=1e-2,
+            K=400,
+            verbose=True,
+        )
 
-    for key in results_baseline.keys():
-        print("Eval set: ", key)
-        for scen in results_baseline[key].keys():
-            old = results_baseline[key][scen]["global"]
-            new = results_opt[key][scen]["global"]
-            pct_change = 100 * (old - new) / old
-            print("\tScen:", scen, "Change:", pct_change)
-            print("\t\tRaw base:", old, "Raw opt:", new)
+        opt_path = f"data/plotting/optimal_co2_only_MESM_{variant_name}.pkl"
+        opt_diagnostics_path = f"data/plotting/optimal_co2_only_MESM_{variant_name}_diagnostics.pkl"
+        with open(opt_path, "wb") as f:
+            pickle.dump(results_opt, f)
+        print(f"Saved {opt_path}")
+        with open(opt_diagnostics_path, "wb") as f:
+            pickle.dump({"preds": preds_opt, "truths": truths_opt, "lat_coords": lat_coords}, f)
+        print(f"Saved {opt_diagnostics_path}")
+
+        print(f"=== variant: {variant_name} ({ic_list}) ===")
+        for key in results_baseline.keys():
+            print("Eval set: ", key)
+            for scen in results_baseline[key].keys():
+                old = results_baseline[key][scen]["global"]
+                new = results_opt[key][scen]["global"]
+                pct_change = 100 * (old - new) / old
+                print("\tScen:", scen, "Change:", pct_change)
+                print("\t\tRaw base:", old, "Raw opt:", new)
 
 
 if __name__ == "__main__":

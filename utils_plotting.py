@@ -1448,10 +1448,25 @@ def plot_scenario_difference_bars2(baseline_results: dict,
                                   separator_indices: list[int] = None,
                                   group_labels: list[str] = None,
                                   save: bool = False,
-                                  figname: str = 'scenario_differences') -> None:
+                                  figname: str = 'scenario_differences',
+                                  seed_baseline_results: list[dict] | None = None,
+                                  seed_optimized_results_list: list[list[dict] | None] | None = None) -> None:
     """
     Per-scenario bar chart of global NRMSE across baseline + multiple optimized
     variants, with optional group separators/labels. Used by 5a_paper_plots.ipynb.
+
+    `seed_baseline_results`/`seed_optimized_results_list` (both optional,
+    default None): `seed_baseline_results` is a list of per-seed baseline
+    result dicts (each shaped like `baseline_results`); `seed_optimized_
+    results_list` has one entry per series in `optimized_results_list`, each
+    either None (that series plots the single-run point estimate, exact
+    prior behavior) or a list of per-seed result dicts (that series plots
+    the mean +/- seed-spread std as an `xerr` error bar, matching the
+    bar-chart seed-spread convention plot_grouped_improvement_bars already
+    uses for Figure 4, rather than Figure 3's shaded-band line-plot
+    convention, since this is a bar chart too). Leaving both at None (the
+    default) is fully backward-compatible - reproduces the exact prior
+    output.
     """
 
     # 1. Setup Data & Layout
@@ -1532,22 +1547,34 @@ def plot_scenario_difference_bars2(baseline_results: dict,
 
     # 2. Plotting Loop for Bar Chart
     # ------------------------------
-    for opt_idx, opt_dict in enumerate(optimized_results_list):
-        diff_values = []
+    def _pct_change_row(base_results, opt_results):
+        row = []
         for scen in scenario_keys:
-            base_val = get_global_value(baseline_results, scen)
-            opt_val = get_global_value(opt_dict, scen)
-
+            base_val = get_global_value(base_results, scen)
+            opt_val = get_global_value(opt_results, scen)
             if np.isnan(base_val) or np.isnan(opt_val) or base_val == 0:
-                diff_values.append(0)
+                row.append(0.0)
             else:
-                pct_change = ((base_val - opt_val) / base_val) * 100
-                diff_values.append(pct_change)
+                row.append(((base_val - opt_val) / base_val) * 100)
+        return row
+
+    for opt_idx, opt_dict in enumerate(optimized_results_list):
+        seed_opt = seed_optimized_results_list[opt_idx] if seed_optimized_results_list else None
+
+        if seed_opt is not None and seed_baseline_results is not None:
+            per_seed = np.array([_pct_change_row(b, o) for b, o in zip(seed_baseline_results, seed_opt)])
+            diff_values = per_seed.mean(axis=0)
+            diff_err = per_seed.std(axis=0)
+        else:
+            diff_values = _pct_change_row(baseline_results, opt_dict)
+            diff_err = None
 
         offset = (opt_idx - n_opts / 2) * bar_width + (bar_width / 2)
 
         bars = ax_bar.barh(y_positions + offset,
                    diff_values,
+                   xerr=diff_err,
+                   error_kw=dict(capsize=2, elinewidth=1) if diff_err is not None else None,
                    label=legend_labels[opt_idx],
                    height=bar_width,
                    color=colors[opt_idx],

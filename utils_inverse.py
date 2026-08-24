@@ -16,6 +16,7 @@ import pickle
 import xarray as xr
 import json
 from pathlib import Path
+from paths import DATA_DIR
 
 # JAX
 import jax
@@ -1093,6 +1094,20 @@ def load_inverse_ckpt(path: str) -> dict:
         "train_temp_traj": raw["train_temp_traj"],
     }
     return out
+
+def load_inverse_ckpt_errors_only(path: str) -> dict:
+    """Load just the 'errors' trajectory from a checkpoint saved by save_inverse_ckpt.
+
+    A full load_inverse_ckpt() call deserializes U_traj/preds_traj/train_temp_traj/
+    opt_state too, which turns a ~15MB checkpoint file into ~150MB in memory - fine
+    for a single checkpoint, but prohibitive across the hundreds of per-seed
+    checkpoints a seed-sweep loader (e.g. load_fig3_single_forcing_data_seed_sweep)
+    reads, none of which use anything but 'errors'. Returns {"errors": jnp.ndarray}
+    only - not a drop-in replacement for load_inverse_ckpt's full return shape.
+    """
+    with open(path, "rb") as f:
+        raw = pickle.load(f)
+    return {"errors": jnp.asarray(raw["errors"], dtype=jnp.float32)}
 
 def scale_by_coord_pytree(weights_pytree: dict) -> optax.GradientTransformation:
     """An optax transform that elementwise-multiplies gradients by a matching pytree of weights."""
@@ -2648,7 +2663,7 @@ def load_fig3_single_forcing_data_seed_sweep(
                     f"scripts/0c_regenerate_checkpoints_agent.py --agent {a} first "
                     f"(scripts/0c_regenerate_checkpoints_co2.py for co2)"
                 )
-            errs.append(load_inverse_ckpt(ckpt_path))
+            errs.append(load_inverse_ckpt_errors_only(ckpt_path))
             with open(baseline_path, "rb") as f:
                 bases.append(pickle.load(f)['Tier 1']['mean'])
         seed_errors_list.append(errs)
@@ -3208,6 +3223,147 @@ def load_fig6_data(save_dir: str = 'data/plotting') -> dict:
         "y_hat_ind_effects": _load('y_hat_ind_effects'),
         "train_scenarios_ind_effects": ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All'],
     }
+
+
+def build_MESM_baseline_eval_sets(eval_dir: str = "data/MESM/emis_driven/zonal_data_mean/") -> dict:
+    """
+    Assemble the Tier 1/Tier 2/DECK/CS3 emissions and MESM zonal-temperature
+    target sets used to evaluate the MESM vector (zonal-output) emulator, plus
+    the Tier 1 training data for the baseline side specifically. Moved out of
+    scripts/4c_evaluate_MESM_emulator.py's private build_eval_sets() so
+    HP-search/seed-sweep scripts can reuse it without duplicating this logic;
+    that script now delegates to this function instead of keeping its own copy.
+    """
+    agents = ["CO2"]
+    scenarios_eval = {
+        "Tier 1": ["historical", "H-ext", "L", "M", "ML", "VLHO", "VLLO-ext"],
+        "Tier 2": ["H-ext-OS", "M-ext", "ML-ext", "L-ext", "VLHO-ext"],
+        "DECK": ["1pctCO2", "2xCO2"],
+        "CS3": ["AA", "CT", "historical"],
+    }
+
+    (eval_emis_sets, emis_dict_tier1_JAX, emis_dict_tier2_JAX, emis_dict_CS3_JAX, emis_dict_all_JAX) = (
+        generate_eval_data(agents, DECK=False, CS3=True, DAMIP=False, GeoMIP=False)
+    )
+
+    (eval_targets_sets, targets_dict_tier1, targets_dict_tier2, targets_dict_DECK, targets_dict_CS3, output_dim, lat_coords) = (
+        generate_target_data(scenarios_eval, data_dir=eval_dir)
+    )
+
+    emis_path = str(DATA_DIR / "MESM" / "emis_driven")
+    emis_1pct_path = f"{emis_path}/1PRCO2/carbemiss.txt"
+    emis_1pct = np.loadtxt(emis_1pct_path, usecols=(2,), skiprows=2)
+    emis_mat_1pct = np.zeros((5, len(emis_1pct)))
+    emis_mat_1pct[0, :] = emis_1pct
+
+    emis_2xCO2_path = f"{emis_path}/2xCO2/implco2emiss.3100.25.txt"
+    emis_2xCO2 = np.loadtxt(emis_2xCO2_path, usecols=(2,))
+    emis_mat_2xCO2 = np.zeros((5, len(emis_2xCO2)))
+    emis_mat_2xCO2[0, :] = emis_2xCO2
+
+    eval_emis_sets["DECK"] = {"1pctCO2": emis_mat_1pct, "2xCO2": emis_mat_2xCO2}
+
+    return {
+        "eval_emis_sets": eval_emis_sets,
+        "eval_targets_sets": eval_targets_sets,
+        "emis_dict_tier1_JAX": emis_dict_tier1_JAX,
+        "targets_dict_tier1": targets_dict_tier1,
+        "output_dim": output_dim,
+        "lat_coords": lat_coords,
+    }
+
+
+def build_MESM_opt_eval_sets(
+    eval_emis_sets: dict,
+    eval_targets_sets: dict,
+    ic_list: list[str],
+    group: str = "all",
+    eval_dir: str = "data/MESM/emis_driven/zonal_data_mean/",
+) -> dict:
+    """
+    Build the CO2-only-optimized training set for the MESM vector emulator's
+    "optimized" side, from the frozen checkpoints/co2/inverse_{IC}_{group}_
+    co2_only_MESM.pkl trajectories for whichever IC(s) are in ic_list, plus
+    the existing eval sets merged in under the 'optimized' key.
+
+    Generalized from scripts/4c_evaluate_MESM_emulator.py's private
+    build_opt_sets() (which hardcoded ic_list=["constant","sine"]) - passing
+    a single-element ic_list (e.g. ["constant"]) trains against only that
+    IC's real-MESM ground truth, since generate_target_data's opt=True path
+    already stores each IC's processed ground truth as a separate per-scenario
+    file (opt_all_constant_mean.pkl / opt_all_sine_mean.pkl) - no new data
+    processing is needed to isolate one IC from the combined case.
+    """
+    emis_dict_opt = {}
+    for IC in ic_list:
+        opt_path = f"checkpoints/co2/inverse_{IC}_{group}_co2_only_MESM.pkl"
+        with open(opt_path, "rb") as f:
+            res = pickle.load(f)
+        co2_array = res["U_traj"][-1]["CO2"]
+        emis_dict_opt[group + "_" + IC] = np.zeros((5, len(co2_array)))
+        emis_dict_opt[group + "_" + IC][0, :] = co2_array.copy()
+
+    eval_emis_opt_sets = {"optimized": emis_dict_opt.copy()}
+    scenarios_train = {"optimized": [group + "_" + IC for IC in ic_list]}
+
+    eval_targets_opt_sets, targets_dict_opt, _, _ = generate_target_data(
+        scenarios_train, data_dir=eval_dir, opt=True
+    )
+
+    for key in eval_targets_sets:
+        eval_targets_opt_sets[key] = eval_targets_sets[key].copy()
+        eval_emis_opt_sets[key] = eval_emis_sets[key].copy()
+
+    return {
+        "eval_emis_opt_sets": eval_emis_opt_sets,
+        "eval_targets_opt_sets": eval_targets_opt_sets,
+        "emis_dict_opt": emis_dict_opt,
+        "targets_dict_opt": targets_dict_opt,
+        "scen_key": "optimized",
+    }
+
+
+def regenerate_fig7_MESM_cache_seed_sweep(
+    seeds: list[int],
+    variants: list[str],
+    results_dir: str = "data/plotting/MESM_seed_sweep",
+    out_path: str = "data/SI_results/seed_uncertainty/fig7_seed_spread_co2_only_MESM.pkl",
+) -> dict:
+    """
+    Aggregate already-trained per-(seed,variant) MESM vector-emulator result
+    pickles (written by scripts/4c_evaluate_MESM_emulator_seed_sweep.py) into
+    one cache keyed by seed, mirroring regenerate_fig4_all_agents_cache_seed_
+    sweep's {seed: {...}} shape. `variants` names the result keys expected
+    per seed - always includes "baseline", plus whichever optimized-side
+    variant(s) are in scope (e.g. just "both", or "constant"/"sine"/"both" -
+    see 5a_paper_plots.ipynb Figure 7 planning notes for which). Pure
+    aggregation - does no training itself, so it's cheap to run even though it
+    still needs to go through a compute node (utils_inverse imports jax at
+    module scope, which crashes on an ORCD login node).
+
+    Raises FileNotFoundError (not a silent partial cache) if any seed/variant
+    file is missing, matching every other seed-sweep aggregator in this file.
+    """
+    all_results = {}
+    for seed in seeds:
+        entry = {}
+        for variant in variants:
+            path = f"{results_dir}/{variant}_seed{seed}.pkl"
+            if not Path(path).exists():
+                raise FileNotFoundError(
+                    f"{path} missing - run scripts/4c_evaluate_MESM_emulator_seed_sweep.py "
+                    f"--seed {seed} --variant {variant} first"
+                )
+            with open(path, "rb") as f:
+                key = "baseline" if variant == "baseline" else f"optimal_{variant}"
+                entry[key] = pickle.load(f)
+        all_results[seed] = entry
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(all_results, f)
+
+    return all_results
 
 
 def load_fig7_emic_data() -> dict:

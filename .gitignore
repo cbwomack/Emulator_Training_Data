@@ -74,5 +74,13 @@ dmypy.json
 
 PROGRESS.md
 REVISIONS.md
+MISSING_DATA.md
 main.tex
 supplement.tex
+
+# VSCode
+*.code-workspace
+.vscode/
+
+# Dev Containers
+.devcontainer/
