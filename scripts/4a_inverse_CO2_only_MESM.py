@@ -40,6 +40,19 @@ DEFAULT_BASELINE_SAVE_PATH = None
 # PROGRESS.md for the extraction method. Preserved as-is, including known
 # oddities (e.g. duplicate 'all' entries, "2"-suffixed checkpoint tags)
 # rather than silently "fixing" them; those are flagged for Phase 5.
+#
+# !! resume_if_exists is deliberately False on every experiment below (set
+# 2026-08-25). These runs write to checkpoints/co2/inverse_{constant,sine}_*_
+# co2_only_MESM.pkl, and REAL MIT Earth System Model ensemble output
+# (data/MESM/emis_driven/zonal_data/optimized/*.nc) was produced against those
+# exact trajectories - re-optimizing them would invalidate the ground truth
+# without commissioning new MESM runs, which is out of scope (see REVISIONS.md).
+# With resume True, bumping num_updates here would SILENTLY extend and destroy
+# them in place; with False the run stops at "Overwriting save data..." instead.
+# The .pkl files are also chmod -w for the same reason. Note
+# inverse_constant_all_co2_only_MESM.pkl is not even reproducible from this
+# script - it has no 'constant' variant, that file came from a one-off manual
+# run. Do NOT include this script in any num_updates migration.
 EXPERIMENTS = {
     'H-ext': {
         'group': 'H-ext',
@@ -56,7 +69,7 @@ EXPERIMENTS = {
         'filter_hist': True,
         'smoothness_weight': 1e-05,
         'checkpoint_every': 50,
-        'resume_if_exists': True,
+        'resume_if_exists': False,
         'preds_every': 50,
     },
     'all': {
@@ -74,7 +87,7 @@ EXPERIMENTS = {
         'filter_hist': False,
         'smoothness_weight': 1e-05,
         'checkpoint_every': 50,
-        'resume_if_exists': True,
+        'resume_if_exists': False,
         'preds_every': 50,
         'active_agents': ('CO2',),
     },
@@ -93,7 +106,7 @@ EXPERIMENTS = {
         'filter_hist': False,
         'smoothness_weight': 1e-05,
         'checkpoint_every': 50,
-        'resume_if_exists': True,
+        'resume_if_exists': False,
         'preds_every': 50,
         'active_agents': ('CO2',),
     },
@@ -112,7 +125,7 @@ EXPERIMENTS = {
         'filter_hist': False,
         'smoothness_weight': 1e-05,
         'checkpoint_every': 50,
-        'resume_if_exists': True,
+        'resume_if_exists': False,
         'preds_every': 50,
         'active_agents': ('CO2',),
     },
@@ -131,7 +144,7 @@ EXPERIMENTS = {
         'filter_hist': False,
         'smoothness_weight': 1e-05,
         'checkpoint_every': 50,
-        'resume_if_exists': True,
+        'resume_if_exists': False,
         'preds_every': 50,
         'active_agents': ('CO2',),
     },

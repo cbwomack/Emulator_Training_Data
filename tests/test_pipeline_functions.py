@@ -173,3 +173,234 @@ def test_optimize_emissions_inverse_checkpoint_roundtrip(tmp_path, synthetic_inv
     np.testing.assert_allclose(out["U_traj"][-1]["CO2"], loaded["U_traj"][-1]["CO2"])
     np.testing.assert_allclose(np.asarray(out["errors"]), np.asarray(loaded["errors"]))
     assert loaded["step_count"] == out["updates_done"]
+
+
+# ---------------------------------------------------------------
+# Resume equivalence
+# ---------------------------------------------------------------
+# The 1000 -> 2000 iteration migration resumes every existing checkpoint rather
+# than rerunning from scratch, which is only sound if resuming is EXACTLY
+# equivalent to a longer fresh run. Nothing exercised the resume_if_exists
+# branch before this. These are bit-exactness assertions, not tolerance checks:
+# the momentum trace round-trips through float32 numpy, and the inner-loop PRNG
+# key is a pure function of the seed with no step dependence, so any difference
+# at all would indicate a real defect rather than accumulated error.
+
+def test_resume_is_bit_exact_with_a_longer_fresh_run(tmp_path, synthetic_inverse_setup):
+    s = synthetic_inverse_setup
+    common = dict(
+        step_size=1e2, K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=s["agents"], active_agents=s["agents"], init_cond="constant",
+        T=s["T"], checkpoint_every=1, preds_every=1,
+    )
+
+    fresh = utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=4,
+        checkpoint_path=os.path.join(tmp_path, "fresh.pkl"), **common)
+
+    resumed_path = os.path.join(tmp_path, "resumed.pkl")
+    utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=2,
+        checkpoint_path=resumed_path, resume_if_exists=False, **common)
+    resumed = utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=4,
+        checkpoint_path=resumed_path, resume_if_exists=True, **common)
+
+    assert resumed["updates_done"] == fresh["updates_done"] == 4
+    assert len(resumed["U_traj"]) == len(fresh["U_traj"]) == 5
+
+    # The final iterate is what every downstream artifact reads (U_traj[-1]).
+    np.testing.assert_array_equal(
+        np.asarray(resumed["U_traj"][-1]["CO2"]), np.asarray(fresh["U_traj"][-1]["CO2"]))
+    # And the whole trajectory, so a mid-run divergence cannot hide.
+    for k in range(5):
+        np.testing.assert_array_equal(
+            np.asarray(resumed["U_traj"][k]["CO2"]), np.asarray(fresh["U_traj"][k]["CO2"]),
+            err_msg=f"trajectory diverged at iterate {k}")
+    np.testing.assert_array_equal(
+        np.asarray(resumed["errors"]), np.asarray(fresh["errors"]))
+
+
+def test_resume_preserves_the_pre_resume_history(tmp_path, synthetic_inverse_setup):
+    # The migration relies on the first 1001 entries of an extended checkpoint
+    # still being the original run, so the appendix arm remains a true control.
+    s = synthetic_inverse_setup
+    common = dict(
+        step_size=1e2, K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=s["agents"], active_agents=s["agents"], init_cond="constant",
+        T=s["T"], checkpoint_every=1, preds_every=1,
+    )
+    path = os.path.join(tmp_path, "extend.pkl")
+
+    short = utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=2,
+        checkpoint_path=path, resume_if_exists=False, **common)
+    short_errors = np.asarray(short["errors"]).copy()
+    short_final = np.asarray(short["U_traj"][-1]["CO2"]).copy()
+
+    extended = utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=4,
+        checkpoint_path=path, resume_if_exists=True, **common)
+
+    np.testing.assert_array_equal(np.asarray(extended["errors"])[:3], short_errors)
+    np.testing.assert_array_equal(
+        np.asarray(extended["U_traj"][2]["CO2"]), short_final)
+
+
+# ---------------------------------------------------------------
+# Recovering true NRMSE from a checkpoint's recorded objective
+# ---------------------------------------------------------------
+# 'errors' stores nrmse + smoothness_weight * sum(dU)^2, so Figures 3 and 5
+# have to subtract the penalty back out. These round-trip the recovery against
+# runs whose smoothness_weight is known by construction, rather than only
+# against the frozen real checkpoints it was developed on.
+
+def _run_with_smoothness(setup, tmp_path, weight, num_updates=3):
+    ckpt_path = os.path.join(tmp_path, f"ckpt_w{weight}.pkl")
+    utils_inverse.optimize_emissions_inverse(
+        setup["emis_dict"], setup["params0"],
+        num_updates=num_updates, step_size=1e2, K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=setup["agents"], active_agents=setup["agents"], init_cond="constant",
+        T=setup["T"], smoothness_weight=weight,
+        checkpoint_path=ckpt_path, checkpoint_every=1, preds_every=1,
+    )
+    import pickle
+    with open(ckpt_path, "rb") as f:
+        return pickle.load(f)
+
+
+def test_recover_smoothness_weight_roundtrip(tmp_path, synthetic_inverse_setup):
+    weight = 1e-2
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, weight)
+    # Solve it back out ignoring the recorded meta, which is the path older
+    # checkpoints (written before meta was populated) have to take.
+    raw_no_meta = dict(raw, meta={})
+    recovered, spread = utils_inverse.recover_smoothness_weight(raw_no_meta)
+
+    assert recovered == pytest.approx(weight, rel=1e-3)
+    # Over-determined: every sampled iteration must agree on the same scalar.
+    assert spread < 1e-3 * weight
+
+
+def test_recover_smoothness_weight_zero_when_unregularized(tmp_path, synthetic_inverse_setup):
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, 0.0)
+    recovered, _ = utils_inverse.recover_smoothness_weight(dict(raw, meta={}))
+    # Snapped to exactly zero, not left as a ratio of rounding errors.
+    assert recovered == 0.0
+
+
+def test_recover_nrmse_trajectory_is_noop_when_unregularized(tmp_path, synthetic_inverse_setup):
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, 0.0)
+    nrmse = utils_inverse.recover_nrmse_trajectory(dict(raw, meta={}))
+    np.testing.assert_array_equal(nrmse, np.asarray(raw["errors"], dtype=np.float64))
+
+
+def test_recover_nrmse_trajectory_strictly_below_recorded_objective(tmp_path, synthetic_inverse_setup):
+    weight = 1e-2
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, weight)
+    errors = np.asarray(raw["errors"], dtype=np.float64)
+    nrmse = utils_inverse.recover_nrmse_trajectory(raw)
+
+    assert np.all(nrmse > 0.0)
+    assert np.all(nrmse <= errors + 1e-12)
+    # The initial iterate is a constant trajectory, so its penalty is exactly
+    # zero and errors[0] is already pure NRMSE - a fixed point of the correction.
+    assert nrmse[0] == pytest.approx(errors[0], rel=1e-12)
+    # A later iterate is no longer constant, so the correction must bite.
+    assert nrmse[-1] < errors[-1]
+
+
+def test_recover_nrmse_trajectory_rejects_wrong_weight(tmp_path, synthetic_inverse_setup):
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, 1e-2)
+    # NRMSE is non-negative by construction, so an overlarge weight must be
+    # rejected rather than silently returning negative "errors".
+    with pytest.raises(ValueError, match="non-positive"):
+        utils_inverse.recover_nrmse_trajectory(raw, smoothness_weight=1e3)
+
+
+# ---------------------------------------------------------------
+# Seed-aggregation convention shared by Figures 3, 4 and 5
+# ---------------------------------------------------------------
+
+def test_aggregate_seeds_median_returns_median_and_iqr():
+    import utils_plotting
+    # Skewed on purpose: one large outlier, which is the case the convention
+    # exists to handle. mean=24, median=3.
+    stacked = np.array([[1.0], [2.0], [3.0], [4.0], [110.0]])
+    centre, lo, hi = utils_plotting._aggregate_seeds(stacked, "median")
+    assert centre[0] == pytest.approx(3.0)
+    assert lo[0] == pytest.approx(2.0)
+    assert hi[0] == pytest.approx(4.0)
+    # The whole point: the outlier moves the mean far outside the IQR.
+    assert stacked.mean() > hi[0]
+
+
+def test_aggregate_seeds_mean_band_reproduces_each_figures_prior_behaviour():
+    import utils_plotting
+    stacked = np.array([[1.0], [2.0], [3.0], [4.0], [110.0]])
+
+    centre, lo, hi = utils_plotting._aggregate_seeds(stacked, "mean", mean_band="minmax")
+    assert (centre[0], lo[0], hi[0]) == pytest.approx((24.0, 1.0, 110.0))
+
+    centre, lo, hi = utils_plotting._aggregate_seeds(stacked, "mean", mean_band="std")
+    assert centre[0] == pytest.approx(24.0)
+    assert lo[0] == pytest.approx(24.0 - stacked.std())
+    assert hi[0] == pytest.approx(24.0 + stacked.std())
+
+
+def test_aggregate_seeds_median_band_is_log_safe():
+    import utils_plotting
+    # Figure 3's y-axis is logarithmic, so a band edge at or below zero cannot
+    # render. mean - std goes negative here; the IQR cannot, since both bounds
+    # are order statistics of strictly positive data.
+    stacked = np.array([[0.01], [0.02], [0.03], [0.04], [5.0]])
+    _, mean_lo, _ = utils_plotting._aggregate_seeds(stacked, "mean", mean_band="std")
+    _, med_lo, _ = utils_plotting._aggregate_seeds(stacked, "median")
+    assert mean_lo[0] < 0.0
+    assert med_lo[0] > 0.0
+
+
+def test_aggregate_seeds_rejects_unknown_convention():
+    import utils_plotting
+    with pytest.raises(ValueError, match="unknown aggregation"):
+        utils_plotting._aggregate_seeds(np.zeros((3, 1)), "iqr")
+
+
+def test_recover_smoothness_weight_raises_rather_than_silently_returning_zero(
+    tmp_path, synthetic_inverse_setup
+):
+    # Regression: a preds_every that samples nothing used to fall through to
+    # "0.0", i.e. "unregularized", silently skipping a real correction. It must
+    # fail loudly instead - a wrong weight is worse than no answer here.
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, 1e-2)
+    with pytest.raises(ValueError, match="could not sample"):
+        utils_inverse.recover_smoothness_weight(raw, preds_every=10_000)
+
+
+def test_preds_every_is_inferred_from_trajectory_lengths(tmp_path, synthetic_inverse_setup):
+    # The stride is exact, not a guess, so recovery works without being told it.
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, 1e-2)
+    assert utils_inverse._infer_preds_every(raw) == 1
+    recovered, _ = utils_inverse.recover_smoothness_weight(dict(raw, meta={}))
+    assert recovered == pytest.approx(1e-2, rel=1e-3)
+
+
+def test_checkpoint_meta_records_run_config(tmp_path, synthetic_inverse_setup):
+    weight = 1e-2
+    raw = _run_with_smoothness(synthetic_inverse_setup, tmp_path, weight)
+    meta = raw["meta"]
+
+    # meta was plumbed through save/load_inverse_ckpt but never populated, which
+    # is why smoothness_weight had to be solved for on every existing artifact.
+    assert meta["smoothness_weight"] == weight
+    assert meta["K_inner"] == 3
+    assert meta["T"] == synthetic_inverse_setup["T"]
+    # With meta present the weight is read exactly; without it, it is solved
+    # back out of float32-stored predictions and so agrees only to ~1e-4
+    # relative. That gap is the reason for recording meta in the first place -
+    # the two paths must agree, but only the recorded one is exact.
+    np.testing.assert_allclose(
+        utils_inverse.recover_nrmse_trajectory(raw),
+        utils_inverse.recover_nrmse_trajectory(dict(raw, meta={})),
+        rtol=1e-4,
+    )

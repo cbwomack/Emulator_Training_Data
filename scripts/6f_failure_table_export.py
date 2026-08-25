@@ -94,13 +94,63 @@ def _pct_improvement_for(baseline_res, optimized_res):
 
 
 def compute_agent_table(seed_baseline_results, seed_optimized_results):
-    """Returns (mean, std) arrays, shape (len(LEG_LABELS)+1, len(TRAIN_SCENARIOS))."""
+    """Per-cell seed statistics, each shape (len(LEG_LABELS)+1, len(TRAIN_SCENARIOS)).
+
+    Reports both conventions. The figures switched to median + IQR on
+    2026-08-25 (utils_plotting.AGGREGATION_DEFAULT), so `median`/`p25`/`p75`
+    describe what is actually drawn; `mean`/`std` are retained because the
+    manuscript's earlier numbers were quoted that way and because the gap
+    between the two is itself informative - these distributions are
+    right-skewed, so mean and median differ systematically.
+    """
     n_seeds = len(seed_baseline_results)
     stacked = np.stack([
         _pct_improvement_for(seed_baseline_results[s], seed_optimized_results[s])
         for s in range(n_seeds)
     ], axis=0)
-    return stacked.mean(axis=0), stacked.std(axis=0)
+    return {
+        "mean": stacked.mean(axis=0), "std": stacked.std(axis=0),
+        "median": np.median(stacked, axis=0),
+        "p25": np.percentile(stacked, 25, axis=0),
+        "p75": np.percentile(stacked, 75, axis=0),
+        "min": stacked.min(axis=0), "max": stacked.max(axis=0),
+        "n_seeds": n_seeds,
+    }
+
+
+def _rows_for(agent, stats, row_labels):
+    """Emit one CSV row per (test, train) cell for a single panel."""
+    rows = []
+    for i, row_label in enumerate(row_labels):
+        for j, train_scen in enumerate(TRAIN_SCENARIOS):
+            med = float(stats["median"][i, j])
+            p25, p75 = float(stats["p25"][i, j]), float(stats["p75"][i, j])
+            val_mean, val_std = float(stats["mean"][i, j]), float(stats["std"][i, j])
+            # Hatching/clipping follow the MEDIAN, because that is the value the
+            # figure now draws. `hatched_under_mean_convention` preserves the
+            # pre-2026-08-25 answer so the two can be compared directly.
+            hatched = med <= HATCH_LIMIT
+            clipped = med < YLIM[0] or med > YLIM[1]
+            rows.append({
+                "agent": agent, "test_scenario": row_label, "train_scenario": train_scen,
+                "pct_improvement_median": round(med, 2),
+                "pct_improvement_p25": round(p25, 2),
+                "pct_improvement_p75": round(p75, 2),
+                "pct_improvement_iqr": round(p75 - p25, 2),
+                "pct_improvement_mean": round(val_mean, 2),
+                "pct_improvement_std": round(val_std, 2),
+                "pct_improvement_min": round(float(stats["min"][i, j]), 2),
+                "pct_improvement_max": round(float(stats["max"][i, j]), 2),
+                "n_seeds": stats["n_seeds"],
+                "hatched_in_figure": hatched,
+                "clipped_by_ylim": clipped,
+                "hatched_under_mean_convention": val_mean <= HATCH_LIMIT,
+            })
+            flag = " [HATCHED]" if hatched else (" [CLIPPED]" if clipped else "")
+            print(f"[{agent}] {row_label:12s} x {train_scen:14s}: "
+                  f"median {med:+8.2f}% (IQR {p25:+7.2f}..{p75:+7.2f}) "
+                  f"| mean {val_mean:+8.2f} +/- {val_std:5.2f}%{flag}")
+    return rows
 
 
 def main():
@@ -112,47 +162,23 @@ def main():
         agent = AGENT_LABELS[agent_lower]
         seed_base = data["seed_baseline_results_list"][agent_idx]
         seed_opt = data["seed_optimized_results_list"][agent_idx]
-        mean, std = compute_agent_table(seed_base, seed_opt)
-
-        for i, row_label in enumerate(row_labels):
-            for j, train_scen in enumerate(TRAIN_SCENARIOS):
-                val_mean, val_std = float(mean[i, j]), float(std[i, j])
-                hatched = val_mean <= HATCH_LIMIT
-                clipped = val_mean < YLIM[0] or val_mean > YLIM[1]
-                rows.append({
-                    "agent": agent, "test_scenario": row_label, "train_scenario": train_scen,
-                    "pct_improvement_mean": round(val_mean, 2), "pct_improvement_std": round(val_std, 2),
-                    "hatched_in_figure": hatched, "clipped_by_ylim": clipped,
-                })
-                flag = " [HATCHED]" if hatched else (" [CLIPPED]" if clipped else "")
-                print(f"[{agent}] {row_label:12s} x {train_scen:14s}: "
-                      f"{val_mean:+7.2f} +/- {val_std:5.2f}%{flag}")
+        rows.extend(_rows_for(agent, compute_agent_table(seed_base, seed_opt), row_labels))
 
     # Figure 4's multi-agent panel - same shape/scenario-naming, one more row group.
     with open(MULTI_AGENT_SEED_SPREAD_PATH, "rb") as f:
         multi_seed_spread = pickle.load(f)
     seed_base_multi = [multi_seed_spread[s]["baseline"] for s in sorted(multi_seed_spread)]
     seed_opt_multi = [multi_seed_spread[s]["optimal"] for s in sorted(multi_seed_spread)]
-    mean, std = compute_agent_table(seed_base_multi, seed_opt_multi)
-
-    for i, row_label in enumerate(row_labels):
-        for j, train_scen in enumerate(TRAIN_SCENARIOS):
-            val_mean, val_std = float(mean[i, j]), float(std[i, j])
-            hatched = val_mean <= HATCH_LIMIT
-            clipped = val_mean < YLIM[0] or val_mean > YLIM[1]
-            rows.append({
-                "agent": "Multi-agent", "test_scenario": row_label, "train_scenario": train_scen,
-                "pct_improvement_mean": round(val_mean, 2), "pct_improvement_std": round(val_std, 2),
-                "hatched_in_figure": hatched, "clipped_by_ylim": clipped,
-            })
-            flag = " [HATCHED]" if hatched else (" [CLIPPED]" if clipped else "")
-            print(f"[Multi-agent] {row_label:12s} x {train_scen:14s}: "
-                  f"{val_mean:+7.2f} +/- {val_std:5.2f}%{flag}")
+    rows.extend(_rows_for("Multi-agent",
+                          compute_agent_table(seed_base_multi, seed_opt_multi), row_labels))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     csv_path = OUT_DIR / "fig4_SI_fig6_failure_table.csv"
-    fieldnames = ["agent", "test_scenario", "train_scenario", "pct_improvement_mean",
-                  "pct_improvement_std", "hatched_in_figure", "clipped_by_ylim"]
+    fieldnames = ["agent", "test_scenario", "train_scenario",
+                  "pct_improvement_median", "pct_improvement_p25", "pct_improvement_p75",
+                  "pct_improvement_iqr", "pct_improvement_mean", "pct_improvement_std",
+                  "pct_improvement_min", "pct_improvement_max", "n_seeds",
+                  "hatched_in_figure", "clipped_by_ylim", "hatched_under_mean_convention"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -162,8 +188,15 @@ def main():
 
     n_hatched = sum(1 for r in rows if r["hatched_in_figure"])
     n_clipped = sum(1 for r in rows if r["clipped_by_ylim"])
+    n_hatched_mean = sum(1 for r in rows if r["hatched_under_mean_convention"])
     print(f"{n_hatched} rows hatched in the figure (<=-{-HATCH_LIMIT}%), "
           f"{n_clipped} rows outside the y-axis view {YLIM}")
+    print(f"(under the pre-2026-08-25 mean convention it was {n_hatched_mean} - "
+          f"the figures now plot the median, so hatching follows it)")
+    worst = min(rows, key=lambda r: r["pct_improvement_median"])
+    print(f"largest hidden magnitude: {worst['agent']} / {worst['test_scenario']} x "
+          f"{worst['train_scenario']} = {worst['pct_improvement_median']:.0f}% "
+          f"(IQR {worst['pct_improvement_p25']:.0f}..{worst['pct_improvement_p75']:.0f})")
 
 
 if __name__ == "__main__":

@@ -1109,6 +1109,198 @@ def load_inverse_ckpt_errors_only(path: str) -> dict:
         raw = pickle.load(f)
     return {"errors": jnp.asarray(raw["errors"], dtype=jnp.float32)}
 
+
+# -----------------------------------------------------------------------------
+# Recovering true NRMSE from a checkpoint's recorded objective
+# -----------------------------------------------------------------------------
+# optimize_emissions_inverse records the FULL objective in 'errors', not the
+# error term (see make_inverse_objective_single_train):
+#
+#     errors[k] = nrmse[k] + smoothness_weight * sum_agents sum_t (dU)^2
+#
+# Figures 3 and 5 report NRMSE, so the penalty has to be subtracted back out.
+# It is a pure function of U, so the correction is exact - no re-optimization
+# is needed, only the trajectory already stored in the checkpoint.
+#
+# Index alignment: the outer loop evaluates the loss at the CURRENT iterate and
+# then steps, so errors[k] = loss(U_traj[k-1]) for k >= 1, while errors[0] =
+# loss(U_traj[0]) is computed separately before the loop. That makes errors[0]
+# and errors[1] duplicates and offsets errors from U_traj by one thereafter.
+
+def smoothness_penalty(U: dict) -> float:
+    """Sum of squared first differences over every agent in one emissions iterate.
+
+    Matches make_inverse_objective_single_train's reg_loss exactly, including
+    its use of an UNNORMALIZED sum in each agent's native units - which is why
+    its magnitude varies by ~5 orders of magnitude between the single-forcing
+    and multi-agent regimes.
+    """
+    return float(sum(np.sum(np.diff(np.asarray(v, dtype=np.float64)) ** 2)
+                     for v in U.values()))
+
+
+def _nrmse_from_preds(preds_entry: list, eps: float = 1e-8) -> float:
+    """Recompute avg_nrmse_over_tests from one saved preds_traj entry.
+
+    preds_traj stores [(scenario, y_hat, y_true), ...] every `preds_every`
+    steps, which is enough to reproduce the objective's NRMSE term directly
+    rather than inferring it - see recover_smoothness_weight.
+    """
+    vals, weights = [], []
+    for (_scen, yhat, ytrue) in preds_entry:
+        yhat = np.asarray(yhat, dtype=np.float64)
+        ytrue = np.asarray(ytrue, dtype=np.float64)
+        rmse = np.sqrt(np.mean((yhat - ytrue) ** 2))
+        vals.append(rmse / (np.max(np.abs(ytrue)) + eps))
+        weights.append(len(ytrue))
+    return float(np.average(vals, weights=weights))
+
+
+# Relative agreement required between a recorded loss and the NRMSE recomputed
+# from preds_traj before the difference counts as a real penalty rather than
+# float32 round-off. See recover_smoothness_weight.
+_NRMSE_RECOMPUTE_RTOL = 1e-5
+
+
+def _infer_preds_every(raw: dict) -> int:
+    """How many outer steps separate consecutive preds_traj entries.
+
+    preds_traj holds one pre-loop entry plus one per `preds_every` steps, and
+    errors holds one per step plus the same pre-loop entry, so the stride is
+    exact rather than a guess. Deriving it removes the failure mode where a
+    mismatched default silently samples nothing (see recover_smoothness_weight).
+    """
+    n_err, n_preds = len(raw["errors"]), len(raw.get("preds_traj") or [])
+    if n_preds > 1 and (n_err - 1) % (n_preds - 1) == 0:
+        return (n_err - 1) // (n_preds - 1)
+    recorded = (raw.get("meta") or {}).get("preds_every")
+    return int(recorded) if recorded else 50
+
+
+def recover_smoothness_weight(raw: dict, preds_every: int | None = None) -> tuple[float, float]:
+    """Solve for the smoothness_weight a checkpoint was produced with.
+
+    The hyperparameters are not stored with the checkpoint (`meta` is empty on
+    every artifact produced so far), but they are recoverable: preds_traj holds
+    predictions every `preds_every` steps, so the objective's NRMSE term can be
+    recomputed directly and the penalty read off as the residual,
+
+        w = (errors[k] - nrmse[k]) / smoothness_penalty(U_traj[k-1])
+
+    Solving at every available k over-determines a single scalar, so the spread
+    across those solutions doubles as a correctness check. Returns
+    (weight, spread); a spread far above `tol` relative to the weight means the
+    index alignment or the objective's form does not match this checkpoint, and
+    the caller should not trust the result.
+
+    Validated against CO2-only, whose weight is independently known from
+    data/SI_results/hp_retune/best_config_unified.json: recovers 1e-6 to ~11
+    significant figures. Every family checked so far recovers a value lying
+    exactly on Stage 0b's search grid {0, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4}.
+    """
+    errors = np.asarray(raw["errors"], dtype=np.float64)
+    U_traj, preds_traj = raw["U_traj"], raw["preds_traj"]
+    if preds_every is None:
+        preds_every = _infer_preds_every(raw)
+
+    residuals, penalties, n_sampled = [], [], 0
+    for j in range(1, len(preds_traj)):
+        k = preds_every * j
+        if k >= len(errors) or k - 1 >= len(U_traj):
+            break
+        n_sampled += 1
+        penalty = smoothness_penalty(U_traj[k - 1])
+        if penalty > 0.0:
+            residuals.append(errors[k] - _nrmse_from_preds(preds_traj[j]))
+            penalties.append(penalty)
+
+    if n_sampled == 0:
+        # Nothing was sampled at all - a wrong `preds_every`, or a run too short
+        # to have written a second preds_traj entry. Returning 0.0 here would
+        # silently report "unregularized" and skip a real correction, so this
+        # has to fail loudly instead.
+        raise ValueError(
+            f"could not sample any (errors, preds_traj) pair at preds_every="
+            f"{preds_every} (len(errors)={len(errors)}, "
+            f"len(preds_traj)={len(preds_traj)}) - cannot recover smoothness_weight"
+        )
+    if not residuals:
+        # Sampled fine, but every penalty was exactly zero - a constant
+        # trajectory. The weight is unidentifiable and also irrelevant, since it
+        # multiplies zero at every iterate.
+        return 0.0, 0.0
+
+    residuals, penalties = np.array(residuals), np.array(penalties)
+
+    # Decide "unregularized" on the residual, not on the solved weight. An
+    # unregularized run leaves errors[k] - nrmse[k] == 0 up to the precision of
+    # the recomputation (preds_traj is stored float32, so ~1e-7 relative), and
+    # dividing that noise by the penalty gives a spurious weight whose size
+    # depends entirely on the penalty's scale - ~1e-14 for the real checkpoints
+    # (penalty ~1e2-1e8) but ~1e-7 for a small synthetic run (penalty ~1). The
+    # residual test is scale-free. The margin is wide: the smallest real
+    # contribution seen is CO2's at ~1.4% of its loss, three orders above this.
+    if np.max(np.abs(residuals)) <= _NRMSE_RECOMPUTE_RTOL * np.max(np.abs(errors)):
+        return 0.0, 0.0
+
+    solutions = residuals / penalties
+    return float(np.median(solutions)), float(np.ptp(solutions))
+
+
+def recover_nrmse_trajectory(raw: dict, smoothness_weight: float | None = None,
+                             preds_every: int | None = None) -> np.ndarray:
+    """Return the true NRMSE trajectory for a checkpoint, penalty removed.
+
+    `smoothness_weight=None` (the default) recovers it from the checkpoint
+    itself via recover_smoothness_weight. Pass an explicit value only to
+    override that - e.g. to check a checkpoint against a config file.
+
+    Raises ValueError if the correction would drive any NRMSE non-positive,
+    which means the supplied weight is wrong: NRMSE is non-negative by
+    construction, so this is a real guard rather than a formality.
+    """
+    errors = np.asarray(raw["errors"], dtype=np.float64)
+    if smoothness_weight is None:
+        # Checkpoints written after meta was populated carry the weight
+        # directly; older ones have to be solved for.
+        recorded = (raw.get("meta") or {}).get("smoothness_weight")
+        smoothness_weight = (float(recorded) if recorded is not None
+                             else recover_smoothness_weight(raw, preds_every=preds_every)[0])
+
+    if smoothness_weight == 0.0:
+        # Unregularized: 'errors' is already pure NRMSE. Skip the O(len(U_traj))
+        # penalty sweep entirely - this is the common case (CH4, Sulfur and the
+        # whole multi-agent family were all forced to 0, see REVISIONS.md).
+        return errors
+
+    U_traj = raw["U_traj"]
+    penalties = np.array([smoothness_penalty(U_traj[max(k - 1, 0)])
+                          for k in range(len(errors))])
+    nrmse = errors - smoothness_weight * penalties
+    if np.any(nrmse <= 0.0):
+        raise ValueError(
+            f"smoothness_weight={smoothness_weight:g} drives NRMSE non-positive "
+            f"(min {nrmse.min():.6g}) - the weight does not match this checkpoint"
+        )
+    return nrmse
+
+
+def load_inverse_ckpt_nrmse_only(path: str, smoothness_weight: float | None = None,
+                                 preds_every: int | None = None) -> dict:
+    """Memory-light loader returning the penalty-corrected NRMSE trajectory.
+
+    The seed-sweep loaders read hundreds of checkpoints and use nothing but the
+    error curve, so this mirrors load_inverse_ckpt_errors_only's contract -
+    returns {"errors": ...} only, not load_inverse_ckpt's full shape - but the
+    trajectory it returns is true NRMSE rather than the recorded objective.
+    Everything deserialized beyond that is dropped before returning.
+    """
+    with open(path, "rb") as f:
+        raw = pickle.load(f)
+    return {"errors": jnp.asarray(
+        recover_nrmse_trajectory(raw, smoothness_weight, preds_every), dtype=jnp.float32)}
+
+
 def scale_by_coord_pytree(weights_pytree: dict) -> optax.GradientTransformation:
     """An optax transform that elementwise-multiplies gradients by a matching pytree of weights."""
     def _mul(g, w): return g * w
@@ -1287,6 +1479,24 @@ def optimize_emissions_inverse(
     train_temp_traj = []
     updates_done = 0
 
+    # Resolved run config, written into every checkpoint. `meta` has been
+    # plumbed through save/load_inverse_ckpt all along but never populated, so
+    # the hyperparameters that produced a checkpoint were unrecoverable from
+    # the artifact itself - smoothness_weight in particular had to be solved
+    # for after the fact (see recover_smoothness_weight) before Figures 3 and 5
+    # could report NRMSE rather than the full objective. Recording it here
+    # means new checkpoints never need that reconstruction.
+    meta = {
+        "num_updates": num_updates, "step_size": step_size, "momentum": momentum,
+        "nesterov": nesterov, "K_inner": K_inner, "lr_inner": lr_inner,
+        "wd_inner": wd_inner, "batch_size": batch_size,
+        "smoothness_weight": smoothness_weight, "init_cond": init_cond
+            if isinstance(init_cond, str) or init_cond is None else "array",
+        "T": T, "filter_hist": filter_hist, "mode": mode,
+        "ema_windows_years": ema_windows_years, "preds_every": preds_every,
+        "active_agents": list(active_agents) if active_agents else None,
+    }
+
     if resume_if_exists and checkpoint_path and os.path.isfile(checkpoint_path):
         print("Resuming from checkpoint...")
         ckpt = load_inverse_ckpt(checkpoint_path)
@@ -1357,7 +1567,7 @@ def optimize_emissions_inverse(
             state = {
                 "U_traj": U_traj, "errors": errors, "opt_state": opt_state,
                 "step_count": updates_done, "time_weights": time_weights,
-                "paramsK_k": _tree_to_numpy(paramsK_k),
+                "paramsK_k": _tree_to_numpy(paramsK_k), "meta": meta,
                 "preds_traj": preds_traj, "train_temp_traj": train_temp_traj,
             }
             save_inverse_ckpt(checkpoint_path, state)
@@ -1629,11 +1839,22 @@ def evaluate_optimal_emulator(
     ind_effects: bool = False,
     ema_windows_years: tuple = (5.0, 30.0, 100.0),
     batch_size: int | None = None,
+    u_index: int = -1,
 ) -> dict | tuple[dict, dict]:
     """
     For each optimize_emissions_inverse checkpoint in `training_paths` (final U in
     the trajectory), train a fresh MLP on the resulting optimal emissions and
     evaluate NRMSE against every eval_sets entry. Returns results_out
+
+    `u_index` (default -1 = the final iterate, i.e. exactly the prior behaviour)
+    selects which outer iterate to evaluate. Any other value turns this into an
+    out-of-sample convergence probe: the checkpoint's own `errors` curve is the
+    bilevel objective measured IN-SAMPLE on the group being optimized, so it
+    falls by construction and cannot say whether generalization is still
+    improving. Evaluating U_traj[k] for a series of k answers that, and is what
+    decides whether running longer helps or just overfits the target group.
+    Mirrors the `u_index` replay already used by
+    scripts/6c_ood_scenario_ssp370_lowntcf.py.
 
     `batch_size` (default None = full-batch) must match whatever batch_size
     actually produced the checkpoints in `training_paths`, or this fresh
@@ -1663,9 +1884,18 @@ def evaluate_optimal_emulator(
         with open(path, "rb") as f:
             raw = pickle.load(f)
 
-        # Extract final optimized emissions (dict)
-        U_traj = [_tree_to_jnp(u) for u in raw["U_traj"]]
-        U_final_dict = U_traj[-1]
+        # Extract the selected optimized emissions iterate (dict).
+        # Index the raw list FIRST, then convert only that one pytree. Converting
+        # the whole trajectory materialized ~5x1001 device arrays to read a
+        # single iterate, which is enough to OOM an 8GB box; it also gets worse
+        # linearly as trajectories lengthen. Negative indices work directly on
+        # the list, so -1 still means the final iterate.
+        n_iters = len(raw["U_traj"])
+        if not -n_iters <= u_index < n_iters:
+            raise IndexError(
+                f"u_index={u_index} out of range for {path} "
+                f"(trajectory has {n_iters} iterates)")
+        U_final_dict = _tree_to_jnp(raw["U_traj"][u_index])
 
         # 2) Mask inactive agents (returns dict)
         U_eff_dict = _apply_active_mask_to_emis(U_final_dict, active_agents, inactive_mode)
@@ -2614,12 +2844,19 @@ def load_fig3_single_forcing_data(agents: list[str] = ['co2', 'ch4', 'n2o', 'Sul
     Per-agent single-forcing inverse vs. baseline NRMSE (Figure 3) for
     utils_plotting.plot_rmse_comparison_single.
     Returns {'results_inverse', 'results_baseline', 'labels'}.
+
+    'errors' is replaced with the penalty-corrected NRMSE trajectory
+    (recover_nrmse_trajectory) so the figure reports the error term alone
+    rather than the recorded objective - see the section banner above
+    load_inverse_ckpt_nrmse_only.
     """
     results_inverse, results_baseline = [], []
     for a in agents:
         path_inverse = f'checkpoints/{a}/inverse_constant_tier1_{a}_only.pkl'
         path_baseline = f'checkpoints/{a}/baseline_{a}_only.pkl'
-        results_inverse.append(load_inverse_ckpt(path_inverse))
+        ckpt = load_inverse_ckpt(path_inverse)
+        ckpt["errors"] = jnp.asarray(recover_nrmse_trajectory(ckpt), dtype=jnp.float32)
+        results_inverse.append(ckpt)
         with open(path_baseline, "rb") as f:
             results_baseline.append(pickle.load(f)['Tier 1']['mean'])
 
@@ -2648,6 +2885,11 @@ def load_fig3_single_forcing_data_seed_sweep(
     than silently falling back to a single point - a partially-seeded
     Figure 3 would misleadingly look like some agents are simply "more
     certain" than others when it's really just missing data.
+
+    Each 'errors' trajectory is the penalty-corrected NRMSE
+    (recover_nrmse_trajectory), not the recorded objective. The correction is
+    exact and per-checkpoint; it is a no-op for CH4 and Sulfur, whose tuned
+    smoothness_weight is 0, and shifts N2O/BC by ~11% and CO2 by ~1.4%.
     """
     seed_errors_list, seed_baseline_error_list = [], []
     for a in agents:
@@ -2663,7 +2905,7 @@ def load_fig3_single_forcing_data_seed_sweep(
                     f"scripts/0c_regenerate_checkpoints_agent.py --agent {a} first "
                     f"(scripts/0c_regenerate_checkpoints_co2.py for co2)"
                 )
-            errs.append(load_inverse_ckpt_errors_only(ckpt_path))
+            errs.append(load_inverse_ckpt_nrmse_only(ckpt_path))
             with open(baseline_path, "rb") as f:
                 bases.append(pickle.load(f)['Tier 1']['mean'])
         seed_errors_list.append(errs)
@@ -3110,11 +3352,59 @@ def load_fig5_multi_forcing_data(
     original checkpoints/multi/*_subset*.pkl family is deprecated (dated
     January 2026, wildly inconsistent per-group update counts). See
     REVISIONS.md Session Log.
+
+    'errors' is the penalty-corrected NRMSE trajectory
+    (recover_nrmse_trajectory). For the multi-agent family this is a no-op -
+    its tuned smoothness_weight is 0 - but the correction is applied rather
+    than assumed, so the figure stays right if the checkpoint family changes.
     """
     results = load_inverse_ckpt(path_inverse)
+    results["errors"] = jnp.asarray(recover_nrmse_trajectory(results), dtype=jnp.float32)
     with open(path_baseline, "rb") as f:
         baseline_error = pickle.load(f)['Tier 1']['mean']
     return {"results": results, "baseline_error": baseline_error}
+
+def load_fig5_multi_forcing_data_seed_sweep(
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str = 'checkpoints/multi_fig4/seed_sweep',
+    tag: str = 'multi_fig4',
+) -> dict:
+    """Multi-seed companion to load_fig5_multi_forcing_data.
+
+    The Figure-3 analogue (load_fig3_single_forcing_data_seed_sweep) has had a
+    seed sweep since Stage 6a, but Figure 5's left panel remained a single seed-0
+    line, so the two panels reported uncertainty differently. This closes that
+    gap: same `checkpoints/multi_fig4/seed_sweep/` family the single-seed loader
+    already points at, just every seed rather than only seed 0.
+
+    Returns kwargs for utils_plotting.plot_rmse_comparison_multi's `seed_errors`/
+    `seed_baseline_errors`. Trajectories are penalty-corrected NRMSE (a no-op
+    for this family, whose smoothness_weight is 0 - but applied, not assumed).
+
+    Raises FileNotFoundError listing what is missing rather than silently
+    plotting a partial sweep, matching the Figure-3 loader's rationale: a
+    partially-seeded band would read as genuine confidence rather than absence.
+    """
+    errs, bases, missing = [], [], []
+    for seed in seeds:
+        ckpt_path = f'{checkpoint_dir}/inverse_constant_tier1_{tag}_seed{seed}.pkl'
+        baseline_path = f'{checkpoint_dir}/baseline_{tag}_seed{seed}.pkl'
+        if not Path(ckpt_path).exists() or not Path(baseline_path).exists():
+            missing.append(seed)
+            continue
+        errs.append(load_inverse_ckpt_nrmse_only(ckpt_path))
+        with open(baseline_path, "rb") as f:
+            bases.append(pickle.load(f)['Tier 1']['mean'])
+
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} of {len(seeds)} seeds missing from {checkpoint_dir} "
+            f"(first few: {missing[:5]}) - regenerate with "
+            f"scripts/0c_regenerate_checkpoints_multi_fig4.py + "
+            f"scripts/submit_multi_fig4_regen.py, or transfer them from the cluster"
+        )
+    return {"seed_errors": errs, "seed_baseline_errors": bases}
+
 
 def regenerate_fig6_individual_effects_cache(
     save_dir: str = 'data/plotting',

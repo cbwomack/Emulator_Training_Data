@@ -87,6 +87,51 @@ def plot_updates(res: dict, save: bool = False) -> None:
   if save:
     plt.savefig(FIGURES_DIR / "emis_updates.pdf", transparent=True)
 
+# Seed-aggregation convention shared by Figures 3, 4 and 5.
+#
+# 'median' (the manuscript default as of 2026-08-25) reports the median with an
+# interquartile band. 'mean' reproduces each figure's own prior behaviour, which
+# differed per figure - min-max for Fig 3, +/- std for Fig 4 - so the two are
+# not interchangeable and `mean_band` records which one to reproduce.
+#
+# Why median + IQR: these seed distributions are right-skewed (mean > median at
+# essentially every iteration), so a symmetric +/- std band misrepresents both
+# tails, and on Fig 3's log axis its lower edge can go non-positive and fail to
+# render at all - the reason Fig 3 used min-max instead. Median pairs naturally
+# with the IQR, both bounds stay strictly positive, and the band is ~3x tighter:
+# across Figure 4's 50 cells the number whose band straddles zero drops from 18
+# to 8, while only ONE cell changes sign, so legibility improves without any
+# conclusion moving. The IQR covers 50% of seeds, which captions must state.
+AGGREGATION_DEFAULT = "median"
+
+
+def _aggregate_seeds(stacked, aggregation: str = AGGREGATION_DEFAULT,
+                     mean_band: str = "std"):
+    """Collapse a (n_seeds, ...) stack to (centre, low, high) for plotting.
+
+    `mean_band` selects which band the 'mean' convention pairs with, so each
+    figure can reproduce its own prior output exactly: 'std' for Figure 4,
+    'minmax' for Figure 3.
+    """
+    stacked = np.asarray(stacked)
+    if aggregation == "median":
+        return (np.median(stacked, axis=0),
+                np.percentile(stacked, 25, axis=0),
+                np.percentile(stacked, 75, axis=0))
+    if aggregation == "mean":
+        centre = stacked.mean(axis=0)
+        if mean_band == "minmax":
+            return centre, stacked.min(axis=0), stacked.max(axis=0)
+        spread = stacked.std(axis=0)
+        return centre, centre - spread, centre + spread
+    raise ValueError(f"unknown aggregation {aggregation!r} (expected 'median' or 'mean')")
+
+
+def _aggregation_label(aggregation: str, n: int) -> str:
+    """Legend text naming the convention, so the figure is self-describing."""
+    return f"median, IQR, n={n}" if aggregation == "median" else f"mean, n={n}"
+
+
 def plot_rmse_comparison_single(
     results_list: list[dict],       # List of dictionaries
     baseline_error_list: list[float],     # Single float value
@@ -94,6 +139,7 @@ def plot_rmse_comparison_single(
     save: bool = False,
     seed_errors_list: list[list[dict] | None] = None,
     seed_baseline_error_list: list[list[float] | None] = None,
+    aggregation: str = AGGREGATION_DEFAULT,
 ) -> None:
     """5-panel NRMSE-vs-update-step comparison, one panel per single-forcing agent experiment.
 
@@ -110,6 +156,17 @@ def plot_rmse_comparison_single(
     other seed-uncertainty plots, e.g. 0a_bilevel_scaled_plots.ipynb) instead
     of a single line. Leaving both at None (the default) is fully
     backward-compatible - reproduces the exact prior output.
+
+    On the y-axis: `results_list`/`seed_errors_list` are expected to carry the
+    penalty-corrected NRMSE that utils_inverse's load_fig3_* loaders now
+    return, NOT a checkpoint's raw 'errors' (which is the full objective,
+    NRMSE + smoothness_weight * sum(dU)^2). Passing raw 'errors' overstates
+    N2O and BC by ~11% and CO2 by ~1.4%.
+
+    Note for the caption: this curve is the bilevel objective evaluated on the
+    scenarios being optimized against, so it is in-sample - a training curve,
+    not held-out skill. Figure 4's retrain-and-evaluate path is the
+    out-of-sample counterpart.
     """
     layout = [
         ["Left", "Left", "Right1", "Right2"],
@@ -134,14 +191,13 @@ def plot_rmse_comparison_single(
 
         # --- Plotting: optimized-emulator trajectory ---
         if seed_errs is not None:
-            stacked = jnp.stack([jnp.asarray(r["errors"]) for r in seed_errs], axis=0)
-            mean_errors = jnp.mean(stacked, axis=0)
-            min_errors = jnp.min(stacked, axis=0)
-            max_errors = jnp.max(stacked, axis=0)
-            x_err = jnp.arange(mean_errors.shape[0])
-            ax.loglog(x_err, mean_errors, label=f"Optimized emulator\n(mean, n={len(seed_errs)})", lw=2, color=cmap(0))
-            ax.fill_between(np.asarray(x_err), np.asarray(min_errors), np.asarray(max_errors),
-                             color=cmap(0), alpha=0.2, linewidth=0)
+            stacked = np.stack([np.asarray(r["errors"]) for r in seed_errs], axis=0)
+            centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
+            x_err = np.arange(centre.shape[0])
+            ax.loglog(x_err, centre, lw=2, color=cmap(0),
+                      label="Optimized emulator\n"
+                            f"({_aggregation_label(aggregation, len(seed_errs))})")
+            ax.fill_between(x_err, lo, hi, color=cmap(0), alpha=0.2, linewidth=0)
         else:
             result = results_list[i]
             errors = jnp.asarray(result["errors"])
@@ -151,10 +207,12 @@ def plot_rmse_comparison_single(
         # --- Plotting: baseline lower bound ---
         if seed_base is not None:
             base_arr = np.asarray(seed_base, dtype=float)
-            base_mean, base_min, base_max = float(base_arr.mean()), float(base_arr.min()), float(base_arr.max())
-            ax.axhline(base_mean, ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound (mean)")
-            if base_max > base_min:
-                ax.axhspan(base_min, base_max, color=cm.lipariS(5), alpha=0.15, linewidth=0)
+            b_centre, b_lo, b_hi = _aggregate_seeds(base_arr, aggregation, mean_band="minmax")
+            stat = "median" if aggregation == "median" else "mean"
+            ax.axhline(float(b_centre), ls="--", c=cm.lipariS(5), lw=1.5,
+                       label=f"Baseline emulator\nerror lower bound ({stat})")
+            if float(b_hi) > float(b_lo):
+                ax.axhspan(float(b_lo), float(b_hi), color=cm.lipariS(5), alpha=0.15, linewidth=0)
         else:
             baseline_error = baseline_error_list[i]
             ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
@@ -196,8 +254,33 @@ def plot_rmse_comparison_single(
 
     return
 
-def plot_rmse_comparison_multi(results: dict, baseline_error: float, save: bool = False) -> None:
-    """3-panel figure: NRMSE-vs-step (left) plus optimal WMGHG and aerosol emissions trajectories (right, via _plot_agents)."""
+def plot_rmse_comparison_multi(results: dict, baseline_error: float, save: bool = False,
+                               seed_errors: list[dict] = None,
+                               seed_baseline_errors: list[float] = None,
+                               aggregation: str = AGGREGATION_DEFAULT) -> None:
+    """3-panel figure: NRMSE-vs-step (left) plus optimal WMGHG and aerosol emissions trajectories (right, via _plot_agents).
+
+    `seed_errors`/`seed_baseline_errors` (both optional, default None): the
+    multi-agent analogue of plot_rmse_comparison_single's seed mode. When given,
+    the left panel plots the aggregate trajectory across seeds with a band
+    instead of a single line, using the same convention as Figures 3 and 4.
+    Leaving both None reproduces the prior single-seed output exactly.
+
+    The right-hand emissions panels stay single-trajectory regardless: they show
+    one realized profile (`results['U_traj'][-1]`), and overlaying 50 of them
+    would obscure rather than inform.
+
+    `results["errors"]` is expected to be the penalty-corrected NRMSE that
+    load_fig5_multi_forcing_data now returns, not a checkpoint's raw 'errors'
+    (the full objective). For the multi-agent family the two coincide, since
+    its tuned smoothness_weight is 0 - but that is a property of the current
+    checkpoints, not of the figure.
+
+    Note for the caption: as in Figure 3, the left panel is the bilevel
+    objective on the optimization target, so it is in-sample. The right panels
+    show U_traj[-1], whose high-frequency content is discussed in the Figure 5
+    spectral analysis (scripts/6h_emissions_spectra.py).
+    """
     layout = [
         ["Left", "Left", "Right1", "Right1", "Right1"],
         ["Left", "Left", "Right2", "Right2", "Right2"]
@@ -213,11 +296,29 @@ def plot_rmse_comparison_multi(results: dict, baseline_error: float, save: bool 
 
     # --- Plot 1: RMSE (Left) ---
     ax = axd['Left']
-    errors = jnp.asarray(results["errors"])
-    x_err = jnp.arange(errors.shape[0])
+    if seed_errors is not None:
+        stacked = np.stack([np.asarray(r["errors"]) for r in seed_errors], axis=0)
+        centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
+        x_err = np.arange(centre.shape[0])
+        ax.loglog(x_err, centre, lw=2, color=cmap(1),
+                  label=f"Optimized emulator\n({_aggregation_label(aggregation, len(seed_errors))})")
+        ax.fill_between(x_err, lo, hi, color=cmap(1), alpha=0.2, linewidth=0)
+    else:
+        errors = np.asarray(results["errors"])
+        x_err = np.arange(errors.shape[0])
+        ax.loglog(x_err, errors, label="Optimized emulator", lw=2, color=cmap(1))
 
-    ax.loglog(x_err, errors, label="Optimized emulator", lw=2, color=cmap(1))
-    ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
+    if seed_baseline_errors is not None:
+        b_centre, b_lo, b_hi = _aggregate_seeds(
+            np.asarray(seed_baseline_errors, dtype=float), aggregation, mean_band="minmax")
+        stat = "median" if aggregation == "median" else "mean"
+        ax.axhline(float(b_centre), ls="--", c=cm.lipariS(5), lw=1.5,
+                   label=f"Baseline emulator\nerror lower bound ({stat})")
+        if float(b_hi) > float(b_lo):
+            ax.axhspan(float(b_lo), float(b_hi), color=cm.lipariS(5), alpha=0.15, linewidth=0)
+    else:
+        ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5,
+                   label="Baseline emulator\nerror lower bound")
 
     # Styling
     ax.margins(x=0, y=0.2)
@@ -1094,7 +1195,8 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
                                   figname: str = '',
                                   n_plots: int=1,
                                   seed_baseline_results: list[dict] = None,
-                                  seed_optimized_results: list[dict] = None) -> None:
+                                  seed_optimized_results: list[dict] = None,
+                                  aggregation: str = AGGREGATION_DEFAULT) -> None:
     """
     Grouped horizontal bar chart of % NRMSE improvement (optimized vs. baseline), grouped by test scenario.
 
@@ -1148,15 +1250,21 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
 
         return np.vstack([pct_improvement, avg_improvement]) * 100
 
-    pct_std = None
+    pct_err = None
     if seed_mode:
         n_seeds = len(seed_baseline_results)
         stacked = np.stack([
             _pct_improvement_for(seed_baseline_results[s], seed_optimized_results[s])
             for s in range(n_seeds)
         ], axis=0)
-        plot_data = stacked.mean(axis=0)
-        pct_std = stacked.std(axis=0)
+        plot_data, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="std")
+        # ax.bar's yerr wants distances from the bar top, not absolute bounds,
+        # and the IQR is asymmetric about the median, so both halves are passed
+        # explicitly. Clipped at 0 because a centre outside its own band (which
+        # +/- std can produce on a skewed distribution) would otherwise give
+        # matplotlib a negative error length.
+        pct_err = np.stack([np.clip(plot_data - lo, 0, None),
+                            np.clip(hi - plot_data, 0, None)], axis=0)
     else:
         plot_data = _pct_improvement_for(baseline_results, optimized_results)
 
@@ -1187,7 +1295,7 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
 
         bars = ax.bar(x_positions + offset, row_values,
                       width=bar_width,
-                      yerr=pct_std[i] if pct_std is not None else None,
+                      yerr=pct_err[:, i] if pct_err is not None else None,
                       capsize=2,
                       label=label,
                       edgecolor='black',
@@ -1309,7 +1417,8 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
                                save: bool = False,
                                figname: str = 'stacked_comparison',
                                seed_baseline_results_list: list[list[dict] | None] = None,
-                               seed_optimized_results_list: list[list[dict] | None] = None) -> None:
+                               seed_optimized_results_list: list[list[dict] | None] = None,
+                               aggregation: str = AGGREGATION_DEFAULT) -> None:
     """
     Creates N vertical subplots using the plot_grouped_improvement_bars logic.
     Assumes baseline_results_list and optimized_results_list have the same length.
@@ -1363,6 +1472,7 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
             save=False,
             seed_baseline_results=curr_seed_base,
             seed_optimized_results=curr_seed_opt,
+            aggregation=aggregation,
             n_plots=n_plots
         )
 
