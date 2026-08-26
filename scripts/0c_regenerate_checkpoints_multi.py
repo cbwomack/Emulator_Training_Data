@@ -15,7 +15,7 @@ config (data/SI_results/hp_retune/multi/best_config_unified.json) and
 6e_baseline_hp_search_k400_multi.py's own baseline config (CO2's tuned
 config confirmed NOT to transfer to the multi-agent case - see REVISIONS.md).
 
-NUM_UPDATES=1000 and the 50-seed sweep both match the single-forcing
+NUM_UPDATES=2000 (extended 2026-08-25) and the 50-seed sweep both match the single-forcing
 convention exactly, per user direction (2026-08-13) - the old multi
 checkpoints used inconsistent update counts per group (500-10000, see
 REVISIONS.md Session Log), unlike every single-forcing agent's uniform
@@ -47,7 +47,7 @@ import jax
 import utils_inverse
 
 MODE = "FaIR"
-NUM_UPDATES = 1000  # matches the single-forcing convention, per user direction 2026-08-13
+NUM_UPDATES = 2000  # extended from 1000 (2026-08-25) after the Stage A out-of-sample gate; resumes in place
 AGENTS = ["CO2", "CH4", "N2O", "Sulfur", "BC"]
 ACTIVE_AGENTS = ("CO2", "CH4", "N2O", "Sulfur", "BC")
 TAG = "all_agents"

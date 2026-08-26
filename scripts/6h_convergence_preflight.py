@@ -172,19 +172,34 @@ def summarize(family, out, iterates):
 
     print(f"\n--- verdict ({family}) ---")
     verdicts = {}
+    k_last, k_prev = iterates[-1], iterates[-2]
     for es in eval_names:
         curve = np.array([med[k][es] for k in iterates])
-        # Compare the last probed interval: still falling means the run had not
-        # finished extracting generalization by iteration 1000.
-        last_delta = curve[-1] - curve[-2]
-        rel = last_delta / curve[-2] * 100
+        # Difference WITHIN each seed, then take the median of those changes.
+        # Differencing the median CURVE instead is not robust: the median at
+        # k=800 and at k=1000 can come from different seeds, so one outlier
+        # flips the sign of the reported step. That is not hypothetical - it
+        # inverted two of ten verdicts on the first 5-seed run (co2/DECK read
+        # +1.48% "turned" when 4/5 seeds improved, and multi/CS3 read -21%
+        # "falling" when 4/5 seeds degraded). The pre-registered rule is about
+        # whether runs are still improving, so the per-seed change is the
+        # quantity it refers to.
+        rels = np.array([(out[s][k_last][es] - out[s][k_prev][es])
+                         / out[s][k_prev][es] * 100 for s in out])
+        rel = float(np.median(rels))
+        n_worse = int((rels > 0).sum())
         best_k = iterates[int(np.argmin(curve))]
-        still_falling = last_delta < 0
-        verdicts[es] = {"still_falling": bool(still_falling), "last_delta_pct": float(rel),
+        # "Flat within seed noise" counts as turned: require both a negative
+        # median step and a majority of seeds moving the same way.
+        still_falling = bool(rel < 0 and n_worse * 2 < len(rels))
+        verdicts[es] = {"still_falling": still_falling, "last_delta_pct": rel,
+                        "n_worse": n_worse, "n_seeds": int(len(rels)),
+                        "per_seed_pct": rels.tolist(),
                         "argmin_iterate": int(best_k), "final": float(curve[-1]),
                         "min": float(curve.min())}
         flag = "FALLING" if still_falling else "TURNED"
-        print(f"  {es:11s} {flag:8s} last step {rel:+7.2f}%   best at iter {best_k:5d}"
+        print(f"  {es:11s} {flag:8s} median per-seed step {rel:+7.2f}%  "
+              f"({n_worse}/{len(rels)} seeds worse)   best at iter {best_k:5d}"
               + ("   <-- minimum is NOT at the end" if best_k != iterates[-1] else ""))
     return med, verdicts
 
@@ -215,9 +230,17 @@ def main():
     ap.add_argument("--seed-list", type=str, default=None,
                     help="explicit comma-separated seeds; overrides --seeds")
     ap.add_argument("--quick", action="store_true", help="probe only 0/500/1000")
+    ap.add_argument("--iterates", type=str, default=None,
+                    help="explicit comma-separated outer iterates to probe, e.g. "
+                         "'0,500,1000,1500,2000' after the Stage C extension; "
+                         "overrides --quick. All shards of one family must use "
+                         "the same list or --mode collect will pool ragged keys.")
     args = ap.parse_args()
 
-    iterates = [0, 500, 1000] if args.quick else DEFAULT_ITERATES
+    if args.iterates:
+        iterates = [int(k) for k in args.iterates.split(",")]
+    else:
+        iterates = [0, 500, 1000] if args.quick else DEFAULT_ITERATES
     seeds = ([int(s) for s in args.seed_list.split(",")] if args.seed_list
              else list(range(args.seeds)))
     families = list(FAMILIES) if args.family == "both" else [args.family]

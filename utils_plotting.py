@@ -102,6 +102,41 @@ def plot_updates(res: dict, save: bool = False) -> None:
 # across Figure 4's 50 cells the number whose band straddles zero drops from 18
 # to 8, while only ONE cell changes sign, so legibility improves without any
 # conclusion moving. The IQR covers 50% of seeds, which captions must state.
+def _preds_stride(results: dict, n_preds: int) -> int:
+    """Outer iterations between consecutive preds_traj entries.
+
+    preds_traj holds one pre-loop entry plus one every `preds_every` steps,
+    while errors holds one per step plus that same pre-loop entry, so the
+    stride divides exactly and can be recovered rather than assumed. Deriving
+    it is what lets a legend report the true iteration number at any run
+    length instead of a value hardcoded for one.
+    """
+    n_err = len(results.get("errors", []) or [])
+    if n_preds > 1 and n_err > 1 and (n_err - 1) % (n_preds - 1) == 0:
+        return (n_err - 1) // (n_preds - 1)
+    meta = results.get("meta") or {}
+    return int(meta.get("preds_every", 50))
+
+
+def _highlight_indices(sel) -> tuple:
+    """First / middle / last of a subsampled index list.
+
+    The hardcoded alternative (`i in [0, 2, 20]`, `i in [0, 100, 1000]`) is
+    correct only at one run length. These index lists come from
+    np.linspace(0, N-1, num=max_lines): with max_lines=11 and a 1000-iteration
+    run (N=21) the selection is [0,2,4,...,20], which is exactly why 0/2/20
+    worked. Extend to 2000 (N=41) and it becomes [0,4,8,...,40] - index 2 is
+    never selected, so that curve and its legend entry disappear from the
+    figure with no error raised, and the old "final" index 20 is now the
+    midpoint. Deriving the highlights from the selection keeps three of them,
+    correctly placed, at any run length.
+    """
+    sel = np.asarray(sel)
+    if sel.size == 0:
+        return ()
+    return (int(sel[0]), int(sel[sel.size // 2]), int(sel[-1]))
+
+
 AGGREGATION_DEFAULT = "median"
 
 
@@ -191,7 +226,23 @@ def plot_rmse_comparison_single(
 
         # --- Plotting: optimized-emulator trajectory ---
         if seed_errs is not None:
-            stacked = np.stack([np.asarray(r["errors"]) for r in seed_errs], axis=0)
+            # Ragged input means a half-migrated family: some seeds have been
+            # extended to a longer run and others have not, or tasks are still
+            # in flight and their checkpoints sit at intermediate multiples of
+            # checkpoint_every. np.stack's own message ("all input arrays must
+            # have the same shape") does not say which agent or which lengths,
+            # which makes a transient mid-migration state look like a code bug.
+            _traj = [np.asarray(r["errors"]) for r in seed_errs]
+            _lens = sorted({t.shape[0] for t in _traj})
+            if len(_lens) > 1:
+                raise ValueError(
+                    f"panel {i} ({agents[i] if i < len(agents) else '?'}) has seeds at "
+                    f"different trajectory lengths {_lens}: this family is only "
+                    f"partially migrated, or its regeneration jobs are still running. "
+                    f"Wait for the family to finish before plotting - mixing lengths "
+                    f"within one panel would average different run stages together."
+                )
+            stacked = np.stack(_traj, axis=0)
             centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
             x_err = np.arange(centre.shape[0])
             ax.loglog(x_err, centre, lw=2, color=cmap(0),
@@ -474,16 +525,21 @@ def plot_emissions_grid(
             # Track max length to set tight x-limits later
             min_t, max_t = np.inf, 0
 
-            # Plot every time series in this experiment's list
+            # Plot every time series in this experiment's list.
+            # last_i rather than a hardcoded 1000: the final iterate must stay
+            # drawn and labelled whatever the run length is (see
+            # _highlight_indices), and it is included explicitly in case the
+            # length is not a multiple of the 100-step sampling stride.
+            last_i = len(entries_list) - 1
             for i, series in enumerate(entries_list):
-                if i % 100 == 0:
+                if i % 100 == 0 or i == last_i:
                   y_data = np.asarray(series).reshape(-1)
                   alpha = 0.2 + 0.6 * (i / max(1, len(entries_list) - 1))
                   if col_idx < 1:
                       x_data = np.arange(0, len(y_data)) + 2024
                   else:
                       x_data = np.arange(0, len(y_data)) + 1750
-                  if i in [0, 1000]:
+                  if i in (0, last_i):
                     ax_top.plot(x_data, y_data, alpha=alpha, lw=1.5, c = cmap(1), label=f'Iteration {i}')
                   else:
                     ax_top.plot(x_data, y_data, alpha=alpha, lw=1.5, c = cmap(1))
@@ -753,6 +809,12 @@ def plot_stacked_results_ppt(
         else:
             sel_pred = np.unique(np.linspace(0, N_all - 1, num=max_lines, dtype=int))
 
+        # Which of the plotted curves get a legend entry, and how to name them.
+        # Both are derived from the data rather than hardcoded so the figure
+        # stays correct when the run length changes - see _highlight_indices.
+        hl_pred = _highlight_indices(sel_pred)
+        pred_stride = _preds_stride(results, N_all)
+
         last_ytrue = None
 
         for k, i in enumerate(sel_pred):
@@ -768,16 +830,14 @@ def plot_stacked_results_ppt(
             # Plot Prediction
             c = cmap(1)
             ls = '-'
-            if i == 0 or i == 2 or i == 20:
-              if i == 0:
+            if i in hl_pred:
+              # Label with the true outer iteration, derived from the stride,
+              # so this reads correctly at 1000, 2000 or any other length.
+              lab = i * pred_stride
+              if i == hl_pred[0]:
                 alpha = 1
                 c = cm.naviaS(4)
                 ls='-.'
-                lab = 0
-              elif i == 2:
-                lab = 100
-              else:
-                lab = 1000
               ax_pred.plot(target_years, yhat, alpha=alpha, color=c, ls=ls, label=f"Emulator iteration {lab}")
             else:
               ax_pred.plot(target_years, yhat, alpha=alpha, color=c, ls=ls)
@@ -951,6 +1011,12 @@ def plot_stacked_results(
         else:
             sel_pred = np.unique(np.linspace(0, N_all - 1, num=max_lines, dtype=int))
 
+        # Which of the plotted curves get a legend entry, and how to name them.
+        # Both are derived from the data rather than hardcoded so the figure
+        # stays correct when the run length changes - see _highlight_indices.
+        hl_pred = _highlight_indices(sel_pred)
+        pred_stride = _preds_stride(results, N_all)
+
         last_ytrue = None
 
         for k, i in enumerate(sel_pred):
@@ -966,16 +1032,14 @@ def plot_stacked_results(
             # Plot Prediction
             c = cmap(1)
             ls = '-'
-            if i == 0 or i == 2 or i == 20:
-              if i == 0:
+            if i in hl_pred:
+              # Label with the true outer iteration, derived from the stride,
+              # so this reads correctly at 1000, 2000 or any other length.
+              lab = i * pred_stride
+              if i == hl_pred[0]:
                 alpha = 1
                 c = cm.naviaS(4)
                 ls='-.'
-                lab = 0
-              elif i == 2:
-                lab = 100
-              else:
-                lab = 1000
               ax_pred.plot(target_years, yhat, alpha=alpha, color=c, ls=ls, label=f"Emulator iteration {lab}")
             else:
               ax_pred.plot(target_years, yhat, alpha=alpha, color=c, ls=ls)
@@ -2518,7 +2582,11 @@ def plot_inverse_results(
             yhat, ytrue = jnp.asarray(yhat), jnp.asarray(ytrue)
 
             alpha = 0.3 + 0.7 * (k / max(1, len(sel_pred) - 1))
-            ax_pred.plot(yhat, alpha=alpha, label=(f"Step {i}"))
+            # i indexes preds_traj, which is sampled every preds_every outer
+            # steps - so it must be scaled to be reported as a step number.
+            # Labelling it directly understated every step by that factor
+            # (at preds_every=50, "Step 4" was really step 200).
+            ax_pred.plot(yhat, alpha=alpha, label=f"Step {i * _preds_stride(results, N_all)}")
             last_ytrue = ytrue
 
         if last_ytrue is not None:
@@ -2775,6 +2843,10 @@ def plot_comparison_results(
         else:
             sel_steps = np.unique(np.linspace(0, n_total - 1, num=max_lines, dtype=int))
 
+        # Highlighted/labelled steps, derived from the selection rather than
+        # hardcoded, so the final iterate is always one of them.
+        hl_steps = _highlight_indices(sel_steps)
+
         for row_offset, ag in enumerate(active_agents):
             row_idx = 1 + row_offset
             ax_curr = axes[row_idx, col_idx]
@@ -2787,12 +2859,14 @@ def plot_comparison_results(
                 try:
                     series = _get_series(state, ag)
                     alpha = 0.2 + 0.6 * (i / max(1, len(U_traj) - 1))
-                    if i in [0, 100, 1000]:
-                        if i == 0:
+                    if i in hl_steps:
+                        if i == hl_steps[0]:
                             c = cm.lipariS(5)
                             alpha = 1
                         else:
                             c = cm.batlowWS(1)
+                        # i indexes U_traj directly, so it IS the outer
+                        # iteration number and needs no stride conversion.
                         ax_curr.plot(series, alpha=alpha, c=c, label=f"Step {i}")
                     else:
                         ax_curr.plot(series, alpha=alpha, c=cm.batlowWS(1))

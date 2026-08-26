@@ -73,6 +73,14 @@ BASELINE_CONFIG_PATH = Path('data/SI_results/baseline_hp/k400_search/best_baseli
 # Per-group experiment definition, unchanged from 3a_inverse_CO2_only.py's
 # EXPERIMENTS dict - these are NOT tunable hyperparameters, just which
 # scenarios/initial-condition each group optimizes against.
+# !! 'H-ext' is a VISUALIZATION-ONLY experiment (user direction, 2026-08-25).
+# It exists to illustrate the method in Figure 2 and is not a quantitative
+# result, so it is deliberately NOT retuned and its numbers are not reported.
+# This matters because it is the one group that is unstable at 2000 iterations:
+# 18/50 seeds end worse than they were at 1000 and p90 regret is 164% (vs
+# ~0 for every 'constant' group) - see REVISIONS.md 2026-08-25. Do not treat
+# that as a result to fix, and do not let it drive a retune of the shared
+# unified config, which the other five groups are stable under.
 GROUP_DEFS = {
     'H-ext': {'init_cond': 'sine',     'T': 477, 'filter_hist': True},
     'tier1': {'init_cond': 'constant', 'T': 751, 'filter_hist': False},
@@ -81,7 +89,7 @@ GROUP_DEFS = {
     'CS3':   {'init_cond': 'constant', 'T': 751, 'filter_hist': True},
     'all':   {'init_cond': 'constant', 'T': 751, 'filter_hist': False},
 }
-NUM_UPDATES = 1000  # production length, matches the original checkpoints
+NUM_UPDATES = 2000  # extended from 1000 (2026-08-25) after the Stage A out-of-sample gate; resumes in place
 TAG = 'co2_only'
 
 

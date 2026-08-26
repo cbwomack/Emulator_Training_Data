@@ -404,3 +404,83 @@ def test_checkpoint_meta_records_run_config(tmp_path, synthetic_inverse_setup):
         utils_inverse.recover_nrmse_trajectory(dict(raw, meta={})),
         rtol=1e-4,
     )
+
+
+# ---------------------------------------------------------------------------
+# Iteration-length independence of the plotting highlights (Stage E)
+# ---------------------------------------------------------------------------
+def _sel(n_all, max_lines=11):
+    """Reproduce the selection utils_plotting builds for a fading history."""
+    import numpy as _np
+    if n_all <= max_lines:
+        return _np.arange(n_all, dtype=int)
+    return _np.unique(_np.linspace(0, n_all - 1, num=max_lines, dtype=int))
+
+
+def test_highlight_indices_track_the_endpoint_at_any_run_length():
+    """The final iterate must always be highlighted.
+
+    The old hardcoded `i in [0, 2, 20]` only coincided with the selection at
+    1000 iterations; at 2000 index 2 is not selected at all and index 20 is the
+    midpoint. Regression guard for that whole class of bug.
+    """
+    import utils_plotting as up
+    for n_preds in (21, 41, 11, 5, 101):        # 1000, 2000, and off-nominal
+        sel = _sel(n_preds)
+        hl = up._highlight_indices(sel)
+        assert len(hl) == 3
+        assert hl[0] == int(sel[0]) == 0
+        assert hl[-1] == int(sel[-1]) == n_preds - 1, (
+            f"final iterate not highlighted for n_preds={n_preds}")
+        assert all(h in set(sel.tolist()) for h in hl), (
+            "highlighted an index that is never plotted")
+
+
+def test_highlight_indices_handles_empty_selection():
+    import numpy as _np
+    import utils_plotting as up
+    assert up._highlight_indices(_np.array([], dtype=int)) == ()
+
+
+def test_preds_stride_recovers_the_true_sampling_interval():
+    """preds index -> outer iteration must scale by the real stride."""
+    import utils_plotting as up
+    # 1000 updates, preds every 50 -> 21 entries; 2000 -> 41.
+    assert up._preds_stride({"errors": [0.0] * 1001}, 21) == 50
+    assert up._preds_stride({"errors": [0.0] * 2001}, 41) == 50
+    # index 20 is step 1000 in both cases - the label must not depend on length
+    assert 20 * up._preds_stride({"errors": [0.0] * 1001}, 21) == 1000
+    assert 20 * up._preds_stride({"errors": [0.0] * 2001}, 41) == 1000
+    # and the last entry names the true endpoint
+    assert 40 * up._preds_stride({"errors": [0.0] * 2001}, 41) == 2000
+
+
+def test_preds_stride_falls_back_to_meta_then_default():
+    import utils_plotting as up
+    # ragged/unusable errors -> use meta
+    assert up._preds_stride({"errors": [0.0] * 7, "meta": {"preds_every": 25}}, 41) == 25
+    # nothing usable -> documented default
+    assert up._preds_stride({}, 0) == 50
+
+
+def test_ragged_seed_trajectories_raise_a_diagnostic_error(monkeypatch):
+    """A half-migrated family must fail with an explanation, not a bare numpy error.
+
+    Mid-migration, some seeds sit at 2001 entries and others at intermediate
+    multiples of checkpoint_every. np.stack's own message names neither the
+    agent nor the lengths, so a transient state reads as a code bug.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import pytest
+    import utils_plotting as up
+
+    seed_errs = [{"errors": [0.1] * 2001}, {"errors": [0.1] * 1401}]
+    with pytest.raises(ValueError, match="partially migrated|different trajectory lengths"):
+        up.plot_rmse_comparison_single(
+            results_list=[None],
+            baseline_error_list=[None],
+            agents=["CO$_2$-only"],
+            seed_errors_list=[seed_errs],
+            seed_baseline_error_list=[[0.05, 0.05]],
+        )

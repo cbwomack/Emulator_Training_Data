@@ -85,7 +85,7 @@ GROUP_DEFS = {
     "CS3":   {"init_cond": "constant", "T": 751, "filter_hist": True},
     "all":   {"init_cond": "constant", "T": 751, "filter_hist": False},
 }
-NUM_UPDATES = 1000  # matches the single-forcing convention (and this session's other multi-agent regen)
+NUM_UPDATES = 2000  # extended from 1000 (2026-08-25) after the Stage A out-of-sample gate; resumes in place
 TAG = "multi_fig4"
 
 

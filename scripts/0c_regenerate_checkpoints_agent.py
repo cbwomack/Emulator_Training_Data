@@ -62,7 +62,7 @@ import jax
 import utils_inverse
 
 MODE = 'FaIR'
-NUM_UPDATES = 1000  # production length, matches CO2's regenerated checkpoints
+NUM_UPDATES = 2000  # extended from 1000 (2026-08-25) after the Stage A out-of-sample gate; resumes in place
 
 AGENT_CONFIG = {
     "CH4":    {"module": "SIa_inverse_CH4_only.py", "agents": ["CH4"],    "active_agents": ("CH4",),    "tag": "ch4_only"},
