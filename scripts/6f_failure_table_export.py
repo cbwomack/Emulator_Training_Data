@@ -45,7 +45,10 @@ import numpy as np
 import utils_inverse
 
 OUT_DIR = Path("data/SI_results/failure_table")
-MULTI_AGENT_SEED_SPREAD_PATH = Path("data/SI_results/seed_uncertainty/fig4_seed_spread_all_agents.pkl")
+# Smoothed arm (w=0.1, 2000 iter) is canonical for the multi-agent panel as of
+# 2026-08-27, matching Figures 4/5/6. The unsmoothed cache (same name without
+# _smooth) is retained for the SI's "pure noise as forcing" argument.
+MULTI_AGENT_SEED_SPREAD_PATH = Path("data/SI_results/seed_uncertainty/fig4_seed_spread_all_agents_smooth.pkl")
 
 AGENT_LABELS = {"co2": "CO2", "ch4": "CH4", "n2o": "N2O", "Sulfur": "Sulfur", "BC": "BC"}
 AGENT_ORDER = ["co2", "ch4", "n2o", "Sulfur", "BC"]

@@ -98,10 +98,36 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--group", choices=GROUPS, default=None,
                          help="Regenerate only this group's checkpoint (default: run all, in order)")
+    parser.add_argument(
+        "--init-cond", choices=("constant", "sine", "ramp", "gaussian"), default=None,
+        help="Override the per-group init_cond from 3b_inverse_all_agents.py's "
+             "EXPERIMENTS dict. DAMIP/GeoMIP/all inherit init_cond='sine' there, "
+             "a sinusoid centred on zero (utils_inverse.init_sine_emissions) that "
+             "starts those groups from 250-375 years of NEGATIVE emissions - "
+             "physically undefined for Sulfur and BC. It belongs to the SI's "
+             "initial-condition sensitivity sweep and reached production by being "
+             "carried over from the pre-refactor notebook (commit 9f03887). Main-"
+             "paper figures must use 'constant'. Checkpoint filenames encode the "
+             "init (inverse_{init_cond}_{group}_...), so a constant-init rerun "
+             "lands beside the sine files rather than overwriting them.")
     parser.add_argument("--seed", type=int, nargs="+", default=list(range(50)),
                          help="One or more seeds (default 0-49, matching the single-forcing "
                               "Stage 6a UQ protocol). Pass a single value for one seed - the "
                               "natural unit for a SLURM array task.")
+    parser.add_argument("--smoothness-weight", type=float, default=None,
+                         help="Override the tuned config's smoothness_weight. Pass this to "
+                              "build a smoothed arm; combine with --penalty-form normalized "
+                              "and --out-dir so the unsmoothed arm on disk is left intact.")
+    parser.add_argument("--penalty-form", choices=("legacy", "normalized"), default="legacy",
+                         help="Which smoothness penalty to apply. 'legacy' is the historical "
+                              "unnormalized sum and is the default so existing behaviour is "
+                              "unchanged; 'normalized' is the dimensionless, agent-count- and "
+                              "length-normalized form (utils_inverse.smoothness_penalty_terms).")
+    parser.add_argument("--out-dir", default=None,
+                         help="Override the checkpoint directory. Required in practice when "
+                              "--smoothness-weight is given: writing a differently-regularized "
+                              "run into the default directory would overwrite the arm it is "
+                              "meant to be compared against.")
     args = parser.parse_args()
 
     unified_cfg, baseline_cfg = load_configs()
@@ -109,7 +135,26 @@ def main():
     print(f"[multi] Unified optimizer config: {unified_cfg}")
     print(f"[multi] Baseline config: {baseline_cfg}")
 
-    os.makedirs(SEED_SWEEP_DIR, exist_ok=True)
+    checkpoint_dir = args.out_dir or CHECKPOINT_DIR
+    seed_sweep_dir = f"{checkpoint_dir}/seed_sweep"
+
+    # A smoothed arm is a different objective and must not land on top of the
+    # unsmoothed one. optimize_emissions_inverse's resume guard would catch the
+    # collision, but failing here is clearer and costs no compute.
+    if args.smoothness_weight is not None:
+        smoothness_weight = args.smoothness_weight
+    else:
+        smoothness_weight = unified_cfg["smoothness_weight"]
+    if (args.out_dir is None
+            and (smoothness_weight != unified_cfg["smoothness_weight"]
+                 or args.penalty_form != "legacy")):
+        raise SystemExit(
+            f"refusing to write a differently-regularized run into {checkpoint_dir}: "
+            f"smoothness_weight={smoothness_weight!r} penalty_form={args.penalty_form!r} "
+            f"versus the tuned {unified_cfg['smoothness_weight']!r}/legacy. "
+            f"Pass --out-dir to keep the existing multi_retuned arm intact.")
+
+    os.makedirs(seed_sweep_dir, exist_ok=True)
 
     to_run = [args.group] if args.group else GROUPS
 
@@ -117,7 +162,7 @@ def main():
         print(f"=== [multi] seed {seed} ===")
 
         write_baseline = (args.group is None) or (args.group == "H-ext")
-        baseline_save_path = f"{SEED_SWEEP_DIR}/baseline_{TAG}_seed{seed}.pkl" if write_baseline else None
+        baseline_save_path = f"{seed_sweep_dir}/baseline_{TAG}_seed{seed}.pkl" if write_baseline else None
 
         setup = utils_inverse.run_inverse_experiment_setup(
             AGENTS, ACTIVE_AGENTS, mode=MODE,
@@ -130,11 +175,13 @@ def main():
 
         for name in to_run:
             print(f"Running group {name!r} (seed {seed})...")
-            gdef = group_defs[name]
+            gdef = dict(group_defs[name])
+            if args.init_cond is not None:
+                gdef["init_cond"] = args.init_cond
             utils_inverse.run_inverse_experiment(
                 setup,
                 group=name,
-                checkpoint_dir=SEED_SWEEP_DIR,
+                checkpoint_dir=seed_sweep_dir,
                 tag=f"{TAG}_seed{seed}",
                 num_updates=NUM_UPDATES,
                 step_size=unified_cfg["step_size"],
@@ -143,7 +190,8 @@ def main():
                 K_inner=unified_cfg["K_inner"],
                 lr_inner=unified_cfg["lr_inner"],
                 wd_inner=unified_cfg["wd_inner"],
-                smoothness_weight=unified_cfg["smoothness_weight"],
+                smoothness_weight=smoothness_weight,
+                penalty_form=args.penalty_form,
                 batch_size=unified_cfg["batch_size"],
                 init_cond=gdef["init_cond"],
                 T=gdef["T"],

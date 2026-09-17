@@ -72,6 +72,8 @@ dmypy.json
 # OS
 .DS_Store
 
+*.tex
+*.md
 PROGRESS.md
 REVISIONS.md
 MISSING_DATA.md

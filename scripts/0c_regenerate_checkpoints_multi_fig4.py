@@ -103,13 +103,46 @@ def main():
                          help="One or more seeds (default 0-49, matching the single-forcing "
                               "Stage 6a UQ protocol). Pass a single value for one seed - the "
                               "natural unit for a SLURM array task.")
+    parser.add_argument("--smoothness-weight", type=float, default=None,
+                         help="Override the tuned config's smoothness_weight. Pass this to "
+                              "build a smoothed arm; combine with --penalty-form normalized "
+                              "and --out-dir so the unsmoothed arm on disk is left intact.")
+    parser.add_argument("--penalty-form", choices=("legacy", "normalized"), default="legacy",
+                         help="Which smoothness penalty to apply. 'legacy' is the historical "
+                              "unnormalized sum and is the default so existing behaviour is "
+                              "unchanged; 'normalized' is the dimensionless, agent-count- and "
+                              "length-normalized form (utils_inverse.smoothness_penalty_terms).")
+    parser.add_argument("--out-dir", default=None,
+                         help="Override the checkpoint directory. Required in practice when "
+                              "--smoothness-weight is given: writing a differently-regularized "
+                              "run into the default directory would overwrite the arm it is "
+                              "meant to be compared against.")
     args = parser.parse_args()
 
     unified_cfg, baseline_cfg = load_configs()
     print(f"[multi_fig4] Unified optimizer config: {unified_cfg}")
     print(f"[multi_fig4] Baseline config: {baseline_cfg}")
 
-    os.makedirs(SEED_SWEEP_DIR, exist_ok=True)
+    checkpoint_dir = args.out_dir or CHECKPOINT_DIR
+    seed_sweep_dir = f"{checkpoint_dir}/seed_sweep"
+
+    # A smoothed arm is a different objective and must not land on top of the
+    # unsmoothed one. optimize_emissions_inverse's resume guard would catch the
+    # collision, but failing here is clearer and costs no compute.
+    if args.smoothness_weight is not None:
+        smoothness_weight = args.smoothness_weight
+    else:
+        smoothness_weight = unified_cfg["smoothness_weight"]
+    if (args.out_dir is None
+            and (smoothness_weight != unified_cfg["smoothness_weight"]
+                 or args.penalty_form != "legacy")):
+        raise SystemExit(
+            f"refusing to write a differently-regularized run into {checkpoint_dir}: "
+            f"smoothness_weight={smoothness_weight!r} penalty_form={args.penalty_form!r} "
+            f"versus the tuned {unified_cfg['smoothness_weight']!r}/legacy. "
+            f"Pass --out-dir to keep the existing multi_fig4 arm intact.")
+
+    os.makedirs(seed_sweep_dir, exist_ok=True)
 
     to_run = [args.group] if args.group else list(GROUP_DEFS)
 
@@ -117,7 +150,7 @@ def main():
         print(f"=== [multi_fig4] seed {seed} ===")
 
         write_baseline = (args.group is None) or (args.group == "tier1")
-        baseline_save_path = f"{SEED_SWEEP_DIR}/baseline_{TAG}_seed{seed}.pkl" if write_baseline else None
+        baseline_save_path = f"{seed_sweep_dir}/baseline_{TAG}_seed{seed}.pkl" if write_baseline else None
 
         setup = utils_inverse.run_inverse_experiment_setup(
             AGENTS, ACTIVE_AGENTS, mode=MODE,
@@ -134,7 +167,7 @@ def main():
             utils_inverse.run_inverse_experiment(
                 setup,
                 group=name,
-                checkpoint_dir=SEED_SWEEP_DIR,
+                checkpoint_dir=seed_sweep_dir,
                 tag=f"{TAG}_seed{seed}",
                 num_updates=NUM_UPDATES,
                 step_size=unified_cfg["step_size"],
@@ -143,7 +176,8 @@ def main():
                 K_inner=unified_cfg["K_inner"],
                 lr_inner=unified_cfg["lr_inner"],
                 wd_inner=unified_cfg["wd_inner"],
-                smoothness_weight=unified_cfg["smoothness_weight"],
+                smoothness_weight=smoothness_weight,
+                penalty_form=args.penalty_form,
                 batch_size=unified_cfg["batch_size"],
                 init_cond=gdef["init_cond"],
                 T=gdef["T"],

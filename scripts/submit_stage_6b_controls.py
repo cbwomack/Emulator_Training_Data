@@ -49,10 +49,12 @@ def _load_ablation_module():
 
 
 def _baseline_ready(agent):
-    path = (
-        Path("data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json") if agent == "CO2"
-        else Path(f"data/SI_results/baseline_hp/k400_search_{agent}/best_baseline_config_K400.json")
-    )
+    if agent == "CO2":
+        path = Path("data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json")
+    elif agent == "Multi":
+        path = Path("data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json")
+    else:
+        path = Path(f"data/SI_results/baseline_hp/k400_search_{agent}/best_baseline_config_K400.json")
     return path.exists()
 
 

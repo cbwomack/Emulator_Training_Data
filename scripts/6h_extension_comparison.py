@@ -45,8 +45,8 @@ import utils_inverse
 
 FAMILIES = {
     "co2":        ("checkpoints/co2_retuned/seed_sweep", "co2_only"),
-    "CH4":        ("checkpoints/CH4_retuned/seed_sweep", "CH4_only"),
-    "N2O":        ("checkpoints/N2O_retuned/seed_sweep", "N2O_only"),
+    "ch4":        ("checkpoints/ch4_retuned/seed_sweep", "ch4_only"),
+    "n2o":        ("checkpoints/n2o_retuned/seed_sweep", "n2o_only"),
     "Sulfur":     ("checkpoints/Sulfur_retuned/seed_sweep", "Sulfur_only"),
     "BC":         ("checkpoints/BC_retuned/seed_sweep", "BC_only"),
     "multi":      ("checkpoints/multi_retuned/seed_sweep", "all_agents"),

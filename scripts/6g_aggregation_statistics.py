@@ -68,7 +68,9 @@ TEST_SCENARIOS = ["Tier 1", "Tier 2", "DECK", "CS3"]
 WEIGHTS = [7, 5, 2, 2]
 PANELS = {
     "co2_only": "data/SI_results/seed_uncertainty/fig4_seed_spread_co2_only.pkl",
-    "all_agents": "data/SI_results/seed_uncertainty/fig4_seed_spread_all_agents.pkl",
+    # Smoothed arm is canonical for the multi-agent panel as of 2026-08-27
+    # (matches Figures 4/5/6 and 6f). Unsmoothed cache = same name, no suffix.
+    "all_agents": "data/SI_results/seed_uncertainty/fig4_seed_spread_all_agents_smooth.pkl",
 }
 
 # Iterations below this are the initial transient. The optimizer is still far
@@ -169,7 +171,13 @@ def analyze_penalty_contamination(seeds):
         tag = utils_inverse._FIG3_AGENT_TAGS[agent_lower]
         raw_stack, corr_stack, weight = [], [], None
         for seed in seeds:
-            path = f"checkpoints/{agent_lower}_retuned/seed_sweep/inverse_constant_tier1_{tag}_seed{seed}.pkl"
+            # Reuse utils_inverse's map rather than re-deriving the path, so this
+            # stage and Figure 3 can never disagree about which arm an agent is
+            # reported from. Sulfur's deployed arm is Sulfur_smooth (w=0.02);
+            # Sulfur_retuned is the w=0 control.
+            ckpt_dir = utils_inverse._FIG3_AGENT_DIRS.get(
+                agent_lower, f"checkpoints/{agent_lower}_retuned/seed_sweep")
+            path = f"{ckpt_dir}/inverse_constant_tier1_{tag}_seed{seed}.pkl"
             with open(path, "rb") as f:
                 raw = pickle.load(f)
             if weight is None:

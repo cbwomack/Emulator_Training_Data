@@ -46,6 +46,17 @@ experiment - already in-objective for Fig 6, disqualified regardless), CS3
 (idealized abrupt-4x/1pct single-agent experiments). All 5 agents
 (CO2/CH4/N2O/Sulfur/BC) are present and vary in this dataset.
 
+**CO2 FFI correction (2026-08-27, Stage 6i):** this script originally read
+RCMIP's bare 'Emissions|CO2', which is TOTAL CO2 including AFOLU. This repo's
+'CO2' agent is CO2 FFI - fossil-fuel-and-industrial only - since
+run_fair.load_scenarioMIP_CMIP7 maps the agent name 'CO2' onto the ScenarioMIP
+CSV's 'CO2 FFI' variable (run_fair.py:222). The mismatch systematically
+overstated the CO2 agent on this scenario by 3-8% (mean 4.7% over 2024-2100;
+largest early, since AFOLU declines while FFI grows). Now reads
+'Emissions|CO2|MAGICC Fossil and Industrial'. **The NRMSE numbers this script
+produced before 2026-08-27 (optimized 0.0266 / baseline 0.2755) predate the fix
+and are superseded by the re-run.**
+
 **Units (verified directly from the RCMIP CSV's own 'Unit' column, not
 assumed):** CO2 in Mt CO2/yr (-> GtCO2/yr, /1000, matching this repo's
 simulate_targets_gmst convention), CH4 in Mt CH4/yr (matches directly, no
@@ -77,7 +88,7 @@ onward, uses RCMIP's ssp370-lowNTCF-aerchemmip values directly.
 
 **Evaluating the EXISTING (not retrained) optimized emulator:** its trained
 MLP params are deterministically reconstructed from checkpoints/multi_
-retuned/seed_sweep/inverse_sine_all_all_agents_seed0.pkl's own stored
+retuned_smooth/seed_sweep/inverse_constant_all_all_agents_seed0.pkl's own stored
 U_traj[-1] (the final, already-optimized emissions trajectory - no
 re-optimization, no new outer-loop compute) replayed through the exact same
 one-step inner-loop training (make_inverse_objective_single_train's own
@@ -87,15 +98,21 @@ regenerated checkpoint was itself produced with - data/SI_results/hp_retune/
 multi/best_config_unified.json (the 2026-08-13 multi-agent Phase 0 retune
 winner: K_inner=400, lr_inner=0.0489, wd_inner=0.03, batch_size=16 - see
 REVISIONS.md) - used to produce that checkpoint's own paramsK_k in the first
-place - deterministic and bit-exact, not a fresh fit. init_cond='sine' (not
-'constant') for group 'all' matches 3b_inverse_all_agents.py's own
-EXPERIMENTS['all']['init_cond'] exactly (the pre-Phase-0 checkpoints/multi/
-directory used inconsistent per-group update counts and this file's own
-former OPT_CKPT_PATH mismatched IC label; both are now moot since that
-checkpoint dir is no longer used here - see REVISIONS.md Session Log on
-checkpoint staleness). Reconstruction is self-validated by re-evaluating the
+place - deterministic and bit-exact, not a fresh fit. init_cond='constant' for group
+'all', which deliberately DIVERGES from 3b_inverse_all_agents.py's
+EXPERIMENTS['all']['init_cond']='sine'. That sinusoid is centred on zero -
+250-375 years of negative emissions, undefined for Sulfur and BC - and belongs
+to the SI initial-condition sensitivity sweep, never to a reported result
+(REVISIONS.md, 2026-08-27). This now reads the same smoothed, constant-init arm
+Figures 5 and 6 report, so the OOD check tests the emulator the paper actually
+presents. (The pre-Phase-0 checkpoints/multi/ directory used inconsistent
+per-group update counts and this file's own former OPT_CKPT_PATH mismatched its
+IC label; both are moot since that dir is no longer used here.) Reconstruction is self-validated by re-evaluating the
 result against the checkpoint's own eval_sets and comparing to its stored
-errors[-1] before trusting it on the new scenario (see main()).
+stored NRMSE - recover_nrmse_trajectory(ckpt)[-1], i.e. errors with the
+smoothness penalty removed - before trusting it on the new scenario (see
+main()). Comparing against raw errors[-1] would abort on the smoothed arm,
+where the penalty is a real fraction of the objective.
 
 **Evaluating the baseline emulator:** genuinely retrained (seed=0), using
 data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json
@@ -130,7 +147,9 @@ RCMIP_SCENARIO = "ssp370-lowNTCF-aerchemmip"
 RCMIP_MODEL = "AIM/CGE"
 RCMIP_REGION = "World"
 RCMIP_VARIABLES = {
-    "CO2": "Emissions|CO2",       # Mt CO2/yr -> GtCO2/yr (/1000)
+    # CO2 FFI, NOT total CO2 - see the "CO2 FFI correction" note in the module
+    # docstring. Mt CO2/yr -> GtCO2/yr (/1000).
+    "CO2": "Emissions|CO2|MAGICC Fossil and Industrial",
     "CH4": "Emissions|CH4",       # Mt CH4/yr, no conversion
     "N2O": "Emissions|N2O",       # kt N2O/yr -> Mt N2O/yr (/1000, unit-family only)
     "Sulfur": "Emissions|Sulfur", # Mt SO2/yr, no conversion
@@ -142,14 +161,20 @@ AGENTS = ["CO2", "CH4", "N2O", "Sulfur", "BC"]
 ACTIVE_AGENTS = ("CO2", "CH4", "N2O", "Sulfur", "BC")
 MODE = "FaIR"
 SEED = 0
-MULTI_CKPT_DIR = "checkpoints/multi_retuned/seed_sweep"
-OPT_CKPT_PATH = f"{MULTI_CKPT_DIR}/inverse_sine_all_all_agents_seed{SEED}.pkl"
-# group 'all' uses init_cond='sine' per 3b_inverse_all_agents.py's own EXPERIMENTS['all']
+MULTI_CKPT_DIR = "checkpoints/multi_retuned_smooth/seed_sweep"
+OPT_INIT_COND = "constant"
+OPT_CKPT_PATH = f"{MULTI_CKPT_DIR}/inverse_{OPT_INIT_COND}_all_all_agents_seed{SEED}.pkl"
+# 3b_inverse_all_agents.py's EXPERIMENTS['all'] specifies init_cond='sine', which
+# this script used to follow. That sinusoid is centred on zero - 250-375 years of
+# negative emissions, undefined for Sulfur and BC - and belongs to the SI
+# initial-condition sensitivity sweep, not to a reported result (REVISIONS.md,
+# 2026-08-27). Now reads the smoothed, constant-init 'all' checkpoint, matching
+# the arm Figures 5 and 6 report.
 UNIFIED_CONFIG_PATH = "data/SI_results/hp_retune/multi/best_config_unified.json"
 BASELINE_CONFIG_PATH = "data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json"
 UNIFIED_CFG = json.load(open(UNIFIED_CONFIG_PATH))["config"]
 BASELINE_CFG = json.load(open(BASELINE_CONFIG_PATH))["config"]
-# The exact hyperparameters checkpoints/multi_retuned/ was regenerated with
+# The exact hyperparameters checkpoints/multi_retuned_smooth/ was regenerated with
 # (0c_regenerate_checkpoints_multi.py) - must match bit-exactly for the
 # reconstruction replay below to be deterministic against the checkpoint's
 # own stored paramsK_k.
@@ -273,29 +298,47 @@ def reconstruct_optimized_paramsK(setup, ckpt, u_index=-1):
 def validate_reconstruction(setup, paramsK, stats, ckpt):
     """Self-check: re-evaluate the reconstructed paramsK (from U_traj[-2],
     see reconstruct_optimized_paramsK's docstring) on the checkpoint's own
-    eval_sets and compare to its stored errors[-1] before trusting the
-    reconstruction method at all."""
+    eval_sets and compare to its stored NRMSE before trusting the
+    reconstruction method at all.
+
+    The comparand is recover_nrmse_trajectory(ckpt)[-1], NOT ckpt["errors"][-1].
+    `errors` stores the full objective, NRMSE + w * penalty(U). For the
+    unsmoothed multi arm (w=0) the two were identical, so comparing against
+    `errors` worked by accident. This script now reads the SMOOTHED arm
+    (w=0.1, normalized), where the penalty contributes ~0.023 of an
+    errors[-1] of ~0.086 - 4.6x the 0.005 tolerance below, so the raw
+    comparison would abort a perfectly good replay (REVISIONS.md, 2026-08-27).
+    recover_nrmse_trajectory reads the weight and penalty form from the
+    checkpoint itself, so this stays correct for either arm."""
     group_emis_dicts = utils_inverse.build_group_emis_dicts(setup["emis_dict_train_JAX"], setup["eval_sets"])
     test_dataset_all = utils_inverse.build_valid(
         group_emis_dicts["all"], historical_name="historical", agents=AGENTS, mode=MODE,
     )
     test_scaled = [(utils_inverse.apply_scaler(X, stats), y, scen) for (X, y, scen) in test_dataset_all]
     reconstructed_nrmse = float(utils_inverse.avg_nrmse_over_tests(paramsK, test_scaled))
-    stored_nrmse = float(ckpt["errors"][-1])
+    stored_nrmse = float(utils_inverse.recover_nrmse_trajectory(ckpt)[-1])
     print(f"[validate] reconstructed NRMSE={reconstructed_nrmse:.6f} vs. checkpoint's stored "
-          f"errors[-1]={stored_nrmse:.6f} (diff={abs(reconstructed_nrmse - stored_nrmse):.6f})")
+          f"NRMSE={stored_nrmse:.6f} (penalty removed; raw errors[-1]="
+          f"{float(ckpt['errors'][-1]):.6f}) (diff={abs(reconstructed_nrmse - stored_nrmse):.6f})")
     return reconstructed_nrmse, stored_nrmse
 
 
 def evaluate_on_new_scenario(setup, paramsK, stats):
-    X, y, _years = build_new_scenario_features(setup)
+    """-> (nrmse, yhat, ytrue, years).
+
+    Returns the per-year trajectory, not just the scalar NRMSE: Stage 6i's
+    Figure 6 panels plot the emulated series against the SCM truth, and this
+    was the one piece the deferred plan was missing.
+    """
+    X, y, years = build_new_scenario_features(setup)
     Xs = utils_inverse.apply_scaler(X, stats)
     yhat = utils_inverse.mlp_forward(paramsK, Xs)
     nrmse = float(utils_inverse._nrmse(jnp.asarray(yhat), jnp.asarray(y)))
-    return nrmse, len(y)
+    return nrmse, np.asarray(yhat).reshape(-1), np.asarray(y).reshape(-1), np.asarray(years)
 
 
 def evaluate_baseline_on_new_scenario(setup):
+    """-> (nrmse, yhat, ytrue, years). See evaluate_on_new_scenario."""
     # Train the baseline fresh on Tier 1 (matches evaluate_baseline_over_
     # multiple_tests's own logic exactly - baseline scores are always
     # freshly, deterministically retrained per evaluation call in this
@@ -312,10 +355,11 @@ def evaluate_baseline_on_new_scenario(setup):
         train_scaled=train_s, key=jax.random.PRNGKey(0),
         K=BASELINE_HP["K"], lr=BASELINE_HP["lr"], weight_decay=BASELINE_HP["weight_decay"],
     )
-    X, y, _years = build_new_scenario_features(setup)
+    X, y, years = build_new_scenario_features(setup)
     Xs = utils_inverse.apply_scaler(X, stats)
     yhat = utils_inverse.mlp_forward(paramsK_base, Xs)
-    return float(utils_inverse._nrmse(jnp.asarray(yhat), jnp.asarray(y)))
+    nrmse = float(utils_inverse._nrmse(jnp.asarray(yhat), jnp.asarray(y)))
+    return nrmse, np.asarray(yhat).reshape(-1), np.asarray(y).reshape(-1), np.asarray(years)
 
 
 def main():
@@ -335,21 +379,22 @@ def main():
     if abs(recon_nrmse - stored_nrmse) > 0.005:
         raise RuntimeError(
             f"Reconstructed optimized-emulator NRMSE from U_traj[-2] ({recon_nrmse:.4f}) doesn't "
-            f"match {OPT_CKPT_PATH}'s own stored errors[-1] ({stored_nrmse:.4f}) closely enough to "
+            f"match {OPT_CKPT_PATH}'s own stored NRMSE ({stored_nrmse:.4f}, penalty removed) closely enough to "
             f"trust the reconstruction method - stopping rather than reporting a number built on a "
             f"broken replay."
         )
-    print(f"[validate] reconstruction method confirmed (U_traj[-2] matches errors[-1] to "
+    print(f"[validate] reconstruction method confirmed (U_traj[-2] matches stored NRMSE to "
           f"{abs(recon_nrmse - stored_nrmse):.6f}) - proceeding with U_traj[-1], the true final state")
 
     # Now apply the (just-validated) method to U_traj[-1] - the actual,
     # fully-optimized final state - for the real new-scenario evaluation.
     paramsK_opt, stats = reconstruct_optimized_paramsK(setup, ckpt, u_index=-1)
 
-    opt_nrmse, n_years = evaluate_on_new_scenario(setup, paramsK_opt, stats)
+    opt_nrmse, opt_yhat, y_true, years = evaluate_on_new_scenario(setup, paramsK_opt, stats)
+    n_years = len(y_true)
     print(f"[ssp370-lowNTCF] optimized emulator NRMSE={opt_nrmse:.4f} (n={n_years} years)")
 
-    baseline_nrmse = evaluate_baseline_on_new_scenario(setup)
+    baseline_nrmse, base_yhat, _y_true_b, _years_b = evaluate_baseline_on_new_scenario(setup)
     print(f"[ssp370-lowNTCF] baseline emulator NRMSE={baseline_nrmse:.4f}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -360,6 +405,11 @@ def main():
             "optimized_nrmse": opt_nrmse,
             "baseline_nrmse": baseline_nrmse,
             "n_years": n_years,
+            # Per-year trajectories, for Stage 6i's Figure 6 panels.
+            "years": years,
+            "y_true": y_true,
+            "optimized_yhat": opt_yhat,
+            "baseline_yhat": base_yhat,
             "reconstruction_validation": {"reconstructed_nrmse": recon_nrmse, "stored_nrmse": stored_nrmse},
         }, f)
     print(f"wrote {out_path}")

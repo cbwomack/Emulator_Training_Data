@@ -22,9 +22,8 @@ import seaborn as sns
 from cmcrameri import cm
 import matplotlib.ticker as ticker
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-from collections import defaultdict
-from sklearn.metrics import r2_score
 
 ## Local
 from paths import FIGURES_DIR
@@ -246,27 +245,25 @@ def plot_rmse_comparison_single(
             centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
             x_err = np.arange(centre.shape[0])
             ax.loglog(x_err, centre, lw=2, color=cmap(0),
-                      label="Optimized emulator\n"
-                            f"({_aggregation_label(aggregation, len(seed_errs))})")
+                      label="Optimized emulator (median)")
             ax.fill_between(x_err, lo, hi, color=cmap(0), alpha=0.2, linewidth=0)
         else:
             result = results_list[i]
             errors = jnp.asarray(result["errors"])
             x_err = jnp.arange(errors.shape[0])
-            ax.loglog(x_err, errors, label="Optimized emulator", lw=2, color=cmap(0))
+            ax.loglog(x_err, errors, label="Optimized emulator (median)", lw=2, color=cmap(0))
 
         # --- Plotting: baseline lower bound ---
         if seed_base is not None:
             base_arr = np.asarray(seed_base, dtype=float)
             b_centre, b_lo, b_hi = _aggregate_seeds(base_arr, aggregation, mean_band="minmax")
-            stat = "median" if aggregation == "median" else "mean"
             ax.axhline(float(b_centre), ls="--", c=cm.lipariS(5), lw=1.5,
-                       label=f"Baseline emulator\nerror lower bound ({stat})")
+                       label="Baseline emulator\nerror lower bound (median)")
             if float(b_hi) > float(b_lo):
                 ax.axhspan(float(b_lo), float(b_hi), color=cm.lipariS(5), alpha=0.15, linewidth=0)
         else:
             baseline_error = baseline_error_list[i]
-            ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
+            ax.axhline(float(baseline_error), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator (median)")
 
         ax.margins(x=0, y=0)
         #ax.xaxis.set_major_locator(plt.MaxNLocator(, prune='lower'))
@@ -291,9 +288,17 @@ def plot_rmse_comparison_single(
             ax.tick_params(axis='y', labelright=True, labelsize=12)
 
         # Only add the Y-label to the first plot to reduce clutter
-        if i == 0:
+        if i == 0:          
             ax.set_ylabel("Emulator error (NRMSE)", fontsize=18)
-            ax.legend(loc="best", fontsize=14)
+            
+            # Fetch existing handles and labels to append the custom IQR patch
+            handles, labels = ax.get_legend_handles_labels()
+            iqr_patch = mpatches.Patch(color='gray', alpha=0.2, label='Interquartile range')
+            
+            handles.append(iqr_patch)
+            labels.append('Interquartile range')
+            
+            ax.legend(handles=handles, labels=labels, loc="lower left", fontsize=12)
 
         ax.set_xlim(left=1.1)
         ax.set_ylim([0.01, 1.5])
@@ -352,7 +357,7 @@ def plot_rmse_comparison_multi(results: dict, baseline_error: float, save: bool 
         centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
         x_err = np.arange(centre.shape[0])
         ax.loglog(x_err, centre, lw=2, color=cmap(1),
-                  label=f"Optimized emulator\n({_aggregation_label(aggregation, len(seed_errors))})")
+                  label=f"Optimized emulator (median)")
         ax.fill_between(x_err, lo, hi, color=cmap(1), alpha=0.2, linewidth=0)
     else:
         errors = np.asarray(results["errors"])
@@ -376,9 +381,19 @@ def plot_rmse_comparison_multi(results: dict, baseline_error: float, save: bool 
     ax.grid(True, alpha=0.3, which="both", ls="-")
     ax.tick_params(axis='both', which='major', labelsize=14)
     ax.set_ylabel("Emulator error (NRMSE)", fontsize=18)
+
+    # Fetch existing handles and labels to append the custom IQR patch
+    handles, labels = ax.get_legend_handles_labels()
+    iqr_patch = mpatches.Patch(color='gray', alpha=0.2, label='Interquartile range')
+    
+    handles.append(iqr_patch)
+    labels.append('Interquartile range')
+    
+    ax.legend(handles=handles, labels=labels, loc="upper right", fontsize=14)
+
+
     ax.set_xlabel('Update iteration no.', fontsize=18)
     ax.set_xlim(left=1.1)
-    ax.legend(loc="upper right", fontsize=14)
 
     # Text Box
     _add_textbox(ax, "(a) All agents", 0.025, 0.97)
@@ -471,7 +486,8 @@ def _plot_agents(x_data: np.ndarray, config: dict, cmap) -> None:
         fancybox=True,      # Rounded corners
         facecolor="white",  # Match text box
         edgecolor="gray",   # Match text box
-        framealpha=0.9      # Match text box
+        framealpha=0.9,      # Match text box
+        fontsize=12
     )
     # Force the legend zorder high just to be safe
     leg.set_zorder(105)
@@ -1342,6 +1358,44 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
     bar_width = total_group_width / n_rows
     limit = -60
 
+    # 3.5 Information-leakage shading (in-objective evaluation sets)
+    # ----------------------------------------------------------------
+    # Same dark-gray shade used for in-objective rows in Figure 6
+    # (plot_ood_r2_forest's SHADE_COLORS["dark"]). A column is leaked on a
+    # given row when that column's training scenario is (or, for "Opt. All",
+    # includes) the row's evaluation scenario - e.g. "Opt. Priority 1"
+    # evaluated on "Priority 1", or "Opt. All" evaluated on anything (Avg.
+    # included, since every component going into that average was itself
+    # in-objective).
+    LEAK_COLOR = "0.55"
+    LEAK_ALPHA = 0.35
+    for j, train_key in enumerate(train_scenarios):
+        trained_on = train_key.removeprefix('Opt. ')
+        for i in range(n_rows):
+            is_avg = (i == n_test)
+            leaked = trained_on == 'All' or (not is_avg and test_scenarios[i] == trained_on)
+            if not leaked:
+                continue
+            offset = (i - n_rows / 2) * bar_width + (bar_width / 2)
+            x_center = x_positions[j] + offset
+            ax.axvspan(x_center - bar_width / 2, x_center + bar_width / 2,
+                       color=LEAK_COLOR, alpha=LEAK_ALPHA, zorder=1, lw=0)
+
+    # Light-gray shading (Figure 6's SHADE_COLORS["light"]) on the Avg. bar
+    # for every non-"Opt. All" column: that average is a weighted mix of
+    # in- and out-of-objective evaluations, so it is partially - not fully -
+    # leaked. "Opt. All" is left untouched above (its Avg. bar is already
+    # fully dark-shaded, since every scenario feeding it is in-objective).
+    PARTIAL_LEAK_COLOR = "0.85"
+    for j, train_key in enumerate(train_scenarios):
+        trained_on = train_key.removeprefix('Opt. ')
+        if trained_on == 'All':
+            continue
+        offset = (n_test - n_rows / 2) * bar_width + (bar_width / 2)
+        x_center = x_positions[j] + offset
+        ax.axvspan(x_center - bar_width / 2, x_center + bar_width / 2,
+                   color=PARTIAL_LEAK_COLOR, alpha=LEAK_ALPHA, zorder=1, lw=0)
+
     # 4. Draw Grouped Bars
     # --------------------
     hatch_pattern = '//'
@@ -1368,13 +1422,14 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
                       zorder=3,
                       alpha=alpha)
 
+        
         for bar, val in zip(bars, row_values):
             # Formatting value to 1 decimal place
             label_text = f"{val:.1f}"
 
             # Determine Y position
             if val < 0:
-                if val <= -60:
+                if val <= -80:
                     bar.set_hatch(hatch_pattern)
                 # Negative: Place just above the x-axis (0 line)
                 y_pos = 2  # Fixed small offset above 0
@@ -1383,7 +1438,7 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
                 # Positive: Place just above the bar
                 y_pos = val + 2
                 va = 'bottom'
-
+            """
             ax.text(bar.get_x() + bar.get_width() / 2,
                     y_pos,
                     label_text,
@@ -1393,6 +1448,8 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
                     color=color,       # Match the bar color
                     fontweight='bold',
                     zorder=4)
+            """
+        
 
             #if bar.get_height() < limit:
             #  ax.plot(bar.get_x() + bar.get_width() / 2, limit, marker='d', color='white', markeredgecolor='black',
@@ -1431,33 +1488,48 @@ def plot_grouped_improvement_bars(baseline_results: dict = None,
     ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=4))
 
     # Legend (Conditional)
-    if show_legend and not is_standalone:
-        # Place legend outside to the right, slightly aligned to top
-        if n_plots == 2:
-          ax.legend(title='Evaluation Dataset',
-                    loc='lower left',
-                    bbox_to_anchor=(0, -0.45),
-                    ncol=3,
-                    frameon=True,
-                    fancybox=True,
-                    framealpha=0.8,
-                    facecolor='white',
-                    edgecolor='#cccccc',
-                    fontsize=12)
-        elif n_plots == 5:
-          ax.legend(title='Evaluation Dataset',
-                    loc='lower left',
-                    bbox_to_anchor=(0, -0.025),
-                    ncol=3,
-                    frameon=True,
-                    fancybox=True,
-                    framealpha=0.8,
-                    facecolor='white',
-                    edgecolor='#cccccc',
-                    fontsize=12)
+    if show_legend:
+        # Fetch the existing handles (the colored bars) and labels
+        handles, labels = ax.get_legend_handles_labels()
+        
+        # If we plotted error bars, add a custom black line to represent the IQR
+        if seed_mode:
+            # Create a proxy artist that natively renders as a vertical error bar
+            iqr_proxy = ax.errorbar([np.nan], [np.nan], yerr=[1], color='black', 
+                                    capsize=3, elinewidth=1.5, capthick=1.5, fmt='none')
+            
+            handles.append(iqr_proxy)
+            labels.append('Interquartile range')
 
-    if is_standalone:
-      ax.legend(fontsize=8)
+        if not is_standalone:
+            # Place legend outside to the right, slightly aligned to top
+            if n_plots == 2:
+              ax.legend(handles=handles, labels=labels,
+                        title='Evaluation Dataset',
+                        loc='lower left',
+                        bbox_to_anchor=(0, -0.45),
+                        ncol=3,
+                        frameon=True,
+                        fancybox=True,
+                        framealpha=0.8,
+                        facecolor='white',
+                        edgecolor='#cccccc',
+                        fontsize=12)
+            elif n_plots == 5:
+              ax.legend(handles=handles, labels=labels,
+                        title='Evaluation Dataset',
+                        loc='lower left',
+                        bbox_to_anchor=(0, -0.025),
+                        ncol=3,
+                        frameon=True,
+                        fancybox=True,
+                        framealpha=0.8,
+                        facecolor='white',
+                        edgecolor='#cccccc',
+                        fontsize=12)
+
+    if is_standalone and show_legend:
+      ax.legend(handles=handles, labels=labels, fontsize=8)
 
     if long_title:
         ax.set_title(long_title, fontsize=14, pad=10, loc='left')
@@ -1540,7 +1612,7 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
             n_plots=n_plots
         )
 
-        ax.set_ylim([-60, 100])
+        ax.set_ylim([-80, 120])
         if n_plots == 2:
           if i == 0:
             ax.text(
@@ -1591,7 +1663,7 @@ def plot_vertical_stacked_bars(baseline_results_list: list[dict],
 
     # Add a global X-axis label at the bottom of the figure
     fig.supxlabel('Emulator Configuration', fontsize=16)
-    fig.supylabel(r'Performance change from baseline emulator [\%]', fontsize=16)
+    fig.supylabel(r'Median performance change from baseline emulator [\%]', fontsize=16)
 
     if save:
         plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
@@ -1624,7 +1696,8 @@ def plot_scenario_difference_bars2(baseline_results: dict,
                                   save: bool = False,
                                   figname: str = 'scenario_differences',
                                   seed_baseline_results: list[dict] | None = None,
-                                  seed_optimized_results_list: list[list[dict] | None] | None = None) -> None:
+                                  seed_optimized_results_list: list[list[dict] | None] | None = None,
+                                  seed_agg: str = "mean_std") -> None:
     """
     Per-scenario bar chart of global NRMSE across baseline + multiple optimized
     variants, with optional group separators/labels. Used by 5a_paper_plots.ipynb.
@@ -1635,13 +1708,20 @@ def plot_scenario_difference_bars2(baseline_results: dict,
     results_list` has one entry per series in `optimized_results_list`, each
     either None (that series plots the single-run point estimate, exact
     prior behavior) or a list of per-seed result dicts (that series plots
-    the mean +/- seed-spread std as an `xerr` error bar, matching the
-    bar-chart seed-spread convention plot_grouped_improvement_bars already
-    uses for Figure 4, rather than Figure 3's shaded-band line-plot
-    convention, since this is a bar chart too). Leaving both at None (the
-    default) is fully backward-compatible - reproduces the exact prior
-    output.
+    a seed-spread error bar, matching the bar-chart seed-spread convention
+    plot_grouped_improvement_bars already uses for Figure 4, rather than
+    Figure 3's shaded-band line-plot convention, since this is a bar chart
+    too). Leaving both at None (the default) is fully backward-compatible -
+    reproduces the exact prior output.
+
+    `seed_agg`: "mean_std" (default, preserves prior behavior exactly) plots
+    mean +/- std as a symmetric xerr; "median_iqr" plots the median with an
+    asymmetric xerr spanning [Q1, Q3] instead - matching the median+IQR
+    convention already used for Figs 3/4/5's seed-spread panels. Only takes
+    effect where seed_optimized_results_list/seed_baseline_results are given.
     """
+    if seed_agg not in ("mean_std", "median_iqr"):
+        raise ValueError(f"seed_agg must be 'mean_std' or 'median_iqr', got {seed_agg!r}")
 
     # 1. Setup Data & Layout
     # ----------------------
@@ -1715,6 +1795,10 @@ def plot_scenario_difference_bars2(baseline_results: dict,
     total_group_width = 0.8
     bar_width = total_group_width / n_opts
     colors = [cm.osloS(i + 2) for i in range(n_opts)]
+    bar_xlim = (-70, 90)  # shared with the hatch check below and ax_bar.set_xlim,
+                          # so a bar clipped past the visible axis is always the
+                          # one that gets hatched (previously a separate, out of
+                          # sync -80 threshold left clipped bars un-hatched)
 
     y_positions = np.arange(n_total)
     ax_bar.invert_yaxis()
@@ -1732,13 +1816,21 @@ def plot_scenario_difference_bars2(baseline_results: dict,
                 row.append(((base_val - opt_val) / base_val) * 100)
         return row
 
+    any_seed_err = False
     for opt_idx, opt_dict in enumerate(optimized_results_list):
         seed_opt = seed_optimized_results_list[opt_idx] if seed_optimized_results_list else None
 
         if seed_opt is not None and seed_baseline_results is not None:
+            any_seed_err = True
             per_seed = np.array([_pct_change_row(b, o) for b, o in zip(seed_baseline_results, seed_opt)])
-            diff_values = per_seed.mean(axis=0)
-            diff_err = per_seed.std(axis=0)
+            if seed_agg == "median_iqr":
+                diff_values = np.median(per_seed, axis=0)
+                q1 = np.percentile(per_seed, 25, axis=0)
+                q3 = np.percentile(per_seed, 75, axis=0)
+                diff_err = np.vstack([diff_values - q1, q3 - diff_values])
+            else:
+                diff_values = per_seed.mean(axis=0)
+                diff_err = per_seed.std(axis=0)
         else:
             diff_values = _pct_change_row(baseline_results, opt_dict)
             diff_err = None
@@ -1756,27 +1848,10 @@ def plot_scenario_difference_bars2(baseline_results: dict,
                    linewidth=0.7,
                    zorder=3)
 
-        # Annotation Loop
+        # Hatch bars clipped past the visible x-axis range.
         for bar, val in zip(bars, diff_values):
-            if val < -70:
+            if val < bar_xlim[0] or val > bar_xlim[1]:
                 bar.set_hatch('//')
-
-            label_text = f"{val:.1f}"
-
-            if val < 0:
-                x_pos = 2
-            else:
-                x_pos = val + 2
-
-            ax_bar.text(x_pos,
-                        bar.get_y() + bar.get_height() / 2,
-                        label_text,
-                        ha='left',
-                        va='center',
-                        fontsize=12,
-                        color=colors[opt_idx],
-                        fontweight='bold',
-                        zorder=4)
 
     # 3. Styling & User Requests
     # --------------------------
@@ -1792,7 +1867,7 @@ def plot_scenario_difference_bars2(baseline_results: dict,
     # Draw a custom vertical line at x=0 to act as the baseline for the bars
     ax_bar.axvline(0, color='#4a5568', linewidth=1.2, zorder=0)
 
-    ax_bar.set_xlim([-70, 90])
+    ax_bar.set_xlim(bar_xlim)
     if separator_indices:
         for idx in separator_indices:
             # Place the line halfway between the specified index and the next one (idx + 0.5)
@@ -1818,8 +1893,26 @@ def plot_scenario_difference_bars2(baseline_results: dict,
               bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
             )
 
-    ax_bar.legend(title='Emulator IC',
+    # Explicit solid-color legend handles for the IC series - built from proxy
+    # Patches rather than the auto-generated bar-container handles, since the
+    # latter pick up whichever individual bar's hatch (set above for bars
+    # clipped past the x-axis limits) happens to land on the legend swatch,
+    # making e.g. "Const." render hatched in the legend even though the
+    # hatch is a per-bar clipping indicator, not a property of that series.
+    legend_handles = [
+        mpatches.Patch(facecolor=colors[i], edgecolor='black', linewidth=0.7, label=legend_labels[i])
+        for i in range(n_opts)
+    ]
+    if seed_agg == "median_iqr" and any_seed_err:
+        legend_handles.append(
+            Line2D([0, 1], [0, 0], color='black', linewidth=1, marker='|', markersize=10,
+                   markeredgewidth=1, label='Interquartile range')
+        )
+
+    ax_bar.legend(handles=legend_handles, title='Emulator IC',
                     loc='lower right',
+                    numpoints=2,  # else Line2D's default numpoints=1 draws the IQR
+                                  # marker at the swatch midpoint instead of both ends
                     title_fontsize=16,
                     frameon=True,
                     fancybox=True,
@@ -1829,10 +1922,504 @@ def plot_scenario_difference_bars2(baseline_results: dict,
                     fontsize=14)
 
     ax_bar.set_ylabel('Scenario', fontsize=18)
-    fig.supxlabel(r'Performance change from baseline emulator [\%]', fontsize=18)
+    x_label = (r'Median performance change from baseline emulator [\%]'
+               if seed_agg == "median_iqr" and any_seed_err
+               else r'Performance change from baseline emulator [\%]')
+    fig.supxlabel(x_label, fontsize=18)
 
     if save:
         plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
+
+
+# ------------------------------------------------------------------
+# Figure 7 v2 (Stage 6o): the same optimized-emissions/temperature panels as
+# plot_scenario_difference_bars2's (a)/(b), but one per initial condition and
+# showing percentile trajectories across a 50-seed sweep instead of a single
+# run. Kept as separate functions rather than options on
+# plot_scenario_difference_bars2 - that function's panels are driven by real
+# MESM ensemble output for two fixed trajectories, which is a different data
+# source and a different claim.
+# ------------------------------------------------------------------
+
+# Line weight/alpha per percentile: the median reads as the main line, the
+# quartiles as context, without needing three separate colours per axis.
+_FIG7V2_QUANTILE_STYLE = {
+    25: {"lw": 1.0, "alpha": 0.55, "ls": "-"},
+    50: {"lw": 2.0, "alpha": 1.00, "ls": "-"},
+    75: {"lw": 1.0, "alpha": 0.55, "ls": "-"},
+}
+
+
+def plot_fig7_v2_ic_panels(panels: list[dict],
+                           years_emis: np.ndarray,
+                           years_temp: np.ndarray,
+                           save: bool = False,
+                           figname: str = 'fig07_v2_ic_panels',
+                           placeholder_bar_panel: bool = True) -> None:
+    r"""
+    Figure 7 v2: one panel per initial condition, each showing the 25th/50th/
+    75th-percentile optimized CO2 emissions trajectory (left axis) and the
+    temperature response it produces (right axis, dashed).
+
+    `panels` is one dict per panel, in plotting order, with keys:
+        'title'      panel title text, without the "(a) " prefix (added here)
+        'emissions'  {25: (T,), 50: (T,), 75: (T,)}
+        'delT'       {25: (T',), 50: (T',), 75: (T',)}
+    plotted against `years_emis` (T,) and `years_temp` (T',) respectively. The
+    two lengths are allowed to differ - the SCM response is defined on every
+    emissions year (T' == T), but plot_scenario_difference_bars2's real-MESM
+    series is one year shorter - so neither is assumed from the other.
+        'seeds'      {25: int, 50: int, 75: int}  - which seed each one is
+        'scores'     {25: float, 50: float, 75: float} - its weighted NRMSE
+    Percentiles are over each seed's average skill across all scenarios, so the
+    "50th" line is the median-performing seed's actual trajectory, not a
+    pointwise median of 50 trajectories - the latter would be a curve no run
+    ever produced.
+
+    IMPORTANT for the caption: unlike plot_scenario_difference_bars2's (a)/(b),
+    `delT` here is the MESM-calibrated SCM's own temperature response, not
+    output from a real MESM ensemble run. No MESM runs exist for these
+    newly-optimized trajectories.
+
+    `placeholder_bar_panel` (default True) reserves the bottom axis the
+    per-scenario NRMSE bar chart will occupy, drawn empty and labelled, so the
+    figure's final proportions are visible before that panel's data source is
+    settled. Set False for a clean three-panel figure.
+    """
+    n = len(panels)
+    layout = [[f"P{i}"] for i in range(n)]
+    height_ratios = [1] * n
+    if placeholder_bar_panel:
+        layout.append(["Bar"])
+        # 5 units for the bar chart against 1 per time-series panel, and ~2.9 in
+        # of figure per unit - the same proportions plot_scenario_difference_
+        # bars2 uses (height_ratios [1, 1, 5] at figsize height 19.5), so the
+        # two versions of Figure 7 are directly comparable side by side.
+        height_ratios.append(5)
+
+    fig, axd = plt.subplot_mosaic(
+        layout, figsize=(8.7, 2.9 * sum(height_ratios)),
+        constrained_layout=True, height_ratios=height_ratios,
+    )
+
+    axes = [axd[f"P{i}"] for i in range(n)]
+    for ax in axes[1:]:
+        ax.sharex(axes[0])
+        ax.sharey(axes[0])
+    for ax in axes[:-1]:
+        ax.tick_params(labelbottom=False)
+
+    # Shared temperature limits across panels, so the three ICs are visually
+    # comparable rather than each autoscaled to its own range.
+    all_t = np.concatenate([np.asarray(p['delT'][q]).reshape(-1)
+                            for p in panels for q in (25, 50, 75)])
+    t_min, t_max = float(all_t.min()), float(all_t.max())
+
+    c_emis = cm.actonS(2)
+    c_temp = cm.actonS(4)
+    letters = 'abcdefgh'
+
+    for i, (ax, panel) in enumerate(zip(axes, panels)):
+        ax_temp = ax.twinx()
+
+        for q in (25, 50, 75):
+            style = _FIG7V2_QUANTILE_STYLE[q]
+            ax.plot(years_emis, np.asarray(panel['emissions'][q]).reshape(-1),
+                    c=c_emis, zorder=3, **style)
+            ax_temp.plot(years_temp, np.asarray(panel['delT'][q]).reshape(-1),
+                         c=c_temp, zorder=1,
+                         lw=style["lw"], alpha=style["alpha"], ls='--')
+
+        ax.grid(axis='y', linestyle='--', alpha=0.3, zorder=0, c=c_emis)
+        ax.grid(axis='x', linestyle='--', alpha=0.3, zorder=0)
+        ax.tick_params(axis='y', labelcolor=c_emis)
+
+        ax_temp.grid(linestyle='--', alpha=0.3, zorder=0, c=c_temp)
+        ax_temp.set_ylim(t_min - 0.75, t_max + 0.75)
+        ax_temp.tick_params(axis='y', labelcolor=c_temp)
+
+        ax.set_ylabel(r'Emissions [GtCO$_2$/yr]', fontsize=16, c=c_emis)
+        ax_temp.set_ylabel(r"$\overline{\Delta T}(t)$ [$^\circ$C]", fontsize=16,
+                           rotation=270, labelpad=15, c=c_temp)
+
+        ax.text(
+            0.02, 0.94, rf"({letters[i]}) {panel['title']}", transform=ax.transAxes,
+            ha="left", va="top", fontsize=16, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+        )
+
+        if i == 0:
+            handles = [
+                Line2D([0], [0], c=c_emis, **_FIG7V2_QUANTILE_STYLE[50]),
+                Line2D([0], [0], c=c_emis, **_FIG7V2_QUANTILE_STYLE[25]),
+                Line2D([0], [0], c=c_temp, ls='--', lw=2.0),
+            ]
+            labels = ['Emissions (median seed)',
+                      'Emissions (25th/75th pct. seed)',
+                      r'SCM $\overline{\Delta T}(t)$']
+            ax_temp.legend(handles, labels, frameon=True, loc='lower left',
+                           fancybox=True, framealpha=0.8, facecolor='white',
+                           edgecolor='#cccccc', fontsize=13)
+
+    axes[0].set_xlim([float(years_emis[0]), float(years_emis[-1])])
+    axes[-1].set_xlabel('Year', fontsize=16)
+
+    if placeholder_bar_panel:
+        ax_bar = axd["Bar"]
+        ax_bar.set_xticks([])
+        ax_bar.set_yticks([])
+        for spine in ax_bar.spines.values():
+            spine.set_linestyle((0, (6, 6)))
+            spine.set_edgecolor('gray')
+        ax_bar.text(
+            0.5, 0.5,
+            f"({letters[n]}) per-scenario NRMSE bar chart\n"
+            "[placeholder - data source not yet settled]",
+            transform=ax_bar.transAxes, ha="center", va="center",
+            fontsize=15, color='gray',
+        )
+
+    if save:
+        plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
+
+
+def plot_ic_convergence_seed_spread(seed_errors_list: list[list],
+                                    seed_baseline_error_list: list[list],
+                                    labels: list[str],
+                                    aggregation: str = AGGREGATION_DEFAULT,
+                                    save: bool = False,
+                                    figname: str = 'fig07_v2_convergence') -> None:
+    """
+    NRMSE-vs-update-step, one panel per initial condition, with a seed-spread
+    band and the baseline emulator's own spread as a horizontal reference.
+
+    Same conventions as plot_rmse_comparison_single (which is hardwired to a
+    5-panel single-forcing-agent mosaic, hence a separate function): log-log
+    axes, median + IQR by default via _aggregate_seeds.
+
+    `seed_errors_list[i]` is a list of per-seed (n_updates,) NRMSE arrays for
+    panel i; `seed_baseline_error_list[i]` a list of per-seed baseline floats.
+
+    On the y-axis: these must be penalty-corrected NRMSE
+    (utils_inverse.recover_nrmse_trajectory), NOT a checkpoint's raw 'errors',
+    which is the full objective NRMSE + smoothness_weight * sum(dU)^2.
+
+    Note for the caption: this curve is the bilevel objective evaluated on the
+    scenarios being optimized against, so it is in-sample - a training curve,
+    not held-out skill. The weighted-NRMSE comparison built from
+    evaluate_optimal_emulator is the out-of-sample counterpart.
+    """
+    n = len(seed_errors_list)
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4.0), sharey=True,
+                             sharex=True, constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    cmap = cm.batlowS
+
+    for i, ax in enumerate(axes):
+        traj = [np.asarray(e).reshape(-1) for e in seed_errors_list[i]]
+        lens = sorted({t.shape[0] for t in traj})
+        if len(lens) > 1:
+            raise ValueError(
+                f"panel {i} ({labels[i]}) has seeds at different trajectory lengths "
+                f"{lens}: some runs timed out mid-optimization or were resumed to a "
+                f"different num_updates. Finish the family before plotting - mixing "
+                f"lengths would average different run stages together."
+            )
+        stacked = np.stack(traj, axis=0)
+        centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
+        x = np.arange(centre.shape[0])
+        ax.loglog(x, centre, lw=2, color=cmap(0), label="Optimized emulator")
+        ax.fill_between(x, lo, hi, color=cmap(0), alpha=0.2, linewidth=0)
+
+        base = np.asarray(seed_baseline_error_list[i], dtype=float)
+        b_centre, b_lo, b_hi = _aggregate_seeds(base, aggregation, mean_band="minmax")
+        ax.axhline(float(b_centre), ls="--", c=cm.lipariS(5), lw=1.5,
+                   label="Baseline emulator")
+        if float(b_hi) > float(b_lo):
+            ax.axhspan(float(b_lo), float(b_hi), color=cm.lipariS(5), alpha=0.15, linewidth=0)
+
+        ax.margins(x=0, y=0)
+        ax.grid(True, alpha=0.3, which="both", ls="-")
+        ax.tick_params(axis='both', which='major', labelsize=12)
+        ax.text(
+            0.05, 0.95, labels[i], transform=ax.transAxes,
+            ha="left", va="top", fontsize=15, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.5)
+        )
+
+        if i == 0:
+            ax.set_ylabel("Emulator error (NRMSE)", fontsize=17)
+            handles, leg_labels = ax.get_legend_handles_labels()
+            n_seeds = stacked.shape[0]
+            band = mpatches.Patch(color='gray', alpha=0.2,
+                                  label=_aggregation_label(aggregation, n_seeds))
+            handles.append(band)
+            leg_labels.append(_aggregation_label(aggregation, n_seeds))
+            ax.legend(handles, leg_labels, frameon=True, fancybox=True, framealpha=0.8,
+                      facecolor='white', edgecolor='#cccccc', fontsize=11, loc='lower left')
+
+    fig.supxlabel("Outer update step", fontsize=17)
+
+    if save:
+        plt.savefig(FIGURES_DIR / f'{figname}.pdf', bbox_inches='tight')
+
+
+def _fig6_seed_stack(seed_cache, getter, scen_plot, lo_idx, hi_idx):
+    """Stack one trajectory across seeds -> (n_seeds, n_times).
+
+    `getter` pulls the per-seed dict down to the {eval_set: {scen: array}} level,
+    so baseline and per-train-scenario curves share one code path.
+    """
+    rows = []
+    for seed in sorted(seed_cache):
+        d = getter(seed_cache[seed])
+        if d is None:
+            continue
+        rows.append(np.asarray(d['All'][scen_plot][lo_idx:hi_idx]))
+    return np.stack(rows) if rows else None
+
+
+def _fig6_ood_seed_stack(ood_seed_traj, tag, label):
+    """(n_seeds, n_times) OOD trajectory stack for one (scenario, emulator label), or None."""
+    if not ood_seed_traj:
+        return None
+    return ood_seed_traj.get(tag, {}).get(label)
+
+
+def plot_ood_r2_forest(
+    ax,
+    r2_table: list[dict],
+    color_map: dict,
+    scenarios: list[str],
+    baseline_color=None,
+    display_label: dict | None = None,
+    dmin: float = -1.0,
+    dmax: float = 1.0,
+    title: str | None = None,
+    scenario_shade: dict[str, str] | None = None,
+    text_ax=None,
+    group_labels: list[tuple[str, int]] | None = None,
+    legend_valign_group: str | None = None,
+    within_group_gap: float = 0.8,
+    between_group_gap: float = 1.4,
+) -> None:
+  """Median R^2 + IQR forest plot across scenarios x emulator configs.
+
+  Recreates the Revision Response Ledger's dot-plus-IQR-line chart (Major 2),
+  generalized from 2 series (baseline vs. one optimized config) to 5 (baseline
+  plus every entry of color_map). One row per scenario, in `scenarios` order
+  top-to-bottom, with one dodged marker+IQR line per emulator. The x-axis is
+  clipped to [dmin, dmax] with off-scale points pinned to the axis and labeled,
+  since baseline R^2 can be far below -1 (e.g. M_AER baseline ~ -11).
+
+  `scenario_shade` optionally maps a scenario name to 'dark' or 'light' to
+  draw a shaded background band behind that row - e.g. grouping rows by which
+  scenario set they were drawn from, generalizing the ledger's own single
+  shaded-reference-row convention to 2 shade levels. Scenarios absent from the
+  dict get no shading.
+
+  `text_ax`/`group_labels` optionally label each scenario-set group in a
+  separate axis to the side, Figure 7's own group-label convention (rotated
+  text centered on the group's row span) but in a dedicated column rather
+  than past this axis's own right edge. `group_labels` is `(name, n_rows)`
+  tuples in the same top-to-bottom order as `scenarios`, each spanning that
+  many consecutive rows starting where the previous group left off.
+
+  `legend_valign_group` optionally vertically centers the legend on one named
+  group from `group_labels` (e.g. an unshaded group, so the legend sits
+  against a plain white background instead of over a shaded band) instead of
+  the default title-anchored position.
+
+  Row spacing is not uniform: adjacent rows drawn from the same
+  `group_labels` entry sit `within_group_gap` apart, adjacent rows from two
+  different entries sit the wider `between_group_gap` apart - giving the
+  divider lines drawn between rows below a real gap to occupy, and matching
+  `text_ax`'s group labels to the rows they actually span.
+
+  `r2_table` is the long-format list of dict rows from
+  scripts/6j_fig6_ood_evaluate.py's --mode merge (scenario, emulator,
+  r2_median, r2_p25, r2_p75, n_seeds; values may be strings, as from csv.DictReader).
+  """
+  baseline_color = baseline_color if baseline_color is not None else cm.lipariS(5)
+  display_label = display_label or {}
+  scenario_shade = scenario_shade or {}
+  SHADE_COLORS = {"dark": "0.55", "light": "0.85"}
+  SHADE_ALPHA = 0.35
+  emulators = ["Baseline Em."] + list(color_map.keys())
+  series_color = {"Baseline Em.": baseline_color, **color_map}
+
+  stats = {}
+  for row in r2_table:
+      stats[(row["scenario"], row["emulator"])] = (
+          float(row["r2_median"]), float(row["r2_p25"]), float(row["r2_p75"]))
+
+  n_emu = len(emulators)
+  dodge = np.linspace(-0.32, 0.32, n_emu)
+
+  def _clip(v):
+      return max(dmin, min(dmax, v))
+
+  # Row y-positions: within_group_gap between two rows drawn from the same
+  # group_labels entry, the wider between_group_gap at a group boundary - so
+  # rows in the same scenario group sit tighter together, and the divider
+  # lines/group text below have a real, larger gap at each group boundary to
+  # sit in. Falls back to a uniform 1-unit spacing (the old behavior) when no
+  # group_labels are given, since there's then no group structure to key off.
+  if group_labels:
+      group_of_idx = []
+      for name, n_rows in group_labels:
+          group_of_idx.extend([name] * n_rows)
+  else:
+      group_of_idx = [None] * len(scenarios)
+
+  cum = [0.0] * len(scenarios)
+  for i in range(1, len(scenarios)):
+      if not group_labels:
+          gap = 1.0  # no group structure given - old uniform spacing
+      else:
+          same_group = group_of_idx[i] == group_of_idx[i - 1]
+          gap = within_group_gap if same_group else between_group_gap
+      cum[i] = cum[i - 1] + gap
+  row_y_vals = [cum[-1] - c for c in cum]  # index 0 (list order) is the topmost row
+
+  row_half = (within_group_gap if group_labels else 1.0) / 2
+
+  for i, scen in enumerate(scenarios):
+      row_y = row_y_vals[i]
+      shade = scenario_shade.get(scen)
+      if shade is not None:
+          # Extend only as far as within_group_gap/2 towards a same-group
+          # neighbor (so two shaded rows meet with no seam), but all the way
+          # to between_group_gap/2 towards a different group or the plot's
+          # own edge - i.e. to the divider line itself - rather than stopping
+          # at the tighter within_group_gap/2 there and leaving an unshaded
+          # sliver before the divider.
+          if not group_labels:
+              top_ext = bottom_ext = row_half
+          else:
+              top_ext = (within_group_gap / 2 if (i > 0 and group_of_idx[i] == group_of_idx[i - 1])
+                         else between_group_gap / 2)
+              bottom_ext = (within_group_gap / 2 if (i < len(scenarios) - 1 and group_of_idx[i] == group_of_idx[i + 1])
+                            else between_group_gap / 2)
+          ax.axhspan(row_y - bottom_ext, row_y + top_ext, color=SHADE_COLORS[shade], alpha=SHADE_ALPHA, zorder=0)
+      for j, emu in enumerate(emulators):
+          st = stats.get((scen, emu))
+          if st is None:
+              continue
+          med, lo, hi = st
+          y = row_y + dodge[j]
+          color = series_color[emu]
+          if med >= dmin:
+              ax.plot([_clip(lo), _clip(hi)], [y, y], color=color, lw=2.5,
+                      alpha=0.55, solid_capstyle="round", zorder=2)
+              ax.plot(_clip(med), y, "o", color=color, ms=5.5, zorder=3,
+                      markeredgecolor="white", markeredgewidth=0.5)
+          else:
+              ax.plot(_clip(med), y, "o", color=color, ms=5.5, zorder=3,
+                      markeredgecolor="white", markeredgewidth=0.5)
+              ax.text(_clip(med) + 0.03, y, f"{med:.1f}", fontsize=7,
+                      va="center", ha="left", color=color)
+
+  # Divider lines between rows, drawn instead of a uniform horizontal grid: a
+  # darker line where two different scenario_groups meet (sitting in the
+  # wider between_group_gap), a lighter one between two rows drawn from the
+  # same group (sitting in the tighter within_group_gap).
+  if group_labels:
+      for i in range(1, len(scenarios)):
+          y_div = (row_y_vals[i - 1] + row_y_vals[i]) / 2
+          same_group = group_of_idx[i] == group_of_idx[i - 1]
+          if same_group:
+              ax.axhline(y_div, color="0.82", lw=0.7, alpha=0.8, zorder=0.5)
+          else:
+              ax.axhline(y_div, color="0.35", lw=1.2, alpha=0.9, zorder=0.5)
+
+  # fontstyle="italic" is a no-op under rcParams["text.usetex"]=True (the
+  # renderer ignores the Text property and just typesets the raw string) -
+  # italics have to be requested in the LaTeX source itself. M_GHG/M_AER are
+  # internal dict keys, not display names - DAMIP's own convention (matching
+  # panel labels (a)/(b) above) is the hyphenated "M-GHG"/"M-aer", not an
+  # underscore. The RAMIP-analog rungs (H-ext-Maer/VLaer/Laer) are themselves
+  # the internal scenario keys (used for the r2_table lookup above), so they
+  # get the same hyphenated-display treatment rather than a key rename. Any
+  # other underscored tag falls back to an escaped underscore, since usetex
+  # text mode treats a bare "_" as a LaTeX error.
+  scenario_display = {"M_GHG": "M-GHG", "M_AER": "M-aer",
+                       "H-ext-Maer": "H-ext-M-aer", "H-ext-VLaer": "H-ext-VL-aer",
+                       "H-ext-Laer": "H-ext-L-aer"}
+  ax.set_yticks(row_y_vals)
+  ax.set_yticklabels([r"\textit{" + scenario_display.get(s, s).replace("_", r"\_") + "}"
+                       for s in scenarios])
+  # Flush with each row's own +/-row_half span (rather than the +/-0.6
+  # padding `_clip` off-scale labels get room for) so a shaded top/bottom
+  # group's background reaches the axis edge with no unshaded sliver above/
+  # below it.
+  ax.set_ylim(row_y_vals[-1] - row_half, row_y_vals[0] + row_half)
+  ax.set_xlim(dmin - 0.05, dmax + 0.05)
+  ax.set_xticks([dmin, dmin / 2, 0, dmax / 2, dmax])
+  ax.set_xticklabels([rf"$\leq${dmin:g}"] + [f"{t:g}" for t in [dmin / 2, 0, dmax / 2, dmax]])
+  ax.axvline(0, color="0.6", lw=1, ls="--", zorder=1)
+  ax.set_xlabel(r"Median $R^2$")
+  ax.grid(axis="x", linestyle="--", alpha=0.3, zorder=0)
+
+  if text_ax is not None and group_labels:
+      # Same y-data-coordinate system as `ax`, so a group's row span here maps
+      # directly onto text_ax's y axis via get_yaxis_transform() (Figure 7's
+      # own technique, just written into a dedicated column's axis instead of
+      # past this axis's own right edge).
+      text_ax.sharey(ax)
+      text_ax.axis("off")
+      idx = 0  # index into scenarios/row_y_vals of this group's first row
+      for name, n_rows in group_labels:
+          center_y = (row_y_vals[idx] + row_y_vals[idx + n_rows - 1]) / 2
+          text_ax.text(0.5, center_y, name, transform=text_ax.get_yaxis_transform(),
+                       rotation=270, ha="center", va="center",
+                       fontsize=11, fontweight="bold", color="#333333")
+          idx += n_rows
+
+  handles = [Line2D([0], [0], marker="o", color=series_color[emu], lw=2.5,
+                    label=display_label.get(emu, emu), markersize=5.5)
+             for emu in emulators]
+  # The dodged horizontal lines themselves are colored per-emulator, not
+  # gray - this entry is a generic explainer of what that line style means,
+  # so it uses a neutral gray swatch rather than any one emulator's color.
+  handles.append(Line2D([0], [0], color="0.5", lw=2.5, alpha=0.55,
+                        solid_capstyle="round", label="Interquartile range"))
+
+  legend_x, legend_y_below_title = 0.03, 0.90
+  if title is not None:
+      title_artist = ax.text(
+              0.03, 0.985, title, transform=ax.transAxes,
+              ha="left", va="top", fontsize=14, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+            )
+      # Measure the title box's actual rendered extent so the legend below it
+      # can be placed genuinely flush-left with it, rather than a guessed
+      # axes-fraction offset that drifts if the title text or font changes.
+      ax.figure.canvas.draw()
+      renderer = ax.figure.canvas.get_renderer()
+      bbox_disp = title_artist.get_bbox_patch().get_window_extent(renderer=renderer)
+      bbox_axes = bbox_disp.transformed(ax.transAxes.inverted())
+      legend_x, legend_y_below_title = bbox_axes.x0, bbox_axes.y0 - 0.015
+
+  legend_loc, legend_anchor = "upper left", (legend_x, legend_y_below_title)
+  if group_labels and legend_valign_group is not None:
+      # Center the legend on one named group's row span (converted from data
+      # y-coordinates to axes-fraction via the ylim set above), so it lands
+      # against that group's background rather than the title-anchored spot.
+      idx = 0
+      center_y = None
+      for name, n_rows in group_labels:
+          if name == legend_valign_group:
+              center_y = (row_y_vals[idx] + row_y_vals[idx + n_rows - 1]) / 2
+              break
+          idx += n_rows
+      if center_y is not None:
+          y0, y1 = ax.get_ylim()
+          legend_loc, legend_anchor = "center left", (legend_x, (center_y - y0) / (y1 - y0))
+
+  ax.legend(handles=handles, loc=legend_loc, bbox_to_anchor=legend_anchor,
+            fontsize=11, title="Emulator configuration",
+            title_fontsize=11, framealpha=0.85)
 
 
 def plot_individual_effects_summary(
@@ -1843,192 +2430,364 @@ def plot_individual_effects_summary(
     ppt: bool = True,
     save: bool = False,
     figname: str = 'individual_effects_ppt4',
+    seed_cache: dict | None = None,
+    aggregation: str = AGGREGATION_DEFAULT,
+    ood_scenarios: dict | None = None,
+    ood_seed_traj: dict | None = None,
+    r2_table: list[dict] | None = None,
 ) -> None:
-  """Plot the multi-agent "individual effects" summary figure.
+  """Plot the multi-agent "individual effects" summary figure, in the
+  pre-revision 2-column shape: a single stacked column on the left, a
+  roughly-square panel on the right.
 
-  Left column: SCM-projected vs. baseline- and optimal-emulator ("Opt. All") predicted
-  temperature trajectories, one row per single-driver scenario (M-GHG, M-aer, G6sulfur).
-  Right panel: emulator-fit scatter/regression across all three scenarios pooled together,
-  with R^2 scores per emulator configuration.
+  Left column (6 rows, a-f): SCM-projected vs. baseline- and all-four-
+  optimized-configs' predicted temperature trajectories. Rows (a)-(c) are the
+  single-driver in-objective scenarios (M-GHG, M-aer, G6sulfur); rows (d)-(f)
+  are the 3 downselected out-of-objective scenarios
+  (utils_inverse.FIG6_OOD_SCENARIOS - H-ext-VLaer, ssp534-over,
+  esm-bell-2000PgC). Every row draws all four entries of
+  train_scenarios_ind_effects (Opt. Tier 1 / DAMIP / GeoMIP / All) against the
+  baseline - rows (d)-(f) need `ood_scenarios`/`ood_seed_traj` from
+  utils_inverse.load_fig6_ood_data and are left blank without them.
 
-  Only 'Opt. All' is drawn against the baseline (the other entries of
-  train_scenarios_ind_effects are computed upstream but intentionally skipped here, matching
-  the original figure design).
+  Right column ('Right', replaces the old scatter/regression panel): a forest
+  plot of median R^2 with IQR across seeds, one row per scenario (the full
+  out-of-objective roster minus esm-pi-CO2pulse, plus the 3 in-objective
+  references, shaded) and one dodged marker per emulator config - a Python
+  recreation of the Revision Response Ledger's chart (Major 2), generalized
+  from 2 series to 5. See plot_ood_r2_forest. Needs `r2_table` from
+  utils_inverse.load_fig6_ood_data.
+
+  `seed_cache` optionally supplies {seed: {y_true, y_hat_baseline, y_hat}} from
+  utils_inverse.regenerate_fig6_individual_effects_cache_seed_sweep. When given:
+
+    - rows (a)-(c) draw median lines with IQR bands across seeds, matching
+      Figures 3/4/5.
+
+  When `seed_cache` is None, rows (a)-(c) behave exactly as before (single-seed
+  lines). When `ood_scenarios`/`ood_seed_traj`/`r2_table` are None, the
+  corresponding rows/right column are left blank (with a printed note) rather
+  than raising, so a partial data refresh still produces a figure.
   """
   i_ppt = 0
 
+  # Back to the pre-revision 2-column shape (unchanged figsize below) - the
+  # left column now stacks all 6 scenarios (3 in-objective + 3
+  # out-of-objective) instead of 3, and the right column's forest plot spans
+  # the same full figure height it always has, keeping its original
+  # roughly-square shape. A 3rd, narrow 'Text' column (carved out of 5% of
+  # Left's former width, not added on top of the figure width) sits to the
+  # right of 'Right' for the per-scenario-group labels (see group_labels
+  # below) - Figure 7's own group-label convention places that text just
+  # outside its own axes via axes-fraction x>1, but a dedicated column gives
+  # explicit, guaranteed room instead of relying on constrained_layout to pad
+  # around out-of-axes text.
   layout = [
-          ["Left1", "Left1", "Left1", "Left1", "Left1", "Right", "Right", "Right"],
-          ["Left2", "Left2", "Left2", "Left2", "Left2", "Right", "Right", "Right"],
-          ["Left3", "Left3", "Left3", "Left3", "Left3", "Right", "Right", "Right"],
-      ]
+      ["YLabel", "Left1", "Right", "Text"],
+      ["YLabel", "Left2", "Right", "Text"],
+      ["YLabel", "Left3", "Right", "Text"],
+      ["YLabel", ".",      "Right", "Text"],  # spacer: harmonized-group break (c -> d)
+      ["YLabel", "Left4", "Right", "Text"],
+      ["YLabel", "Left5", "Right", "Text"],
+      ["YLabel", ".",      "Right", "Text"],  # spacer: harmonized-group break (e -> f)
+      ["YLabel", "Left6", "Right", "Text"],
+  ]
 
-  plot_map = {"Left1":"M_GHG", "Left2":"M_AER", "Left3":"G6sulfur"}
-  color_map = {'Opt. Tier 1':cm.actonS(2), 'Opt. DAMIP':cm.actonS(4), 'Opt. GeoMIP': cm.actonS(6), 'Opt. All':cm.osloS(2)}
-  labels = [r"(a) Medium emissions, greenhouse gases only (DAMIP: $\it{M}$-$\it{GHG}$)",
-            r"(b) Medium emissions, aerosols only (DAMIP: $\it{M}$-$\it{aer}$)",
-            r"(c) High emissions with sulfur injection (GeoMIP: $\it{G6sulfur}$)"]
+  # Baseline (lipariS(5), coral ~8 deg hue) and Opt. All (osloS(2), blue ~216
+  # deg) stay fixed. The other 3 configs used to all come from actonS (a
+  # narrow pink-purple range), which made them hard to tell apart - drawing
+  # each from a different Crameri categorical map instead spreads them to
+  # gold (~47 deg), green (~139 deg), and magenta (~324 deg), roughly evenly
+  # spaced around the hue wheel from the two fixed anchors.
+  color_map = {'Opt. Tier 1':cm.bamakoS(15), 'Opt. DAMIP':cm.hawaiiS(3), 'Opt. GeoMIP': cm.budaS(3), 'Opt. All':cm.osloS(2)}
+  baseline_color = cm.lipariS(5)
+  display_label = {'Opt. Tier 1': 'Opt. Prio. 1', 'Baseline Em.': 'Baseline Em.',
+                    'Opt. DAMIP': 'Opt. DAMIP', 'Opt. GeoMIP': 'Opt. GeoMIP', 'Opt. All': 'Opt. All'}
+
+  # One unified left-column stack: in-objective references first (a-c), then
+  # the 3 downselected out-of-objective scenarios (d-f).
+  panel_kind = {"Left1": "in_obj", "Left2": "in_obj", "Left3": "in_obj",
+                "Left4": "ood", "Left5": "ood", "Left6": "ood"}
+  panel_scenario = {"Left1": "M_GHG", "Left2": "M_AER", "Left3": "G6sulfur",
+                     "Left4": "H-ext-VLaer", "Left5": "ssp534-over", "Left6": "esm-bell-2000PgC"}
+
+  # 3 harmonized x-axis sub-groups: (a)-(c) share real calendar 1850-2150
+  # (unchanged); (d)-(e) share real calendar 2024-2100 (H-ext-VLaer's native
+  # data runs to 2150 and gets cropped - deliberate, per user request); (f) is
+  # the odd one out - esm-bell-2000PgC is a piControl-branched idealized
+  # experiment, not real historical time (see load_fig6_ood_data), so instead
+  # of a calendar axis it gets a relative "years since branch" axis, 0-200.
+  ood_xlim = {"H-ext-VLaer": (2024, 2100), "ssp534-over": (2024, 2100),
+              "esm-bell-2000PgC": (0, 200)}
+  ood_relative_x = {"esm-bell-2000PgC"}
+  panel_labels = {
+      "Left1": r"(a) Medium GHG emissions, greenhouse gases only (DAMIP: $\it{M}$-$\it{GHG}$)",
+      "Left2": r"(b) Medium GHG emissions, aerosols only (DAMIP: $\it{M}$-$\it{aer}$)",
+      "Left3": r"(c) High GHG emissions with sulfur injection (GeoMIP: $\it{G6sulfur}$)",
+      "Left4": r"(d) High GHG emissions, very-low aerosols (RAMIP analog: $\it{H}$-$\it{ext}$-$\it{VL}$-$\it{aer}$)",
+      "Left5": r"(e) Overshoot scenario (ScenarioMIP-CMIP6: $\it{ssp534}$-$\it{over}$)",
+      "Left6": r"(f) piControl-branched CO$_2$-only bell-shaped emissions (ZECMIP: $\it{esm}$-$\it{bell}$-$\it{2000PgC}$)",
+  }
   plot_len = len(y_true_ind_effects["All"]["M_GHG"])
   x_vals = np.arange(1850, 2151)
 
   if ppt:
       figsize = (16.81, 7)
   else:
-      figsize = (17.8, 7)
+      figsize = (17.8, 12.8)
 
   fig, ax_dict = plt.subplot_mosaic(
       layout,
       figsize=figsize,
       constrained_layout=True,
-      gridspec_kw={"wspace": 0.001, "hspace": 0.001}
+      gridspec_kw={
+          # 'YLabel' is a narrow spacer column carved out to the left of
+          # 'Left', holding the manually-drawn y-axis label (see below) -
+          # w_pad/h_pad are zeroed for the whole figure (next line), so
+          # fig.supylabel's automatic placement sat flush against 'Left'
+          # with no real gap; a dedicated column, drawn into the same way as
+          # 'Text' on the right, gives that gap explicit, guaranteed room.
+          "width_ratios": [0.35, 4.75, 3, 0.25],
+          # The 2 '.' spacer rows (breaks between harmonized x-axis groups)
+          # get a small fraction of a data row's height - visual separation
+          # between groups is concentrated there, not in gridspec's own
+          # wspace/hspace (see set_constrained_layout_pads below). Reduced
+          # 0.15 -> 0.08 -> 0.03 across successive tightening passes; the
+          # freed height_ratios budget also goes straight to the 6 data
+          # rows' own share of a fixed figsize, so panels grow slightly too.
+          "height_ratios": [1, 1, 1, 0.03, 1, 1, 0.03, 1],
+      }
   )
+  # constrained_layout ignores gridspec_kw's own wspace/hspace here - it
+  # reserves a fixed minimum gap for each axes' tick-label space regardless
+  # (even where tick_params(labelbottom=False) hides the labels: hiding
+  # doesn't free the space constrained_layout reserved for them). The actual
+  # knob is the layout engine's own pads, set directly - zeroing these is what
+  # lets same-harmonized-group panels (a-b, b-c, d-e) sit close together,
+  # while the '.' spacer rows above still give real separation between groups.
+  fig.set_constrained_layout_pads(w_pad=0.0, h_pad=0.0, wspace=0.0, hspace=0.0)
+  ax_dict["Text"].axis("off")
+  ax_dict["YLabel"].axis("off")
 
-  for j, ax_label in enumerate(plot_map):
+  has_ood = bool(ood_scenarios and ood_seed_traj)
+  if not has_ood:
+      print("plot_individual_effects_summary: no OOD data supplied - Left4-6 left blank. "
+            "Pass ood_scenarios/ood_seed_traj from utils_inverse.load_fig6_ood_data.")
+
+  # Tracks the min/max of every array actually drawn (band edges included, not
+  # just medians) across all 6 panels, so every row can share one y-axis range
+  # covering the full data extent regardless of scenario.
+  y_min, y_max = np.inf, -np.inf
+  def _track(*arrays):
+      nonlocal y_min, y_max
+      for arr in arrays:
+          arr = np.asarray(arr)
+          if arr.size == 0:
+              continue
+          y_min = min(y_min, float(np.nanmin(arr)))
+          y_max = max(y_max, float(np.nanmax(arr)))
+
+  for ax_label, scen_plot in panel_scenario.items():
       ax_plot = ax_dict[ax_label]
-      scen_plot = plot_map[ax_label]
+      kind = panel_kind[ax_label]
 
-      ax_plot.plot(x_vals, y_true_ind_effects['All'][scen_plot][100:plot_len], label='SCM-projected', c='black', ls='--', lw=2, alpha = 0.8)
-      ax_plot.plot(x_vals, y_hat_baseline['All'][scen_plot][100:plot_len], label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
+      if kind == "ood" and not has_ood:
+          continue
 
-      for i, train in enumerate(reversed(train_scenarios_ind_effects)):
-          train_label = train
-          if train in ['Opt. Tier 2','Opt. DECK', 'Opt. CS3']:
+      if kind == "in_obj":
+          truth = y_true_ind_effects['All'][scen_plot][100:plot_len]
+          ax_plot.plot(x_vals, truth, label='SCM-projected', c='black', ls='--', lw=2, alpha = 0.8)
+          _track(truth)
+
+          # Ground truth is the SCM, not an emulator, so it carries no seed
+          # spread and stays a single line. Everything below it gets a band
+          # when the seed cache is supplied.
+          if seed_cache:
+              b_stack = _fig6_seed_stack(
+                  seed_cache, lambda r: r['y_hat_baseline'], scen_plot, 100, plot_len)
+              if b_stack is not None:
+                  b_c, b_lo, b_hi = _aggregate_seeds(b_stack, aggregation, mean_band="minmax")
+                  ax_plot.fill_between(x_vals, b_lo, b_hi, color=cm.lipariS(5), alpha=0.18,
+                                       lw=0, zorder=1)
+                  ax_plot.plot(x_vals, b_c, label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
+                  _track(b_lo, b_hi)
+              else:
+                  base = y_hat_baseline['All'][scen_plot][100:plot_len]
+                  ax_plot.plot(x_vals, base, label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
+                  _track(base)
+          else:
+              base = y_hat_baseline['All'][scen_plot][100:plot_len]
+              ax_plot.plot(x_vals, base, label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
+              _track(base)
+
+          for train in reversed(train_scenarios_ind_effects):
+              train_label = train
+              if train in ['Opt. Tier 2','Opt. DECK', 'Opt. CS3']:
+                  continue
+              alpha = 0.6
+              zorder = 0
+              ls = (0, (5, 4))
+              if train == 'Opt. All':
+                  alpha = 1
+                  zorder = 10
+                  ls = '-'
+              elif train == 'Opt. Tier 1':
+                  train_label = 'Opt. Prio. 1'
+              o_stack = (_fig6_seed_stack(seed_cache, lambda r: r['y_hat'].get(train),
+                                          scen_plot, 100, plot_len)
+                         if seed_cache else None)
+              if o_stack is not None:
+                  o_c, o_lo, o_hi = _aggregate_seeds(o_stack, aggregation, mean_band="minmax")
+                  ax_plot.fill_between(x_vals, o_lo, o_hi, color=color_map[train],
+                                       alpha=0.18, lw=0, zorder=zorder)
+                  ax_plot.plot(x_vals, o_c, alpha=alpha, label=train_label, zorder=zorder + 1,
+                               lw=2, ls=ls, color=color_map[train])
+                  _track(o_lo, o_hi)
+              else:
+                  opt = y_hat_ind_effects[train]['All'][scen_plot][100:plot_len]
+                  ax_plot.plot(x_vals, opt, alpha=alpha, label=train_label, zorder=zorder, lw=2, ls=ls, color=color_map[train])
+                  _track(opt)
+
+          ax_plot.set_xlim([1850, 2150])
+          if ax_label in ("Left1", "Left2"):
+              ax_plot.sharex(ax_dict["Left3"])
+              # bottom=False (not just labelbottom=False): constrained_layout
+              # reserves padding for the tick marks themselves, not only
+              # their labels - with h_pad/hspace already at 0, this residual
+              # reservation was the remaining within-group gap.
+              ax_plot.tick_params(axis="x", bottom=False, labelbottom=False)
+
+      else:  # kind == "ood"
+          tag = scen_plot
+          scen = ood_scenarios.get(tag)
+          if scen is None:
               continue
-          if train not in ['Opt. All']:
-              continue
-          alpha = 0.6
-          zorder = 0
-          ls = (0, (5, 4))
-          if train == 'Opt. All':
-              alpha = 1
-              zorder = 10
-              ls = '-'
-          elif train == 'Opt. Tier 1':
-              train_label = 'Opt. Prio. 1'
-          ax_plot.plot(x_vals, y_hat_ind_effects[train]['All'][scen_plot][100:plot_len], alpha=alpha, label=train_label, zorder=zorder, lw=2, ls=ls, color=color_map[train])
+          years = scen["years"]
+          x_plot = (years - years.min()) if tag in ood_relative_x else years
+          xlim = ood_xlim[tag]
+          # Only track y-bounds over the portion actually left visible after
+          # cropping to the harmonized xlim, so a cropped-off tail (e.g.
+          # H-ext-VLaer's 2100-2150) doesn't waste shared y-axis range.
+          vis = (x_plot >= xlim[0]) & (x_plot <= xlim[1])
 
-      if ax_label != "Left3":
-          ax_plot.sharex(ax_dict["Left3"])
-          ax_plot.sharey(ax_dict["Left3"])
-          ax_plot.tick_params(labelbottom=False)
+          ax_plot.plot(x_plot, scen["y_scm"], label='SCM-projected', c='black',
+                       ls='--', lw=2, alpha=0.8)
+          _track(scen["y_scm"][vis])
+
+          b_stack = _fig6_ood_seed_stack(ood_seed_traj, tag, "Baseline Em.")
+          if b_stack is not None:
+              b_c, b_lo, b_hi = _aggregate_seeds(b_stack, aggregation, mean_band="minmax")
+              ax_plot.fill_between(x_plot, b_lo, b_hi, color=baseline_color, alpha=0.18, lw=0, zorder=1)
+              ax_plot.plot(x_plot, b_c, label='Baseline Em.', lw=2, ls="-", c=baseline_color)
+              _track(b_lo[vis], b_hi[vis])
+
+          # Unlike the top 3 rows, every optimized config is drawn here - the
+          # point of these rows is comparing all four configs' genuinely
+          # out-of-distribution skill, not just 'Opt. All's.
+          for train in reversed(train_scenarios_ind_effects):
+              if train in ['Opt. Tier 2', 'Opt. DECK', 'Opt. CS3']:
+                  continue
+              train_label = display_label.get(train, train)
+              alpha, zorder, ls = (1, 10, '-') if train == 'Opt. All' else (0.85, 5, (0, (5, 4)))
+              o_stack = _fig6_ood_seed_stack(ood_seed_traj, tag, train)
+              if o_stack is None:
+                  continue
+              o_c, o_lo, o_hi = _aggregate_seeds(o_stack, aggregation, mean_band="minmax")
+              ax_plot.fill_between(x_plot, o_lo, o_hi, color=color_map[train], alpha=0.18, lw=0, zorder=zorder)
+              ax_plot.plot(x_plot, o_c, alpha=alpha, label=train_label, zorder=zorder + 1,
+                           lw=2, ls=ls, color=color_map[train])
+              _track(o_lo[vis], o_hi[vis])
+
+          ax_plot.set_xlim(xlim)
+          if ax_label == "Left4":
+              ax_plot.tick_params(axis="x", bottom=False, labelbottom=False)
 
       ax_plot.grid(linestyle='--', alpha=0.3, zorder=0)
-
       ax_plot.text(
-              0.015, 0.915, labels[j], transform=ax_plot.transAxes,
-              ha="left", va="top", fontsize=14, fontweight="bold",
+              0.015, 0.915, panel_labels[ax_label], transform=ax_plot.transAxes,
+              ha="left", va="top", fontsize=11, fontweight="bold", zorder=20,
               bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
             )
-      ax_plot.set_ylim([-4.2, 5.2])
 
-  ax_plot.set_xlim([1850, 2150])
-  ax_plot.set_xlabel("Year")
+  # Apply one shared y-axis range (data min/max across every panel, with a
+  # small pad) to all 6 rows, in place of the old fixed [-4.2, 5.2] used only
+  # for the in-objective rows.
+  if np.isfinite(y_min) and np.isfinite(y_max):
+      data_range = y_max - y_min
+      bottom_pad = 0.04 * data_range
+      # The (a)-(f) title box sits near the top of each panel (y=0.915 axes
+      # fraction, below); a bigger top-only pad gives it clear whitespace
+      # above the plotted curves instead of the tight 4% pad crowding it.
+      top_pad = 0.16 * data_range
+      shared_ylim = [y_min - bottom_pad, y_max + top_pad]
+      for ax_label in panel_scenario:
+          ax_dict[ax_label].set_ylim(shared_ylim)
 
-  ax_dict["Left2"].legend(ncol=2,
+  # Each of the 3 harmonized x-axis sub-groups gets its own axis label at the
+  # bottom of that group, since (f)'s relative axis isn't calendar "Year".
+  ax_dict["Left3"].set_xlabel("Year")
+  ax_dict["Left5"].set_xlabel("Year")
+  ax_dict["Left6"].set_xlabel("Years since piControl branch")
+
+  # One shared legend for the whole left column - every row uses the same
+  # color/style mapping (SCM-projected, Baseline Em., and all 4 optimized
+  # configs), so a single legend inside panel (b) replaces the two separate
+  # in-panel legends that used to fight the compressed row heights for space.
+  handles, legend_labels = ax_dict["Left1"].get_legend_handles_labels()
+  ax_dict["Left2"].legend(handles, legend_labels, ncol=2,
+                    loc='upper right',
                     frameon=True,
                     fancybox=True,
                     framealpha=0.8,
                     facecolor='white',
                     edgecolor='#cccccc',
-                    fontsize=12)
+                    fontsize=11,
+                    handlelength=1.5,
+                    handletextpad=0.5,
+                    columnspacing=1.0)
 
-  fig.supylabel(r'Temperature anomaly [$^\circ$C]', fontsize=16)
+  # Drawn into the dedicated 'YLabel' column rather than fig.supylabel, whose
+  # automatic placement sat flush against 'Left' once w_pad was zeroed above
+  # - x=0.3 (left-of-center within the column) leaves a visible gap between
+  # the label and 'Left's own left edge instead.
+  ax_dict["YLabel"].text(0.3, 0.5, r'Temperature anomaly [$^\circ$C]',
+                          transform=ax_dict["YLabel"].transAxes,
+                          rotation=90, ha='center', va='center', fontsize=16)
 
-  ax_plot = ax_dict['Right']
-
-  scenario_legend_handles = {}
-  marker_legend_handles = []
-  scenarios = ["M_GHG","M_AER","G6sulfur"]
-  model_performance = defaultdict(lambda: {'true': [], 'pred': [], 'color': None})
-
-  step = 15
-  size = 35
-  markers = ['o','s','d']
-  base_color = cm.lipariS(5)
-
-  for j, scen_plot in enumerate(scenarios):
-      y_true = y_true_ind_effects['All'][scen_plot][100:plot_len]
-      y_pred_base = y_hat_baseline['All'][scen_plot][100:plot_len]
-      ax_plot.scatter(y_true[::step], y_pred_base[::step],
-                      marker=markers[j], color=base_color, s=size,
-                      facecolor='white', linewidths=1, alpha=0.4)
-
-      model_performance['Baseline Em.']['true'].extend(y_true)
-      model_performance['Baseline Em.']['pred'].extend(y_pred_base)
-      model_performance['Baseline Em.']['color'] = base_color
-
-      for i, train in enumerate(reversed(train_scenarios_ind_effects)):
-              if train in ['Opt. Tier 2','Opt. DECK', 'Opt. CS3']:
-                  continue
-              y_pred = y_hat_ind_effects[train]['All'][scen_plot][100:plot_len]
-
-              model_performance[train]['true'].extend(y_true)
-              model_performance[train]['pred'].extend(y_pred)
-              model_performance[train]['color'] = color_map[train]
-
-  emulator_handles = [Line2D([0], [0], ls='--', color='k', lw=2, label=f"Ideal fit (1:1)")]
-  for name, data in model_performance.items():
-      markeredgewidth = 1
-      ls = (0, (5, 4))
-      if name not in ['Baseline Em.','Opt. All']:
-          continue
-      if name == 'Opt. All' or name == 'Baseline Em.':
-          markeredgewidth = 1.75
-          ls = '-'
-      elif name == 'Opt. Tier 1':
-          name = 'Opt. Prio. 1'
-      sns.regplot(
-          x=np.array(data['true']),
-          y=np.array(data['pred']),
-          scatter=False,
-          ci=95,
-          color=data['color'],
-          ax=ax_plot,
-          truncate=False,
-          line_kws={'linewidth': 1.5, 'zorder': 11, 'linestyle':ls}
+  # -- Right column: median R^2 + IQR forest plot across all scenarios/configs --
+  if r2_table:
+      # The full out-of-objective roster minus esm-pi-CO2pulse (Ledger Major
+      # 2's own critique: 0.21 K of total signal, R^2 dominated by a
+      # single-year spike), grouped by which scenario set each was drawn from
+      # rather than by skill - within each group, order matches the ledger's
+      # own descending-'Opt. All'-median-R^2 convention. CMIP5's only entries
+      # here are the RCP scenarios (rcp45/rcp85); CMIP6 covers 3 different
+      # MIPs native to that generation (ScenarioMIP's ssp534-over, RAMIP's own
+      # ssp370-126aer, AerChemMIP's ssp370-lowNTCF) - as opposed to the CMIP7
+      # RAMIP-analogue rungs (H-ext-*), which get their own group.
+      scenario_groups = [
+          ("DAMIP",                 ["M_GHG", "M_AER"],                            "dark"),
+          ("GeoMIP",                ["G6sulfur"],                                  "dark"),
+          ("RAMIP analogs (CMIP7)", ["H-ext-Maer", "H-ext-VLaer", "H-ext-Laer"], "light"),
+          ("CMIP5",                 ["rcp45", "rcp85"],                            None),
+          ("CMIP6",                 ["ssp370-lowNTCF", "ssp370-126aer", "ssp534-over"], None),
+          ("ZECMIP",                ["esm-bell-1000PgC", "esm-bell-2000PgC"],      None),
+      ]
+      ood_forest_scenarios = [s for _, scens, _ in scenario_groups for s in scens]
+      scenario_shade = {s: shade for _, scens, shade in scenario_groups if shade is not None for s in scens}
+      plot_ood_r2_forest(
+          ax_dict['Right'], r2_table, color_map,
+          scenarios=ood_forest_scenarios,
+          scenario_shade=scenario_shade,
+          baseline_color=baseline_color, display_label=display_label,
+          title='(g) Emulator skill summary',
+          text_ax=ax_dict['Text'],
+          group_labels=[(name, len(scens)) for name, scens, _ in scenario_groups],
+          legend_valign_group="CMIP5",
       )
-      score = r2_score(data['true'], data['pred'])
-      handle = Line2D([0], [0], ls=ls, color=data['color'], lw=2, label=f"{name} ($R^2={score:.2f}$)")
-      emulator_handles.append(handle)
-
-  scenario_handles = []
-  scen_labels = [r'$\it{M}$-$\it{GHG}$',r'$\it{M}$-$\it{aer}$',r'$\it{G6sulfur}$']
-  for marker, label in zip(markers, scen_labels):
-      handle = Line2D([0], [0], marker=marker, color='w', label=label,
-                      markerfacecolor='white', markeredgecolor='k', markersize=8)
-      scenario_handles.append(handle)
-
-  scen_legend = ax_plot.legend(handles=scenario_handles, loc='lower right', title='Scenario', fontsize=12, title_fontsize=12)
-  ax_plot.add_artist(scen_legend)
-
-  emu_legend = ax_plot.legend(handles=emulator_handles,
-                              loc='upper left', fontsize=12,
-                              bbox_to_anchor=(0.019893604239317852,
-                                              0.6345526951619422,
-                                              0.43059349211779896,
-                                              0.2872407910360216),
-                              title='Emulator configuration',
-                              mode='expand',
-                              title_fontsize=12,
-                              borderaxespad=0)
-  shift = [65, 2, 26, 0, 3, 6]
-  for i, text in enumerate(emu_legend.get_texts()):
-      text.set_horizontalalignment('right')
-      text.set_x(shift[i])
-
-  ax_plot.grid(linestyle='--', alpha=0.3, zorder=0)
-  ax_plot.set_ylabel(r'Emulated temperature anomaly [$^\circ$C]')
-  ax_plot.set_xlabel(r'SCM-projected temperature anomaly [$^\circ$C]')
-  ax_plot.axline((0, 0), slope=1, color='black', alpha=0.8, linestyle='--', linewidth=1.5, zorder=0)
-  ax_plot.set_xlim([-1.5, 5.175])
-  ax_plot.set_ylim([-4.5, 6.5])
-  final_handles = list(scenario_legend_handles.values()) + marker_legend_handles
-
-  ax_plot.text(
-              0.03, 0.975, '(d) Emulator fit', transform=ax_plot.transAxes,
-              ha="left", va="top", fontsize=14, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
+  else:
+      print("plot_individual_effects_summary: no r2_table supplied - right column left blank. "
+            "Pass r2_table from utils_inverse.load_fig6_ood_data.")
 
   if save:
       plt.savefig(FIGURES_DIR / f'{figname}.pdf')
@@ -2293,12 +3052,7 @@ def plot_model_comparison(emis_dict: dict, target_dict: dict, theta0: jnp.ndarra
     """
     # 1. Parameter Setup
     # Select the correct base parameters for the mode to reconstruct theta0
-    if mode == 'FaIR':
-        base_params = utils_FaIR_JAX.FAIR_PARAMS
-    elif mode == 'MESM':
-        base_params = utils_FaIR_JAX.MESM_PARAMS
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
+    base_params = utils_FaIR_JAX.params_for_mode(mode)
 
     params_opt = utils_FaIR_JAX.params_from_theta(theta0, base_params=base_params)
 
@@ -2360,13 +3114,13 @@ def plot_model_comparison(emis_dict: dict, target_dict: dict, theta0: jnp.ndarra
         # Plot Truth
         ax.plot(years, target_matrix[i, :actual_len], color='black', label='Target (Data)', lw=2)
 
-        # Plot Default
+        # Plot calibrated (theta0 / params_opt)
         ax.plot(years, preds_opt[i, :actual_len], color='tab:red', linestyle='--',
-                label='Default (FaIR)', lw=2)
-
-        # Plot MESM calibration
-        ax.plot(years, preds_default[i, :actual_len], color='tab:blue', linestyle=':',
                 label=f'Calibrated ({mode})', lw=2)
+
+        # Plot mode's own uncalibrated default params (params=None)
+        ax.plot(years, preds_default[i, :actual_len], color='tab:blue', linestyle=':',
+                label=f'Default ({mode})', lw=2)
 
         ax.set_title(f'Scenario: {name}')
         ax.set_xlabel('Years')
@@ -2721,13 +3475,17 @@ def plot_zonal_predictions(results: dict, preds: dict, truths: dict, lat_coords:
     return fig
 
 def plot_comparison_results(
-    result_paths: list[str],
-    column_titles: list[str],
-    baseline_errors: list[float],
+    result_paths: list[str] | None = None,
+    column_titles: list[str] = None,
+    baseline_errors: list[float] | None = None,
     active_agents: tuple | None = None,
     agent_units: dict | None = None,
     max_lines: int = 11,
     save_path: str | None = None,
+    seed_result_paths: list[list[str]] | None = None,
+    seed_baseline_errors: list[list[float]] | None = None,
+    representative_seed: int = 0,
+    aggregation: str = AGGREGATION_DEFAULT,
 ) -> None:
     """
     Comparison plot for multiple optimize_emissions_inverse checkpoints, used
@@ -2736,21 +3494,59 @@ def plot_comparison_results(
     Columns = datasets (defined by result_paths). Rows = 1 (NRMSE) + N (agents).
 
     Args:
-        result_paths: File paths to pickle files containing 'errors'/'U_traj'.
+        result_paths: File paths to pickle files containing 'errors'/'U_traj'
+            (single-run mode). Ignored for a column where the corresponding
+            entry of `seed_result_paths` is given.
         column_titles: Text box label for each column (top left).
-        baseline_errors: Baseline error value (dashed line) per column.
+        baseline_errors: Baseline error value (dashed line) per column,
+            single-run mode.
+        seed_result_paths: Optional, one entry per column - a list of
+            per-seed checkpoint paths (same experiment/condition, varying
+            seed). When given for a column, the NRMSE row plots the
+            median trajectory with a shaded IQR band (matching Figure 3's
+            plot_rmse_comparison_single convention) instead of a single
+            line, using the penalty-corrected NRMSE
+            (utils_inverse.load_inverse_ckpt_nrmse_only), not a checkpoint's
+            raw 'errors'. Leaving this None (the default) is fully
+            backward-compatible - reproduces the exact prior single-run
+            output.
+        seed_baseline_errors: Optional, one entry per column - a list of
+            per-seed baseline NRMSE floats, paired with `seed_result_paths`.
+        representative_seed: In seed mode, which seed's emissions trajectory
+            drives the bottom rows (rows 1..N). These stay single-seed even
+            in seed mode - overlaying 50 realized trajectories per column
+            would be unreadable, matching this repo's existing precedent
+            that illustrative trajectory panels are not seed-aggregated
+            (e.g. Figure 2's H-ext visualization).
+        aggregation: 'median' (default, IQR band) or 'mean' (min-max band),
+            only used when `seed_result_paths` is given for a column.
     """
+    n_cols = len(seed_result_paths) if seed_result_paths is not None else len(result_paths)
+    if column_titles is None or len(column_titles) != n_cols:
+        raise ValueError("column_titles must be given and match the number of columns.")
 
     # --- 1. Load Data ---
+    # Per column: the single-run dict used for rows 1..N (emissions
+    # trajectories) always, plus (in seed mode) the per-seed NRMSE
+    # trajectories/baselines used for row 0 instead of the single-run values.
     loaded_results = []
-    for path in result_paths:
-        with open(path, 'rb') as f:
-            loaded_results.append(pickle.load(f))
+    seed_nrmse_by_col = [None] * n_cols
+    seed_baseline_by_col = [None] * n_cols
+    for col_idx in range(n_cols):
+        if seed_result_paths is not None and seed_result_paths[col_idx] is not None:
+            paths = seed_result_paths[col_idx]
+            rep_path = paths[representative_seed]
+            with open(rep_path, 'rb') as f:
+                loaded_results.append(pickle.load(f))
+            seed_nrmse_by_col[col_idx] = [
+                utils_inverse.load_inverse_ckpt_nrmse_only(p)["errors"] for p in paths
+            ]
+            seed_baseline_by_col[col_idx] = seed_baseline_errors[col_idx]
+        else:
+            with open(result_paths[col_idx], 'rb') as f:
+                loaded_results.append(pickle.load(f))
 
-    n_cols = len(loaded_results)
-    if len(column_titles) != n_cols:
-        raise ValueError("Length of column_titles must match result_paths.")
-    if len(baseline_errors) != n_cols:
+    if seed_result_paths is None and baseline_errors is not None and len(baseline_errors) != n_cols:
         raise ValueError("Length of baseline_errors must match result_paths.")
 
     # --- 2. Helpers (Internal) ---
@@ -2817,10 +3613,42 @@ def plot_comparison_results(
 
         # --- Row 0: NRMSE ---
         ax_err = axes[0, col_idx]
-        x_err = jnp.arange(errors.shape[0])
 
-        ax_err.loglog(x_err, errors, c=cm.batlowWS(1), label="Optimized emulator")
-        ax_err.axhline(float(baseline_errors[col_idx]), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
+        if seed_nrmse_by_col[col_idx] is not None:
+            _lens = sorted({int(t.shape[0]) for t in seed_nrmse_by_col[col_idx]})
+            if len(_lens) > 1:
+                raise ValueError(
+                    f"column {col_idx} ({column_titles[col_idx]!r}) has seeds at different "
+                    f"trajectory lengths {_lens}: this sweep is only partially migrated, or "
+                    f"its regeneration jobs are still running."
+                )
+            stacked = np.stack([np.asarray(t) for t in seed_nrmse_by_col[col_idx]], axis=0)
+            centre, lo, hi = _aggregate_seeds(stacked, aggregation, mean_band="minmax")
+            x_err = np.arange(centre.shape[0])
+            stat = "median" if aggregation == "median" else "mean"
+            ax_err.loglog(x_err, centre, c=cm.batlowWS(1), lw=2, label=f"Optimized emulator ({stat})")
+            ax_err.fill_between(x_err, lo, hi, color=cm.batlowWS(1), alpha=0.2, linewidth=0)
+
+            b_centre, b_lo, b_hi = _aggregate_seeds(
+                np.asarray(seed_baseline_by_col[col_idx], dtype=float), aggregation, mean_band="minmax")
+            ax_err.axhline(float(b_centre), ls="--", c=cm.lipariS(5), lw=1.5,
+                           label=f"Baseline emulator\nerror lower bound ({stat})")
+            if float(b_hi) > float(b_lo):
+                ax_err.axhspan(float(b_lo), float(b_hi), color=cm.lipariS(5), alpha=0.15, linewidth=0)
+            n_update_steps = int(x_err[-1])
+
+            if col_idx == 0:
+                handles, labels = ax_err.get_legend_handles_labels()
+                iqr_patch = mpatches.Patch(color='gray', alpha=0.2, label='Interquartile range')
+                handles.append(iqr_patch)
+                labels.append('Interquartile range')
+                ax_err.legend(handles=handles, labels=labels, loc="upper right", fontsize=9)
+        else:
+            x_err = jnp.arange(errors.shape[0])
+            ax_err.loglog(x_err, errors, c=cm.batlowWS(1), label="Optimized emulator")
+            ax_err.axhline(float(baseline_errors[col_idx]), ls="--", c=cm.lipariS(5), lw=1.5, label="Baseline emulator\nerror lower bound")
+            if col_idx == 0:
+                ax_err.legend(loc="upper right", fontsize=9)
 
         ax_err.set_xlim(0, n_update_steps)
         if col_idx == 0:
@@ -2833,8 +3661,6 @@ def plot_comparison_results(
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
         )
         ax_err.grid(True, alpha=0.3)
-        if col_idx == 0:
-            ax_err.legend(loc="upper right", fontsize=9)
 
         # --- Rows 1..N: Emissions ---
         n_total = len(U_traj)
@@ -2893,3 +3719,550 @@ def plot_comparison_results(
         plt.savefig(FIGURES_DIR / f'{save_path}.pdf')
 
     return
+
+# ==================================================================
+# Stage 6i: Figure 6 OOD extension
+# ==================================================================
+
+# One colour per scenario GROUP, linestyle separating members within a group -
+# identity is never carried by colour alone. Colours are cmcrameri batlowS
+# entries, matching this repo's existing figures (Figure 6 uses cm.lipariS /
+# cm.osloS). Validated all-pairs: worst CVD deltaE 10.0, worst normal-vision
+# deltaE 16.5, every contrast-vs-white >= 2.48 - so the set clears the CVD (>=8)
+# and normal-vision (>=15) separation targets.
+#
+# NOTE on lightness: batlowS deliberately spans a WIDE lightness range, which is
+# what keeps its categories distinguishable when a journal prints in greyscale.
+# That is an intentional deviation from the narrow-lightness-band convention used
+# for on-screen categorical palettes, and it is the right trade for a manuscript
+# figure. Do not "fix" it by re-picking within one lightness band: doing so
+# collapses the available batlowS colours to a single olive/orange family whose
+# pairwise separation then fails outright.
+#
+# Colours are keyed by group, NOT by position, so downselecting the scenario
+# roster later cannot repaint the survivors.
+OOD_GROUP_COLORS = {
+    "cmip7_ramip":     "#011959",  # navy
+    "co2_only":        "#226061",  # teal
+    "other_generation": "#828231", # olive
+    "cmip6_aerosol":   "#dd954d",  # orange
+}
+OOD_GROUP_LABELS = {
+    "cmip7_ramip": "CMIP7 RAMIP analogue",
+    "co2_only": r"CO$_2$-only idealized",
+    "other_generation": "Other scenario generation",
+    "cmip6_aerosol": "CMIP6 aerosol perturbation",
+}
+OOD_LINESTYLES = ["-", "--", ":"]
+
+_OOD_PANEL_SPECS = [
+    ("CO2", r"CO$_2$ [GtCO$_2$/yr]"),
+    ("CH4", r"CH$_4$ [MtCH$_4$/yr]"),
+    ("N2O", r"N$_2$O [MtN$_2$O/yr]"),
+    ("Sulfur", r"Sulfur [MtSO$_2$/yr]"),
+    ("BC", "BC [MtBC/yr]"),
+    ("GMST", r"SCM $\Delta T$ [$^\circ$C]"),
+]
+
+
+def _ood_scenario_styles(scen):
+    """Stable per-scenario style: colour from its group, linestyle from its index
+    within that group. Shared by every Stage 6i figure so a scenario keeps one
+    identity across them."""
+    style, per_group = {}, {}
+    for tag, d in scen.items():
+        g = d["group"]
+        i = per_group.get(g, 0)
+        per_group[g] = i + 1
+        style[tag] = dict(color=OOD_GROUP_COLORS[g], ls=OOD_LINESTYLES[i % len(OOD_LINESTYLES)])
+    return style
+
+
+def plot_ood_scenario_overview(cache, xlim=(1850, 2160), save=None, figsize=(18, 9)):
+    """Six panels - one per forcing agent plus the SCM-simulated GMST - with one
+    line per OOD scenario on every panel.
+
+    This is the Phase-A diagnostic for Stage 6i: it makes the whole candidate
+    roster legible before any emulator touches it, showing which scenarios sit
+    genuinely far from the training distribution, which are near-duplicates, and
+    whether any splice or unit conversion went wrong.
+
+    `cache` is the dict written by scripts/6i_fig6_ood_extension.py, with keys
+    'scenarios', 'references', 'historical', 'agents'. In-sample CMIP7 references
+    are drawn as thin grey lines for context and are not part of the roster.
+
+    CAVEAT on the x-axis: the CO2-only idealized scenarios are piControl-branched
+    and carry NO calendar meaning - RCMIP simply labels their branch year 1850, so
+    esm-bell-* peaks at "1899" and esm-pi-CO2pulse at "1860". They are drawn on the
+    same calendar axis for compactness, but they are not contemporaneous with the
+    historical period the other scenarios are prepended with. This is the same
+    convention the repo already uses for DECK (utils_inverse.py:683).
+    """
+    fig, axes = plt.subplots(2, 3, figsize=figsize, constrained_layout=True)
+    axes = axes.ravel()
+
+    scen = cache["scenarios"]
+    refs = cache.get("references", {})
+    hist = cache.get("historical", {})
+
+    style = _ood_scenario_styles(scen)
+
+    hist_years = None
+    if hist:
+        n_hist = len(next(iter(hist.values())))
+        hist_years = np.arange(2024 - n_hist, 2024)
+
+    for ax, (key, ylabel) in zip(axes, _OOD_PANEL_SPECS):
+        # Historical context (shared by every scenario that prepends it).
+        if key != "GMST" and hist_years is not None:
+            ax.plot(hist_years, hist[key], color="0.55", lw=1.0, zorder=1)
+
+        # In-sample references, recessive.
+        for rtag, rd in refs.items():
+            yv = rd["y_scm"] if key == "GMST" else rd["emis"][key]
+            ax.plot(rd["years"], yv, color="0.7", lw=1.0, zorder=1)
+
+        for tag, d in scen.items():
+            yv = d["y_scm"] if key == "GMST" else d["emis"][key]
+            ax.plot(d["years"], yv, lw=1.8, zorder=3,
+                    color=style[tag]["color"], ls=style[tag]["ls"])
+
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(xlim)
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.set_axisbelow(True)
+
+    for ax in axes[3:]:
+        ax.set_xlabel("Year")
+
+    # Legend: group colour + per-scenario linestyle, so identity is colour+dash.
+    handles = []
+    for g, label in OOD_GROUP_LABELS.items():
+        members = [t for t, d in scen.items() if d["group"] == g]
+        if not members:
+            continue
+        handles.append(Line2D([], [], color="none", label=r"\textbf{%s}" % label))
+        for t in members:
+            handles.append(Line2D([], [], color=style[t]["color"], ls=style[t]["ls"],
+                                  lw=1.8, label=t))
+    handles.append(Line2D([], [], color="0.7", lw=1.0, label="In-sample reference"))
+
+    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5),
+               frameon=False, fontsize=12, handlelength=2.4)
+
+    if save is not None:
+        fig.savefig(FIGURES_DIR / f"{save}.pdf", bbox_inches="tight", transparent=True)
+    return fig, axes
+
+
+def plot_harmonization_diagnostic(cache, xlim=(2010, 2100), save=None, figsize=(18, 9)):
+    """Before/after evidence for the Gidden et al. (2018) harmonization.
+
+    Five emissions panels plus a summary panel. In each emissions panel the
+    published RCMIP pathway is drawn faint and dashed, the harmonized pathway
+    solid, and the repo's own CMIP7 historical in grey. The two vertical rules
+    mark the harmonization year (2023, where the corrected pathway is pinned to
+    the historical inventory) and the convergence year (2080, from which the
+    correction is exactly zero and the pathway is the scenario as published).
+
+    The sixth panel is what the exercise is for: the size of the step at the
+    2023->2024 handoff, per species and scenario, before and after. Open marker =
+    published, filled = harmonized, joined by a rule.
+
+    Only scenarios with harmonize=True appear. The CMIP7 crosses are drawn from
+    the same source file as the historical and the CO2-only experiments are
+    piControl-branched, so neither is harmonized and neither belongs here.
+
+    `cache` is the dict written by scripts/6i_fig6_ood_extension.py.
+    """
+    scen = {t: d for t, d in cache["scenarios"].items() if d.get("harmonized")}
+    if not scen:
+        raise ValueError("no harmonized scenarios in this cache")
+    hist = cache["historical"]
+    agents = cache["agents"]
+    style = _ood_scenario_styles(cache["scenarios"])
+
+    n_hist = len(next(iter(hist.values())))
+    hist_years = np.arange(2024 - n_hist, 2024)
+
+    fig, axes = plt.subplots(2, 3, figsize=figsize, constrained_layout=True)
+    axes = axes.ravel()
+
+    units = dict(_OOD_PANEL_SPECS)
+    for ax, agent in zip(axes, agents):
+        ax.plot(hist_years, hist[agent], color="0.55", lw=1.2, zorder=2)
+        for tag, d in scen.items():
+            # Raw and harmonized share the scenario's linestyle and differ only in
+            # weight, so a pair reads as one scenario. Giving the raw line its own
+            # dash pattern instead makes it collide with whichever scenario is
+            # already dashed.
+            ax.plot(d["years"], d["emis_raw"][agent], lw=0.9, alpha=0.4, zorder=3,
+                    color=style[tag]["color"], ls=style[tag]["ls"])
+            ax.plot(d["years"], d["emis"][agent], lw=1.8, zorder=4,
+                    color=style[tag]["color"], ls=style[tag]["ls"])
+
+        for yr in (2023, 2080):
+            ax.axvline(yr, color="0.4", lw=0.8, ls=(0, (1, 3)), zorder=1)
+
+        ax.set_ylabel(units[agent])
+        ax.set_xlim(xlim)
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.set_axisbelow(True)
+
+    # -- summary: the handoff step, before and after
+    ax = axes[5]
+    tags = list(scen)
+    span = 0.72
+    for i, agent in enumerate(agents):
+        h = float(hist[agent][-1])
+        for j, tag in enumerate(tags):
+            d = scen[tag]
+            y = i + span * (j / max(len(tags) - 1, 1) - 0.5)
+            raw = 100.0 * (float(d["emis_raw"][agent][0]) - h) / abs(h)
+            new = 100.0 * (float(d["emis"][agent][0]) - h) / abs(h)
+            c = style[tag]["color"]
+            ax.plot([raw, new], [y, y], color=c, lw=1.2, alpha=0.6, zorder=2)
+            ax.plot(raw, y, "o", ms=6.5, mfc="white", mec=c, mew=1.6, zorder=3)
+            ax.plot(new, y, "o", ms=6.5, color=c, mec="white", mew=1.0, zorder=4)
+
+    ax.axvline(0.0, color="0.35", lw=1.0, zorder=1)
+    ax.set_yticks(range(len(agents)))
+    ax.set_yticklabels(agents)
+    ax.set_ylim(len(agents) - 0.5, -0.5)
+    ax.set_xlabel(r"Step at the 2023$\rightarrow$2024 handoff [\%]")
+    ax.grid(alpha=0.25, lw=0.6, axis="x")
+    ax.set_axisbelow(True)
+
+    for a in axes[3:5]:
+        a.set_xlabel("Year")
+
+    handles = []
+    for g, label in OOD_GROUP_LABELS.items():
+        members = [t for t in tags if scen[t]["group"] == g]
+        if not members:
+            continue
+        handles.append(Line2D([], [], color="none", label=r"\textbf{%s}" % label))
+        for t in members:
+            handles.append(Line2D([], [], color=style[t]["color"], ls=style[t]["ls"],
+                                  lw=1.8, label=t))
+    handles += [
+        Line2D([], [], color="none", label=r"\textbf{Harmonization}"),
+        Line2D([], [], color="0.35", ls="-", lw=0.9, alpha=0.4, label="Published (RCMIP)"),
+        Line2D([], [], color="0.35", ls="-", lw=1.8, label="Harmonized"),
+        Line2D([], [], color="0.55", ls="-", lw=1.2, label="CMIP7 historical"),
+    ]
+    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5),
+               frameon=False, fontsize=12, handlelength=2.4)
+
+    if save is not None:
+        fig.savefig(FIGURES_DIR / f"{save}.pdf", bbox_inches="tight", transparent=True)
+    return fig, axes
+
+
+def plot_ood_scenario_grid(cache, sweep, aggregation=AGGREGATION_DEFAULT,
+                           save=None, figsize=(18, 16)):
+    """Stage 6i Phase B: every OOD scenario's emulated trajectory against SCM truth.
+
+    A plain panel grid plus one pooled scatter, sized from the scenario list.
+    `plot_individual_effects_summary` is deliberately NOT reused or modified
+    here: its mosaic, shared `xlim=[1850,2150]`/`ylim=[-4.2,5.2]` and hardcoded
+    legend pixel offsets `shift=[65,2,26,0,3,6]` all break on a different panel
+    count, and the CO2-only scenarios span a different set of years anyway. The
+    survivors get folded into the real figure only after downselection.
+
+    `cache`  - the Phase A scenario cache (scripts/6i_fig6_ood_extension.py)
+    `sweep`  - {seed: {optimized: {tag: {...}}, baseline: {...}}} from
+               scripts/6j_fig6_ood_evaluate.py --mode collect
+
+    Colours follow the existing Figure 6 convention exactly: SCM truth black
+    dashed, baseline cm.lipariS(5), optimized cm.osloS(2). Median lines with IQR
+    bands across seeds, matching Figures 3/4/5/6.
+    """
+    scen = cache["scenarios"]
+    tags = list(scen)
+    seeds = sorted(sweep)
+
+    n = len(tags) + 1  # +1 for the pooled scatter
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    c_base, c_opt = cm.lipariS(5), cm.osloS(2)
+
+    def _band(tag, key):
+        stack = np.stack([np.asarray(sweep[s][key][tag]["yhat"]).reshape(-1) for s in seeds])
+        return _aggregate_seeds(stack, aggregation, mean_band="minmax")
+
+    def _r2_summary(tag, key):
+        vals = np.asarray([sweep[s][key][tag]["r2"] for s in seeds])
+        return np.median(vals), np.percentile(vals, 25), np.percentile(vals, 75)
+
+    for ax, tag in zip(axes, tags):
+        d = scen[tag]
+        x = np.asarray(d["years"])
+        ax.plot(x, d["y_scm"], c="black", ls="--", lw=2, alpha=0.8, zorder=10,
+                label="SCM-projected")
+
+        for key, colour, lbl in (("baseline", c_base, "Baseline Em."),
+                                 ("optimized", c_opt, "Opt. All")):
+            centre, lo, hi = _band(tag, key)
+            ax.fill_between(x, lo, hi, color=colour, alpha=0.18, lw=0, zorder=1)
+            ax.plot(x, centre, color=colour, lw=2, zorder=5, label=lbl)
+
+        r2_o = _r2_summary(tag, "optimized")
+        r2_b = _r2_summary(tag, "baseline")
+        ax.set_title(
+            f"{tag}\n"
+            rf"$R^2$ opt {r2_o[0]:.3f} [{r2_o[1]:.3f}, {r2_o[2]:.3f}]  |  "
+            rf"base {r2_b[0]:.3f}",
+            fontsize=11)
+        ax.set_xlim(x[0], x[-1])
+        ax.set_ylabel(r"$\Delta T$ [$^\circ$C]")
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.set_axisbelow(True)
+
+    # -- pooled scatter, at the seed whose pooled optimized R^2 is nearest median
+    ax = axes[len(tags)]
+    truth = np.concatenate([np.asarray(scen[t]["y_scm"]).reshape(-1) for t in tags])
+
+    def _pooled(seed, key):
+        return np.concatenate([np.asarray(sweep[seed][key][t]["yhat"]).reshape(-1)
+                               for t in tags])
+
+    def _pooled_r2(seed, key):
+        yh = _pooled(seed, key)
+        ss_res = float(np.sum((truth - yh) ** 2))
+        ss_tot = float(np.sum((truth - truth.mean()) ** 2))
+        return 1.0 - ss_res / ss_tot
+
+    pooled_o = np.array([_pooled_r2(s, "optimized") for s in seeds])
+    pooled_b = np.array([_pooled_r2(s, "baseline") for s in seeds])
+    med_seed = seeds[int(np.argmin(np.abs(pooled_o - np.median(pooled_o))))]
+
+    lims = [min(truth.min(), _pooled(med_seed, "baseline").min()),
+            max(truth.max(), _pooled(med_seed, "baseline").max())]
+    ax.plot(lims, lims, c="black", ls="--", lw=1.5, alpha=0.8, zorder=1)
+    ax.scatter(truth, _pooled(med_seed, "baseline"), s=6, color=c_base, alpha=0.35,
+               lw=0, zorder=2,
+               label=rf"Baseline, $R^2$={np.median(pooled_b):.3f} "
+                     rf"[{np.percentile(pooled_b, 25):.3f}, {np.percentile(pooled_b, 75):.3f}]")
+    ax.scatter(truth, _pooled(med_seed, "optimized"), s=6, color=c_opt, alpha=0.55,
+               lw=0, zorder=3,
+               label=rf"Opt. All, $R^2$={np.median(pooled_o):.3f} "
+                     rf"[{np.percentile(pooled_o, 25):.3f}, {np.percentile(pooled_o, 75):.3f}]")
+    ax.set_xlabel(r"SCM $\Delta T$ [$^\circ$C]")
+    ax.set_ylabel(r"Emulated $\Delta T$ [$^\circ$C]")
+    ax.set_title(f"All OOD scenarios pooled\n(scatter from seed {med_seed}, "
+                 f"nearest median of {len(seeds)})", fontsize=11)
+    ax.legend(frameon=False, fontsize=10, loc="upper left")
+    ax.grid(alpha=0.25, lw=0.6)
+    ax.set_axisbelow(True)
+
+    for extra in axes[n:]:
+        extra.axis("off")
+
+    handles, labels_ = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels_, loc="lower center", ncol=3, frameon=False,
+               fontsize=12, bbox_to_anchor=(0.5, -0.02))
+
+    if save is not None:
+        fig.savefig(FIGURES_DIR / f"{save}.pdf", bbox_inches="tight", transparent=True)
+    return fig, axes
+
+
+def plot_scm_mesm_fidelity_grid(panels, ncols=3, save=None, figsize=None):
+    """Additional Major Point 4 - one panel per scenario, recalibrated SCM
+    (mode='MESM') global-mean-temperature output against real MESM
+    ground truth (data/MESM/emis_driven/zonal_data_mean/, area-weighted to a
+    global mean). Companion figure to scripts/6d_scm_mesm_fidelity.py, which
+    computes the NRMSE/R^2 this function only visualizes - no metric here is
+    recomputed independently of that script's `nrmse_r2`; those numbers are
+    reported in the companion LaTeX table instead of in-panel.
+
+    `panels` - list of dicts, one per scenario, plotted in the given order:
+        {
+          "set_name": str,          # "Tier 1" / "Tier 2" / "DECK" / "CS3"
+          "scenario": str,
+          "x": array (T,),          # calendar year, or simulation year for
+                                     # idealized (DECK/CS3) experiments - see
+                                     # xlabel
+          "xlabel": str,
+          "scm": array (T,),
+          "mesm": array (T,),
+          "nrmse": float,
+          "r2": float,
+        }
+
+    Panels carry no title - each is labelled (a), (b), ... plus its scenario
+    name, matching Figure 3's boxed-annotation convention (`_add_textbox`).
+    All panels share one y-axis range, set from the min/max of every
+    SCM/MESM trajectory actually drawn, so warming magnitudes are directly
+    comparable across scenarios.
+    """
+    n = len(panels)
+    nrows = int(np.ceil(n / ncols))
+    if figsize is None:
+        figsize = (6.0 * ncols, 3.6 * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    c_mesm, c_scm = "black", cm.osloS(2)
+
+    y_min = min(min(np.nanmin(p["mesm"]), np.nanmin(p["scm"])) for p in panels)
+    y_max = max(max(np.nanmax(p["mesm"]), np.nanmax(p["scm"])) for p in panels)
+    data_range = y_max - y_min
+    # Extra headroom at the top for the (a)/(b)/... label box and (in the
+    # first panel only) the legend, both of which sit near the top of the
+    # panel (see the text()/legend() calls below).
+    shared_ylim = [y_min - 0.05 * data_range, y_max + 0.18 * data_range]
+
+    handles = [Line2D([0], [0], color=c_mesm, lw=2, label="MESM global average"),
+               Line2D([0], [0], color=c_scm, ls="--", lw=2, label="MESM-calibrated SCM")]
+
+    def _italic_scenario(name):
+        # Mathtext-italicize each hyphen-separated piece individually (same
+        # convention as panel_labels in plot_individual_effects_summary) so
+        # the hyphens in e.g. "H-ext-OS" stay literal hyphens instead of
+        # being absorbed into the math block and rendered as minus signs.
+        return "-".join(rf"$\it{{{part}}}$" for part in name.split("-"))
+
+    for i, (ax, p) in enumerate(zip(axes, panels)):
+        ax.plot(p["x"], p["mesm"], color=c_mesm, lw=2, alpha=0.85, zorder=5,
+                label="MESM global average")
+        ax.plot(p["x"], p["scm"], color=c_scm, ls="--", lw=2, alpha=0.9, zorder=6,
+                label="MESM-calibrated SCM")
+        # (x, y) below: axes-fraction position of the (a)/(b)/... label box -
+        # adjust these two numbers to nudge it (0,0)=bottom-left,
+        # (1,1)=top-right of the panel. y=0.995 currently sits flush
+        # against the panel's top edge, tracking constrained_layout
+        # regardless of panel size.
+        ax.text(0.03, 0.95, f"({chr(97 + i)}) {_italic_scenario(p['scenario'])}", transform=ax.transAxes,
+                ha="left", va="top", fontsize=18, fontweight="bold", zorder=20,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="gray", alpha=0.9))
+        ax.set_xlabel(p["xlabel"], fontsize=16)
+        if i % ncols == 0:
+            ax.set_ylabel(r"$\Delta T$ [$^\circ$C]", fontsize=20)
+        ax.tick_params(axis="both", labelsize=12)
+        ax.set_xlim(p["x"][0], p["x"][-1])
+        ax.set_ylim(shared_ylim)
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.set_axisbelow(True)
+
+        if i == 0:
+            # loc="upper right" (with no bbox_to_anchor) places the legend
+            # inside this panel's own top-right corner; swap loc or add
+            # bbox_to_anchor=(x, y) in axes-fraction coords to move it.
+            leg = ax.legend(handles=handles, loc="upper right", frameon=True, fancybox=True,
+                             facecolor="white", edgecolor="gray", framealpha=0.9,
+                             fontsize=17, handlelength=1.8)
+            leg.set_zorder(25)
+
+    for extra in axes[n:]:
+        extra.axis("off")
+
+    if save is not None:
+        fig.savefig(FIGURES_DIR / f"{save}.pdf", bbox_inches="tight", transparent=True)
+        fig.savefig(FIGURES_DIR / f"{save}.png", bbox_inches="tight", dpi=200, transparent=True)
+    return fig, axes
+
+
+# ==================================================================
+# SI: representative-seed emissions comparison (CO2-only + multi-forcing)
+# ==================================================================
+
+def plot_seed_emissions_comparison(
+    co2_emissions: dict,
+    multi_emissions: dict,
+    co2_seed_info: dict | None = None,
+    multi_seed_info: dict | None = None,
+    agent_units: dict | None = None,
+    agent_cmaps: dict | None = None,
+    shade_fracs: dict | None = None,
+    title_suffix: str = '',
+    panel_width: float = 14.0,
+    panel_height: float = 2.0,
+    figsize: tuple | None = None,
+    save: bool = False,
+    figname: str = 'SI_seed_emissions_comparison',
+) -> None:
+    """
+    6-panel figure, stacked vertically on a shared x-axis: converged
+    (final-iteration) emissions trajectories for the seed closest to the
+    25th percentile, the median, and the 75th percentile of skill (from
+    utils_inverse.load_SI_seed_emissions_comparison_data), one line each per
+    panel.
+
+    Panel (a) is the CO2-only single-forcing experiment (Figure 3); panels
+    (b)-(f) are the multi-forcing experiment's (Figure 5) 5 individual
+    forcing agents - CO2, CH4, N2O, Sulfur, BC, in the same order as Figure
+    3's own panels. Labels sit boxed in each panel's top-left corner,
+    matching this notebook's other multi-panel figures (e.g.
+    plot_comparison_results, plot_individual_effects_summary).
+
+    Each panel draws from its own fabiocrameri (cmcrameri) colormap
+    (`agent_cmaps`, default one distinct sequential map per agent), sampled
+    at 3 shades (`shade_fracs`, default q25=0.85/median=0.55/q75=0.25 of the
+    map) rather than one fixed 3-color scheme shared across panels.
+
+    `panel_width`/`panel_height` set the default figsize as
+    (panel_width, panel_height * 6) - i.e. one row's worth of width times 6
+    stacked rows. Pass `figsize` directly to override both.
+
+    `title_suffix` is appended to every panel's boxed title (e.g. ", Opt.
+    All") - the data alone doesn't say which training group produced it, so
+    the caller states it explicitly rather than the label silently going
+    stale.
+    """
+    if agent_units is None:
+        agent_units = {"CO2": "Gt/yr", "CH4": "Mt/yr", "N2O": "Mt/yr", "Sulfur": "Mt/yr", "BC": "Mt/yr"}
+    if agent_cmaps is None:
+        # One distinct sequential cmcrameri map per panel, so no two panels
+        # (including the two CO2 panels, single- vs multi-forcing) share a
+        # color family.
+        agent_cmaps = {
+            "CO2_single": cm.batlow, "CO2": cm.davos, "CH4": cm.lajolla,
+            "N2O": cm.acton, "Sulfur": cm.bamako, "BC": cm.oslo,
+        }
+    if shade_fracs is None:
+        shade_fracs = {"q25": 0.85, "median": 0.55, "q75": 0.25}
+
+    label_map = {"q25": "25th percentile seed", "median": "Median seed", "q75": "75th percentile seed"}
+
+    if figsize is None:
+        figsize = (panel_width, panel_height * 6)
+
+    multi_agents = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')
+    agent_math = {"CO2": "CO$_2$", "CH4": "CH$_4$", "N2O": "N$_2$O", "Sulfur": "Sulfur", "BC": "BC"}
+    panels = [(f"CO$_2$ (single-forcing{title_suffix})", "CO2", "CO2_single", co2_emissions, co2_seed_info)]
+    for a in multi_agents:
+        panels.append((f"{agent_math[a]} (multi-forcing{title_suffix})", a, a, multi_emissions[a], multi_seed_info))
+
+    fig, axes = plt.subplots(6, 1, figsize=figsize, sharex=True, constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    for i, (ax, (title, agent, cmap_key, emissions, seed_info)) in enumerate(zip(axes, panels)):
+        cmap = agent_cmaps[cmap_key]
+        for key in ("q25", "median", "q75"):  # legend/draw order: 25th, median, 75th
+            series = np.asarray(emissions[key])
+            label = label_map[key]
+            if seed_info is not None:
+                seed, nrmse = seed_info[key]
+                label = f"{label} ({seed}, NRMSE={nrmse:.3f})"
+            ax.plot(np.arange(series.shape[0]), series, lw=2, color=cmap(shade_fracs[key]), label=label)
+
+        ax.text(0.015, 0.92, f"({chr(97 + i)}) {title}", transform=ax.transAxes,
+                ha="left", va="top", fontsize=12, fontweight="bold", zorder=20,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9))
+
+        unit = agent_units.get(agent, "units/yr")
+        ax.set_ylabel(f"Emissions\n({unit})", fontsize=11)
+        ax.set_xlim(0, next(iter(emissions.values())).shape[0])
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9, loc="lower right", ncol=3)
+
+    axes[-1].set_xlabel("Year")
+
+    if save:
+        fig.savefig(FIGURES_DIR / f"{figname}.pdf", bbox_inches="tight")
+    return fig, axes

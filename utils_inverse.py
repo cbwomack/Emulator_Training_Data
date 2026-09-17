@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import pickle
 import xarray as xr
 import json
+import csv
 from pathlib import Path
 from paths import DATA_DIR
 
@@ -234,7 +235,9 @@ def simulate_targets_gmst(
     emis_hist_dict: dict | None = None,                # dict or None: {"CO2": (T_hist,), "CH4": (T_hist,), ...}
     agents: tuple = AGENTS_DEFAULT,              # tuple/list: which agents to include and their row order
     mode: str = 'FaIR',
-    dt: float = 0.1
+    dt: float = 0.1,
+    params: dict | None = None,
+    use_checkpoint: bool = False,
 ) -> jnp.ndarray:
     """
     Returns GMST over the current scenario's years using the new multi-agent simulator.
@@ -243,6 +246,16 @@ def simulate_targets_gmst(
       - emis_curr_dict values are in native units per agent:
           CO2: GtCO2/yr, CH4: MtCH4/yr (consistent with simulate_temp)
       - Missing agents in emis_*_dict are zero-filled (keeps column layout stable).
+      - params: optional explicit SCM parameter dict (e.g.
+        utils_FaIR_JAX.params_from_theta(theta, base_params)), forwarded to
+        simulate_temp in place of its own mode-based FAIR_PARAMS/MESM_PARAMS
+        lookup. Differentiable w.r.t. theta - this is what makes the function
+        usable as a calibration forward-model, not just an evaluation one (see
+        scripts/2d_calibrate_MESM_alt.py). None (default) preserves the
+        existing mode-based behaviour exactly.
+      - use_checkpoint: forwarded to simulate_temp's own gradient-checkpointing
+        option (see its docstring). False (default) preserves existing cost;
+        only used by a jax.grad caller over a long trajectory.
     """
 
     yrs_c = _as_jnp(years_curr).reshape(-1)
@@ -272,7 +285,9 @@ def simulate_targets_gmst(
             years=yrs_all,
             emissions_by_agent=emissions_by_agent_all,
             mode=mode,
-            dt=dt
+            params=params,
+            dt=dt,
+            use_checkpoint=use_checkpoint,
         )
         GMST_curr = out_all["GMST"][-Tcur:]
     else:
@@ -282,7 +297,9 @@ def simulate_targets_gmst(
             years=yrs_c,
             emissions_by_agent=emissions_by_agent_c,
             mode=mode,
-            dt=dt
+            params=params,
+            dt=dt,
+            use_checkpoint=use_checkpoint,
         )
         GMST_curr = out_c["GMST"]
 
@@ -969,6 +986,48 @@ def avg_nrmse_over_tests(params: list[dict], test_list: list, eps: float = 1e-8)
     return jnp.average(jnp.stack(vals), weights=weights).astype(jnp.float32)
 
 
+# ---------------------------------------------------------------------------
+# Smoothness penalty: reference-normalized form
+# ---------------------------------------------------------------------------
+# SD of each agent pooled over the real ScenarioMIP Tier-1 ensemble
+# (data/FaIR_IO/emissions/ScenarioMIP_tier1_CO2_CH4_N2O_Sulfur_BC.pkl).
+# Committed as a constant rather than recomputed per run so a checkpoint's
+# penalty is reproducible from the checkpoint alone; verified reproducible to
+# 4 s.f. by tests/test_pipeline_functions.py.
+SIGMA_REF_SCENARIOMIP = {
+    "CO2": 25.0477, "CH4": 185.0055, "N2O": 5.2361,
+    "Sulfur": 29.9742, "BC": 1.8038,
+}
+
+# "legacy"     : sum_a sum_t (dU_a)^2, unnormalized, in each agent's native
+#                units. The historical behaviour. Its magnitude varies ~5
+#                orders of magnitude between the single-forcing and
+#                multi-agent regimes, which is why one weight grid could not
+#                serve both and 0 was the only survivable value.
+# "normalized" : (1/|A|) sum_a mean_t[(dU_a)^2] / sigma_ref_a^2. Dimensionless,
+#                length-normalized and agent-count-normalized, so a single
+#                shared weight applies comparable pressure across regimes. The
+#                denominator is a CONSTANT, not a function of U, so the
+#                optimizer cannot inflate it instead of smoothing the numerator.
+PENALTY_FORMS = ("legacy", "normalized")
+
+
+def smoothness_penalty_terms(U_eff: dict, active_agents: tuple, penalty_form: str):
+    """The penalty as a JAX scalar, for the objective's use."""
+    if penalty_form == "legacy":
+        reg = 0.0
+        for a in active_agents:
+            reg = reg + jnp.sum(jnp.diff(U_eff[a]) ** 2)
+        return reg
+    if penalty_form == "normalized":
+        reg = 0.0
+        for a in active_agents:
+            sig = SIGMA_REF_SCENARIOMIP[a]
+            reg = reg + jnp.mean(jnp.diff(U_eff[a]) ** 2) / (sig ** 2)
+        return reg / max(len(active_agents), 1)
+    raise ValueError(f"penalty_form must be one of {PENALTY_FORMS}, got {penalty_form!r}")
+
+
 def make_inverse_objective_single_train(
     params0: list[dict],
     test_dataset_all: list,
@@ -983,6 +1042,7 @@ def make_inverse_objective_single_train(
     ema_windows_years: tuple = (5.0, 30.0, 100.0),
     batch_size: int | None = None,
     key: jax.random.PRNGKey = jax.random.PRNGKey(0),
+    penalty_form: str = "legacy",
 ) -> callable:
     """
     Build the bilevel objective `objective(U_pytree) -> (loss, aux)` at the heart of
@@ -1006,14 +1066,12 @@ def make_inverse_objective_single_train(
     def objective(U_pytree):
         U_eff = _apply_active_mask_to_emis(U_pytree, active_agents, inactive_mode)
 
+        # First-difference penalty on U, penalizing jaggedness directly.
+        # See PENALTY_FORMS for why the normalized variant exists; "legacy"
+        # is the default so every existing checkpoint stays reproducible.
         reg_loss = 0.0
         if smoothness_weight > 0.0:
-            for agent_name in active_agents:
-                arr = U_eff[agent_name]
-                # First-difference penalty: Sum of squared changes between years
-                # Penalizes "jaggedness" directly.
-                diffs = jnp.diff(arr)
-                reg_loss += jnp.sum(diffs**2)
+            reg_loss = smoothness_penalty_terms(U_eff, active_agents, penalty_form)
 
         train_updated = build_train(
             U_eff,
@@ -1127,7 +1185,26 @@ def load_inverse_ckpt_errors_only(path: str) -> dict:
 # loss(U_traj[0]) is computed separately before the loop. That makes errors[0]
 # and errors[1] duplicates and offsets errors from U_traj by one thereafter.
 
-def smoothness_penalty(U: dict) -> float:
+def smoothness_penalty(U: dict, penalty_form: str = "legacy",
+                      active_agents: tuple | None = None) -> float:
+    """Numpy twin of smoothness_penalty_terms, for post-hoc NRMSE recovery.
+
+    Must match the objective's penalty EXACTLY or recover_nrmse_trajectory
+    silently returns a wrong NRMSE. `penalty_form` defaults to "legacy" so
+    every checkpoint written before the normalized form existed - none of
+    which carry a penalty_form in `meta` - recovers correctly.
+    """
+    agents = active_agents if active_agents is not None else tuple(U)
+    if penalty_form == "normalized":
+        terms = [float(np.mean(np.diff(np.asarray(U[a], dtype=np.float64)) ** 2)
+                       / SIGMA_REF_SCENARIOMIP[a] ** 2) for a in agents]
+        return float(sum(terms) / max(len(terms), 1))
+    if penalty_form != "legacy":
+        raise ValueError(f"penalty_form must be one of {PENALTY_FORMS}, got {penalty_form!r}")
+    return _smoothness_penalty_legacy(U)
+
+
+def _smoothness_penalty_legacy(U: dict) -> float:
     """Sum of squared first differences over every agent in one emissions iterate.
 
     Matches make_inverse_objective_single_train's reg_loss exactly, including
@@ -1177,6 +1254,21 @@ def _infer_preds_every(raw: dict) -> int:
     return int(recorded) if recorded else 50
 
 
+def _penalty_form_of(raw: dict) -> str:
+    """The penalty form a checkpoint was written under.
+
+    Checkpoints predating the normalized form carry no `penalty_form` in meta
+    (many carry no meta at all), and were all produced with the legacy sum -
+    so absence must mean "legacy", never a guess.
+    """
+    return str((raw.get("meta") or {}).get("penalty_form") or "legacy")
+
+
+def _active_of(raw: dict) -> tuple | None:
+    aa = (raw.get("meta") or {}).get("active_agents")
+    return tuple(aa) if aa else None
+
+
 def recover_smoothness_weight(raw: dict, preds_every: int | None = None) -> tuple[float, float]:
     """Solve for the smoothness_weight a checkpoint was produced with.
 
@@ -1200,6 +1292,10 @@ def recover_smoothness_weight(raw: dict, preds_every: int | None = None) -> tupl
     """
     errors = np.asarray(raw["errors"], dtype=np.float64)
     U_traj, preds_traj = raw["U_traj"], raw["preds_traj"]
+    # The penalty must be reconstructed in the SAME form the run used, or the
+    # residual below is divided by the wrong quantity and the recovered weight
+    # is silently wrong. Absent meta means legacy - see _penalty_form_of.
+    form, active = _penalty_form_of(raw), _active_of(raw)
     if preds_every is None:
         preds_every = _infer_preds_every(raw)
 
@@ -1209,7 +1305,7 @@ def recover_smoothness_weight(raw: dict, preds_every: int | None = None) -> tupl
         if k >= len(errors) or k - 1 >= len(U_traj):
             break
         n_sampled += 1
-        penalty = smoothness_penalty(U_traj[k - 1])
+        penalty = smoothness_penalty(U_traj[k - 1], form, active)
         if penalty > 0.0:
             residuals.append(errors[k] - _nrmse_from_preds(preds_traj[j]))
             penalties.append(penalty)
@@ -1274,7 +1370,8 @@ def recover_nrmse_trajectory(raw: dict, smoothness_weight: float | None = None,
         return errors
 
     U_traj = raw["U_traj"]
-    penalties = np.array([smoothness_penalty(U_traj[max(k - 1, 0)])
+    penalties = np.array([smoothness_penalty(U_traj[max(k - 1, 0)],
+                                             _penalty_form_of(raw), _active_of(raw))
                           for k in range(len(errors))])
     nrmse = errors - smoothness_weight * penalties
     if np.any(nrmse <= 0.0):
@@ -1354,6 +1451,7 @@ def optimize_emissions_inverse(
     ema_windows_years: tuple = (5.0, 30.0, 100.0),
     batch_size: int | None = None,
     key: jax.random.PRNGKey = jax.random.PRNGKey(0),
+    penalty_form: str = "legacy",
 ) -> dict:
     """
     The core bilevel/outer-loop optimizer: finds an emissions trajectory U (one
@@ -1414,7 +1512,8 @@ def optimize_emissions_inverse(
         mode=mode,
         batch_size=batch_size,
         key=key,
-        ema_windows_years=ema_windows_years
+        ema_windows_years=ema_windows_years,
+        penalty_form=penalty_form,
     )
 
     # --- 1. Create a Pure Loss Function (No Strings) ---
@@ -1490,7 +1589,9 @@ def optimize_emissions_inverse(
         "num_updates": num_updates, "step_size": step_size, "momentum": momentum,
         "nesterov": nesterov, "K_inner": K_inner, "lr_inner": lr_inner,
         "wd_inner": wd_inner, "batch_size": batch_size,
-        "smoothness_weight": smoothness_weight, "init_cond": init_cond
+        "smoothness_weight": smoothness_weight, "penalty_form": penalty_form,
+        "sigma_ref": (SIGMA_REF_SCENARIOMIP if penalty_form == "normalized" else None),
+        "init_cond": init_cond
             if isinstance(init_cond, str) or init_cond is None else "array",
         "T": T, "filter_hist": filter_hist, "mode": mode,
         "ema_windows_years": ema_windows_years, "preds_every": preds_every,
@@ -1500,6 +1601,20 @@ def optimize_emissions_inverse(
     if resume_if_exists and checkpoint_path and os.path.isfile(checkpoint_path):
         print("Resuming from checkpoint...")
         ckpt = load_inverse_ckpt(checkpoint_path)
+        stored_meta = ckpt.get("meta") or {}
+        if stored_meta:
+            bad = _resume_config_mismatches(stored_meta, meta)
+            if bad:
+                raise ValueError(
+                    "refusing to resume: this run's configuration differs from the "
+                    f"checkpoint at {checkpoint_path}.\n  "
+                    + "\n  ".join(bad)
+                    + "\nResuming would apply the new settings to the restored "
+                      "optimizer state and splice two different objectives into one "
+                      "error curve. Write to a new checkpoint_path, or pass "
+                      "resume_if_exists=False to overwrite deliberately.")
+        else:
+            print("  (checkpoint predates meta; cannot verify config match)")
         U_traj = ckpt["U_traj"]
         errors = ckpt["errors"].tolist()
         U_pytree = U_traj[-1]
@@ -1950,8 +2065,21 @@ def evaluate_optimal_emulator(
         if ind_effects:
             y_hat_all[train_label] = {}
         for test_name, emis_dict_test in eval_sets.items():
+            # Bug fixed 2026-09-04: `mode` was not forwarded here, so the
+            # evaluation targets were always built from the FaIR SCM regardless
+            # of what this function was called with, while the baseline it gets
+            # compared against (generate_and_eval_baseline_emulator, which does
+            # forward mode) used the requested SCM. A no-op for every existing
+            # caller - all of them pass mode='FaIR' or leave the default, and
+            # 6a_seed_uncertainty_sweep.py's mode=mod.MODE has only ever been
+            # run against 3a_inverse_CO2_only.py (MODE='FaIR'), so no cached
+            # result changes. It is NOT a no-op for mode='MESM'/'MESM_tier1':
+            # without it, Stage 6o's optimized emulator would be scored against
+            # FaIR ground truth and its baseline against MESM's, which is not a
+            # comparison of anything.
             test_raw = build_dataset_from_runfair_dict(
-                emis_dict_test, historical_name=historical_name, ema_windows_years=ema_windows_years
+                emis_dict_test, historical_name=historical_name, mode=mode,
+                ema_windows_years=ema_windows_years
             )
             test_s_scaled = _apply_stats_to_test(test_raw, stats)
 
@@ -2210,6 +2338,47 @@ def build_group_emis_dicts(emis_dict_train_JAX: dict, eval_sets: dict) -> dict[s
             groups[group] = eval_sets[eval_key].copy()
     return groups
 
+# Hyperparameters that must not change across a resume. num_updates is
+# deliberately absent - extending it is the entire point of resuming - and so is
+# preds_every, which only sets how often predictions are sampled. Everything
+# here either defines the objective (so a change would blend two different
+# problems into one error curve) or is applied to the restored momentum trace
+# (so a change would corrupt the optimizer state silently).
+RESUME_INVARIANT_KEYS = (
+    "step_size", "momentum", "nesterov", "K_inner", "lr_inner", "wd_inner",
+    "batch_size", "smoothness_weight", "penalty_form", "init_cond", "T",
+    "filter_hist", "mode", "active_agents", "ema_windows_years",
+)
+
+
+def _resume_config_mismatches(stored: dict, incoming: dict) -> list[str]:
+    """Which invariant hyperparameters differ between a checkpoint and this call.
+
+    Compares only keys the stored meta actually carries, so checkpoints written
+    before a field existed do not fail on its absence. Values are normalized
+    through repr so dict-valued step_size and list/tuple active_agents compare
+    structurally rather than by identity.
+    """
+    out = []
+    for k in RESUME_INVARIANT_KEYS:
+        if k not in stored:
+            continue
+        a, b = stored[k], incoming.get(k)
+        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            same = list(a) == list(b)
+        elif isinstance(a, dict) and isinstance(b, dict):
+            same = (set(a) == set(b)
+                    and all(np.isclose(float(a[j]), float(b[j])) for j in a))
+        elif isinstance(a, (int, float)) and isinstance(b, (int, float)) \
+                and not isinstance(a, bool) and not isinstance(b, bool):
+            same = bool(np.isclose(float(a), float(b)))
+        else:
+            same = a == b
+        if not same:
+            out.append(f"{k}: checkpoint has {a!r}, this run passes {b!r}")
+    return out
+
+
 def run_inverse_experiment(
     setup: dict,
     group: str,
@@ -2229,9 +2398,11 @@ def run_inverse_experiment(
     resume_if_exists: bool,
     preds_every: int,
     smoothness_weight: float = 0.0,
+    penalty_form: str = "legacy",
     active_agents: tuple[str, ...] | None = None,
     mode: str | None = None,
     batch_size: int | None = None,
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
     key: jax.random.PRNGKey = jax.random.PRNGKey(0),
 ) -> dict:
     """
@@ -2248,9 +2419,24 @@ def run_inverse_experiment(
     checkpoint on disk have been normalized to the uniform template.
 
     No hyperparameter has a default here (aside from smoothness_weight/
-    active_agents/mode) - every 3x/4a notebook tunes these per group, so
+    penalty_form/active_agents/mode) - every 3x/4a notebook tunes these per group, so
     callers must pass them explicitly rather than rely on a value that might
     silently differ from what was tuned for a given experiment.
+
+    `ema_windows_years` is forwarded to optimize_emissions_inverse's own
+    build_valid/make_inverse_objective_single_train calls - this is the
+    actual per-iteration feature convention the bilevel optimizer trains
+    and evaluates against. Bug fixed 2026-09-01: this function previously
+    had no ema_windows_years parameter at all, so every caller silently got
+    optimize_emissions_inverse's own hardcoded default (5.0, 30.0, 100.0)
+    regardless of what run_inverse_experiment_setup's own ema_windows_years
+    was set to (that value only ever reached params0/the baseline emulator,
+    never the optimization objective itself). This made
+    scripts/SIf_sensitivity_seed_sweep.py's features sweep a no-op: all
+    three short/medium/long conditions silently trained identically and
+    produced byte-identical checkpoints - not a genuine null result. The
+    default here matches the prior implicit behavior exactly, so every other
+    existing caller is unaffected.
     """
     group_emis_dicts = build_group_emis_dicts(setup["emis_dict_train_JAX"], setup["eval_sets"])
     if group not in group_emis_dicts:
@@ -2278,12 +2464,14 @@ def run_inverse_experiment(
         T=T,
         filter_hist=filter_hist,
         smoothness_weight=smoothness_weight,
+        penalty_form=penalty_form,
         mode=mode,
         checkpoint_path=checkpoint_path,
         checkpoint_every=checkpoint_every,
         resume_if_exists=resume_if_exists,
         preds_every=preds_every,
         batch_size=batch_size,
+        ema_windows_years=ema_windows_years,
         key=key,
     )
 
@@ -2867,6 +3055,18 @@ def load_fig3_single_forcing_data(agents: list[str] = ['co2', 'ch4', 'n2o', 'Sul
 _FIG3_AGENT_TAGS = {'co2': 'co2_only', 'ch4': 'ch4_only', 'n2o': 'n2o_only',
                     'Sulfur': 'Sulfur_only', 'BC': 'BC_only'}
 
+# Checkpoint family per agent. Everything defaults to {agent}_retuned; Sulfur is
+# the one single-forcing agent with a deployed normalized-penalty arm (w=0.02),
+# so its production family is Sulfur_smooth and Sulfur_retuned (w=0) is the
+# control. Before 2026-08-27 this loader read the control for every agent, which
+# meant Figure 3's Sulfur panel plotted an arm the paper does not deploy.
+#
+# The switch is free on skill and decisive on smoothness (tier1, 50 seeds):
+#   Sulfur_retuned  NRMSE 0.0129 [0.0113, 0.0145]   R 0.937 [0.810, 1.073]
+#   Sulfur_smooth   NRMSE 0.0131 [0.0117, 0.0142]   R 0.132 [0.096, 0.173]
+# R=1.414 is white noise; the roughest real ScenarioMIP profile is R=0.0959.
+_FIG3_AGENT_DIRS = {'Sulfur': 'checkpoints/Sulfur_smooth/seed_sweep'}
+
 
 def load_fig3_single_forcing_data_seed_sweep(
     agents: list[str] = ['co2', 'ch4', 'n2o', 'Sulfur', 'BC'],
@@ -2888,13 +3088,15 @@ def load_fig3_single_forcing_data_seed_sweep(
 
     Each 'errors' trajectory is the penalty-corrected NRMSE
     (recover_nrmse_trajectory), not the recorded objective. The correction is
-    exact and per-checkpoint; it is a no-op for CH4 and Sulfur, whose tuned
-    smoothness_weight is 0, and shifts N2O/BC by ~11% and CO2 by ~1.4%.
+    exact and per-checkpoint; it is a no-op only for CH4 (w=0), and shifts
+    N2O/BC by ~11% and CO2 by ~1.4%. It is NOT a no-op for Sulfur any more:
+    the panel now reads the deployed Sulfur_smooth arm at w=0.02 (see
+    _FIG3_AGENT_DIRS).
     """
     seed_errors_list, seed_baseline_error_list = [], []
     for a in agents:
         tag = _FIG3_AGENT_TAGS[a]
-        checkpoint_dir = f'checkpoints/{a}_retuned/seed_sweep'
+        checkpoint_dir = _FIG3_AGENT_DIRS.get(a, f'checkpoints/{a}_retuned/seed_sweep')
         errs, bases = [], []
         for seed in seeds:
             ckpt_path = f'{checkpoint_dir}/inverse_constant_tier1_{tag}_seed{seed}.pkl'
@@ -3249,6 +3451,20 @@ def regenerate_SI_extended_results_cache_seed_sweep(
     (tier1/tier2/DECK/CS3/all) - H-ext is excluded here too, matching Fig 4's
     convention (H-ext is Figure 2's single-scenario example, not part of the
     grouped-bar figures).
+
+    Bug fixed 2026-08-31: this function's evaluate_optimal_emulator call did
+    not forward batch_size=unified_cfg["batch_size"], unlike
+    regenerate_fig4_all_agents_cache_seed_sweep's otherwise-identical call
+    (which does). This is exactly the train/eval hyperparameter mismatch
+    evaluate_optimal_emulator's own docstring warns about ("look[s] 7-27x
+    WORSE than baseline - not a real finding, just a train/eval
+    inconsistency"): N2O (batch_size=16), Sulfur (64), and BC (32) were all
+    silently re-evaluated full-batch instead of at their actual trained
+    minibatch size, which inverted the reported conclusion for N2O/BC (a
+    majority-of-seeds improvement over baseline was reported as a
+    majority-of-seeds regression). CH4 (batch_size=None) was unaffected by
+    construction. Every SI_extended_seed_spread_{agent}.pkl cache built
+    before this fix is stale for N2O/Sulfur/BC and must be rebuilt.
     """
     if baseline_config_path is None:
         raise ValueError(
@@ -3304,6 +3520,7 @@ def regenerate_SI_extended_results_cache_seed_sweep(
             weight_decay=unified_cfg["wd_inner"],
             mode='FaIR',
             ema_windows_years=ema_windows_years,
+            batch_size=unified_cfg["batch_size"],
         )
 
         all_results[seed] = {"baseline": setup["baseline_results"], "optimal": optimal_results}
@@ -3337,12 +3554,12 @@ def load_fig4_data(
         "x_labels": ['Opt. Priority 1', 'Opt. Priority 2', 'Opt. DECK', 'Opt. CS3', 'Opt. All'],
         "leg_labels": ['Priority 1', 'Priority 2', 'DECK', 'CS3'],
         "weights": [7, 5, 2, 2],
-        "figname": 'performance_summary',
+        "figname": 'fig04_scm_summary',
     }
 
 def load_fig5_multi_forcing_data(
-    path_inverse: str = 'checkpoints/multi_fig4/seed_sweep/inverse_constant_tier1_multi_fig4_seed0.pkl',
-    path_baseline: str = 'checkpoints/multi_fig4/seed_sweep/baseline_multi_fig4_seed0.pkl',
+    path_inverse: str = 'checkpoints/multi_fig4_smooth/seed_sweep/inverse_constant_tier1_multi_fig4_seed0.pkl',
+    path_baseline: str = 'checkpoints/multi_fig4_smooth/seed_sweep/baseline_multi_fig4_seed0.pkl',
 ) -> dict:
     """
     Multi-agent inverse vs. baseline NRMSE (Figure 5) for
@@ -3366,7 +3583,7 @@ def load_fig5_multi_forcing_data(
 
 def load_fig5_multi_forcing_data_seed_sweep(
     seeds: list[int] = tuple(range(50)),
-    checkpoint_dir: str = 'checkpoints/multi_fig4/seed_sweep',
+    checkpoint_dir: str = 'checkpoints/multi_fig4_smooth/seed_sweep',
     tag: str = 'multi_fig4',
 ) -> dict:
     """Multi-seed companion to load_fig5_multi_forcing_data.
@@ -3377,9 +3594,22 @@ def load_fig5_multi_forcing_data_seed_sweep(
     gap: same `checkpoints/multi_fig4/seed_sweep/` family the single-seed loader
     already points at, just every seed rather than only seed 0.
 
+    2026-08-27: default moved from multi_fig4 to multi_fig4_smooth (the w=0.1
+    normalized-penalty arm at 2000 iterations), making the smoothed arm
+    canonical for Figures 4/5/6 alike. Pass checkpoint_dir=
+    'checkpoints/multi_fig4/seed_sweep' for the unsmoothed arm, which the SI
+    keeps for the "pure noise as forcing" argument.
+
     Returns kwargs for utils_plotting.plot_rmse_comparison_multi's `seed_errors`/
-    `seed_baseline_errors`. Trajectories are penalty-corrected NRMSE (a no-op
-    for this family, whose smoothness_weight is 0 - but applied, not assumed).
+    `seed_baseline_errors`. Trajectories are penalty-corrected NRMSE via
+    load_inverse_ckpt_nrmse_only.
+
+    The correction was a no-op when this docstring was written (the default
+    multi_fig4 family has smoothness_weight 0) but is NOT one for the smoothed
+    families: pass checkpoint_dir='checkpoints/multi_fig4_smooth/seed_sweep'
+    and w=0.1, so `errors` runs ~0.023 above the true NRMSE. Applied, never
+    assumed - which is why the smoothed arm plots correctly here while
+    6c_ood_scenario's hardcoded errors[-1] had to be fixed separately.
 
     Raises FileNotFoundError listing what is missing rather than silently
     plotting a partial sweep, matching the Figure-3 loader's rationale: a
@@ -3410,6 +3640,12 @@ def regenerate_fig6_individual_effects_cache(
     save_dir: str = 'data/plotting',
     unified_config_path: str = 'data/SI_results/hp_retune/multi/best_config_unified.json',
     baseline_config_path: str = 'data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json',
+    tier1_checkpoint_dir: str = 'checkpoints/multi_fig4_smooth/seed_sweep',
+    tier1_tag: str = 'multi_fig4',
+    multi_checkpoint_dir: str = 'checkpoints/multi_retuned_smooth/seed_sweep',
+    multi_tag: str = 'all_agents',
+    init_cond: str = 'constant',
+    seed: int = 0,
 ) -> dict:
     """
     Recompute the per-agent baseline/optimal-emulator predictions used by the
@@ -3448,23 +3684,39 @@ def regenerate_fig6_individual_effects_cache(
     unified_cfg = json.load(open(unified_config_path))["config"]
     baseline_cfg = json.load(open(baseline_config_path))["config"]
 
+    # `seed` reaches params0, the baseline emulator and the inner-retrain key
+    # together - the same fairness property run_inverse_experiment_setup enforces
+    # for every other seed sweep here. seed=0 reproduces the prior behaviour
+    # exactly, since 0 was the hardcoded value in all three places.
     params0, _ = generate_init_params_and_train_data(
-        agents, active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=None, verbose=False
+        agents, active_agents, test_scen='historical', hidden_sizes=[16], idx_demo=None,
+        verbose=False, seed=seed,
     )
     eval_sets_ind_effects, *_ = generate_eval_data(agents, CS3=True, DAMIP=True, GeoMIP=True)
 
     _, y_hat_baseline, y_true_ind_effects = generate_and_eval_baseline_emulator(
         eval_sets_ind_effects["Tier 1"], eval_sets_ind_effects, save_path=None,
-        verbose=False, hidden_sizes=[16],
+        verbose=False, hidden_sizes=[16], seed=seed,
         K=baseline_cfg["K"], lr=baseline_cfg["lr"], weight_decay=baseline_cfg["weight_decay"],
     )
 
+    # Defaults now read the SMOOTHED families and the CONSTANT-initial-condition
+    # DAMIP/GeoMIP/all checkpoints. Previously these were hardcoded to the
+    # unsmoothed families with init_cond='sine' - a sinusoid centred on zero,
+    # i.e. 250-375 years of negative emissions, undefined for Sulfur and BC.
+    # That belongs to the SI initial-condition sensitivity sweep, never to a
+    # main-paper figure (REVISIONS.md, 2026-08-27). Tier 1 is always 'constant'.
     training_paths_ind_effects = [
-        'checkpoints/multi_fig4/seed_sweep/inverse_constant_tier1_multi_fig4_seed0.pkl',
-        'checkpoints/multi_retuned/seed_sweep/inverse_sine_DAMIP_all_agents_seed0.pkl',
-        'checkpoints/multi_retuned/seed_sweep/inverse_sine_GeoMIP_all_agents_seed0.pkl',
-        'checkpoints/multi_retuned/seed_sweep/inverse_sine_all_all_agents_seed0.pkl',
+        f'{tier1_checkpoint_dir}/inverse_constant_tier1_{tier1_tag}_seed{seed}.pkl',
+        f'{multi_checkpoint_dir}/inverse_{init_cond}_DAMIP_{multi_tag}_seed{seed}.pkl',
+        f'{multi_checkpoint_dir}/inverse_{init_cond}_GeoMIP_{multi_tag}_seed{seed}.pkl',
+        f'{multi_checkpoint_dir}/inverse_{init_cond}_all_{multi_tag}_seed{seed}.pkl',
     ]
+    for _p in training_paths_ind_effects:
+        if not Path(_p).exists():
+            raise FileNotFoundError(
+                f"{_p} missing - run scripts/0c_regenerate_checkpoints_multi.py "
+                f"--seed {seed} --init-cond {init_cond} first")
     train_scenarios_ind_effects = ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All']
     _, y_hat_ind_effects = evaluate_optimal_emulator(
         training_paths=training_paths_ind_effects,
@@ -3474,7 +3726,7 @@ def regenerate_fig6_individual_effects_cache(
         active_agents=active_agents,
         inactive_mode="zeros",
         historical_name="historical",
-        key=jax.random.PRNGKey(0),
+        key=jax.random.PRNGKey(seed),
         K=unified_cfg["K_inner"],
         lr=unified_cfg["lr_inner"],
         weight_decay=unified_cfg["wd_inner"],
@@ -3498,21 +3750,237 @@ def regenerate_fig6_individual_effects_cache(
     }
 
 
-def load_fig6_data(save_dir: str = 'data/plotting') -> dict:
+def regenerate_fig6_individual_effects_cache_seed_sweep(
+    seeds: list[int] = tuple(range(50)),
+    tier1_checkpoint_dir: str = 'checkpoints/multi_fig4_smooth/seed_sweep',
+    tier1_tag: str = 'multi_fig4',
+    multi_checkpoint_dir: str = 'checkpoints/multi_retuned_smooth/seed_sweep',
+    multi_tag: str = 'all_agents',
+    init_cond: str = 'constant',
+    unified_config_path: str = 'data/SI_results/hp_retune/multi/best_config_unified.json',
+    baseline_config_path: str = 'data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json',
+    out_path: str = 'data/SI_results/seed_uncertainty/fig6_seed_spread_ind_effects.pkl',
+    ema_windows_years: tuple = (5.0, 30.0, 100.0),
+) -> dict[int, dict]:
+    """
+    Multi-seed companion to regenerate_fig6_individual_effects_cache, giving
+    Figure 6 the same median+IQR treatment Figures 3/4/5 already have.
+
+    The single-seed version hardcodes `_seed0.pkl` for all four training paths,
+    so Figure 6 has only ever shown one seed. That is the same hazard found for
+    Figure 5, where seed 0 turned out to be the best of 50 (REVISIONS.md,
+    2026-08-13) - one draw presented as the result.
+
+    Per seed this returns the three objects the figure plots, so the caller can
+    aggregate across seeds however it likes:
+      - `y_true`      ground-truth SCM temperatures (identical across seeds;
+                      stored per seed anyway so each record is self-contained)
+      - `y_hat_baseline`  baseline emulator predictions
+      - `y_hat`       optimal-emulator predictions, keyed by train scenario
+
+    Seeding follows the same fairness property as every other seed sweep here:
+    run_inverse_experiment_setup(seed=seed) seeds params0 and the baseline
+    emulator together, and the inner-retrain key is PRNGKey(seed), so baseline
+    and optimized emulators vary together within a seed.
+
+    `init_cond` selects which DAMIP/GeoMIP/all checkpoints to read. It defaults
+    to 'constant'. The 'sine' variants that 3b_inverse_all_agents.py's
+    EXPERIMENTS dict specifies for those three groups start from a sinusoid
+    centred on zero - 250-375 years of negative emissions, undefined for Sulfur
+    and BC - and belong to the SI initial-condition sensitivity sweep, not to a
+    main-paper figure (REVISIONS.md, 2026-08-27). Tier 1 is always 'constant'.
+    """
+    unified_cfg = json.load(open(unified_config_path))["config"]
+    baseline_cfg = json.load(open(baseline_config_path))["config"]
+
+    agents = ['CO2', 'CH4', 'N2O', 'Sulfur', 'BC']
+    active_agents = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC')
+    train_scenarios = ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All']
+
+    all_results = {}
+    for seed in seeds:
+        # DAMIP/GeoMIP must be True here - Figure 6's whole subject is the
+        # M-GHG / M-aer / G6sulfur single-driver scenarios, which live in those
+        # eval sets and are absent from Figure 4's own setup call.
+        setup = run_inverse_experiment_setup(
+            agents, active_agents, mode='FaIR', CS3=True, DAMIP=True, GeoMIP=True,
+            idx_demo=None, seed=seed,
+            baseline_K=baseline_cfg["K"], baseline_lr=baseline_cfg["lr"],
+            baseline_weight_decay=baseline_cfg["weight_decay"],
+            ema_windows_years=ema_windows_years,
+        )
+
+        training_paths = [
+            f'{tier1_checkpoint_dir}/inverse_constant_tier1_{tier1_tag}_seed{seed}.pkl',
+            f'{multi_checkpoint_dir}/inverse_{init_cond}_DAMIP_{multi_tag}_seed{seed}.pkl',
+            f'{multi_checkpoint_dir}/inverse_{init_cond}_GeoMIP_{multi_tag}_seed{seed}.pkl',
+            f'{multi_checkpoint_dir}/inverse_{init_cond}_all_{multi_tag}_seed{seed}.pkl',
+        ]
+        for p in training_paths:
+            if not Path(p).exists():
+                raise FileNotFoundError(
+                    f"{p} missing - run scripts/0c_regenerate_checkpoints_multi.py "
+                    f"--seed {seed} --init-cond {init_cond} first"
+                )
+
+        _, y_hat_ind_effects = evaluate_optimal_emulator(
+            training_paths=training_paths,
+            train_scenarios=train_scenarios,
+            eval_sets=setup["eval_sets"],
+            params0=setup["params0"],
+            active_agents=active_agents,
+            inactive_mode="zeros",
+            historical_name="historical",
+            key=jax.random.PRNGKey(seed),
+            K=unified_cfg["K_inner"],
+            lr=unified_cfg["lr_inner"],
+            weight_decay=unified_cfg["wd_inner"],
+            batch_size=unified_cfg["batch_size"],
+            ind_effects=True,
+        )
+
+        all_results[seed] = {
+            "y_true": setup["ground_truth_delT"],
+            "y_hat_baseline": setup["baseline_pred_delT"],
+            "y_hat": y_hat_ind_effects,
+        }
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(all_results, f)
+
+    return all_results
+
+
+def load_fig6_data(
+    save_dir: str = 'data/plotting',
+    seed_cache_path: str | None = 'data/SI_results/seed_uncertainty/fig6_seed_spread_ind_effects.pkl',
+) -> dict:
     """
     Load the cached per-agent baseline/optimal-emulator predictions for the
     individual-effects figure (utils_plotting.plot_individual_effects_summary).
+
+    Also returns `seed_cache` when the 50-seed spread cache exists, so the
+    notebook's `plot_individual_effects_summary(**fig6_data, ...)` call picks up
+    the median+IQR treatment with no change at the call site. Pass
+    `seed_cache_path=None` to force the old single-seed figure.
+
+    A missing seed cache is not an error - it degrades to the single-seed
+    figure - but it IS reported, because silently plotting one seed is exactly
+    the failure this cache exists to remove (Figure 5's published panel plotted
+    seed 0, which turned out to be the best of 50).
     """
     def _load(name):
         with open(f'{save_dir}/{name}.pkl', 'rb') as f:
             return pickle.load(f)
 
-    return {
+    out = {
         "y_true_ind_effects": _load('y_true_ind_effects'),
         "y_hat_baseline": _load('y_hat_baseline_ind_effects'),
         "y_hat_ind_effects": _load('y_hat_ind_effects'),
         "train_scenarios_ind_effects": ['Opt. Tier 1', 'Opt. DAMIP', 'Opt. GeoMIP', 'Opt. All'],
     }
+    if seed_cache_path is not None:
+        if Path(seed_cache_path).is_file():
+            with open(seed_cache_path, 'rb') as f:
+                out["seed_cache"] = pickle.load(f)
+            print(f"load_fig6_data: seed spread loaded ({len(out['seed_cache'])} seeds) "
+                  f"-> median + IQR")
+        else:
+            print(f"load_fig6_data: WARNING - {seed_cache_path} not found; falling back to the "
+                  f"SINGLE-SEED figure. Build it with "
+                  f"scripts/build_fig6_ind_effects_cache.py before reporting this panel.")
+    return out
+
+
+# Figure 6's downselected out-of-objective panel (Stage 6i/6j): the eleven-
+# scenario roster minus esm-pi-CO2pulse (dropped - 0.21 K of total signal, R^2
+# dominated by a single-year spike) and the eight scenarios whose skill was
+# indistinguishable from the in-objective references, keeping one
+# representative failure (esm-bell-2000PgC) alongside the two clean wins.
+FIG6_OOD_SCENARIOS = ["H-ext-VLaer", "ssp534-over", "esm-bell-2000PgC"]
+
+# scripts/6j_fig6_ood_evaluate.py's CONFIGS registry, display-label only (the
+# checkpoint paths belong to that script, not this module).
+FIG6_OOD_CONFIG_LABELS = {
+    "all": "Opt. All",
+    "damip": "Opt. DAMIP",
+    "geomip": "Opt. GeoMIP",
+    "tier1": "Opt. Tier 1",
+}
+
+
+def load_fig6_ood_data(
+    ood_dir: str = "data/SI_results/fig6_ood",
+    scenarios: list[str] = FIG6_OOD_SCENARIOS,
+) -> dict:
+    """
+    Load Figure 6's out-of-objective evaluation data (Stage 6i/6j):
+
+    - `ood_scenarios`: {tag: {years, y_scm}} SCM truth for the downselected
+      scenarios, from fig6_ood_scenarios.pkl.
+    - `ood_seed_traj`: {tag: {emulator_label: (n_seeds, n_times) array}} of
+      per-seed predicted trajectories on those scenarios, for baseline and
+      every optimized config found - built from each config's collected sweep
+      (scripts/6j_fig6_ood_evaluate.py --mode collect). Baseline is retrained
+      independently within each config's run but is config-invariant by
+      construction (same seed, same procedure), so whichever config's sweep is
+      read first supplies it.
+    - `r2_table`: the merged long-format table (--mode merge) feeding the
+      column-3 forest plot.
+
+    Each piece degrades independently (printed warning, key omitted) when its
+    upstream file isn't built yet, matching load_fig6_data's fallback style -
+    callers should check for the expected keys before plotting.
+    """
+    ood_dir = Path(ood_dir)
+    out: dict = {}
+
+    scenario_cache_path = ood_dir / "fig6_ood_scenarios.pkl"
+    if scenario_cache_path.is_file():
+        with open(scenario_cache_path, "rb") as f:
+            cache = pickle.load(f)
+        out["ood_scenarios"] = {
+            tag: {"years": np.asarray(cache["scenarios"][tag]["years"]),
+                  "y_scm": np.asarray(cache["scenarios"][tag]["y_scm"])}
+            for tag in scenarios
+        }
+    else:
+        print(f"load_fig6_ood_data: WARNING - {scenario_cache_path} not found; "
+              f"column 2 (OOD trajectories) cannot be built.")
+
+    ood_seed_traj: dict[str, dict[str, np.ndarray]] = {tag: {} for tag in scenarios}
+    for config, label in FIG6_OOD_CONFIG_LABELS.items():
+        suffix = "" if config == "all" else f"_{config}"
+        sweep_path = ood_dir / f"fig6_ood_seed_sweep{suffix}.pkl"
+        if not sweep_path.is_file():
+            print(f"load_fig6_ood_data: WARNING - {sweep_path} not found; "
+                  f"'{label}' will be missing from column 2. Run "
+                  f"scripts/6j_fig6_ood_evaluate.py --mode collect --config {config}.")
+            continue
+        with open(sweep_path, "rb") as f:
+            sweep = pickle.load(f)
+        seeds = sorted(sweep)
+        for tag in scenarios:
+            ood_seed_traj[tag][label] = np.stack(
+                [np.asarray(sweep[s]["optimized"][tag]["yhat"]) for s in seeds])
+            ood_seed_traj[tag].setdefault(
+                "Baseline Em.",
+                np.stack([np.asarray(sweep[s]["baseline"][tag]["yhat"]) for s in seeds]),
+            )
+    if any(ood_seed_traj[tag] for tag in scenarios):
+        out["ood_seed_traj"] = ood_seed_traj
+
+    r2_table_path = ood_dir / "fig6_ood_r2_table_fig6.csv"
+    if r2_table_path.is_file():
+        with open(r2_table_path, newline="") as f:
+            out["r2_table"] = list(csv.DictReader(f))
+    else:
+        print(f"load_fig6_ood_data: WARNING - {r2_table_path} not found; "
+              f"column 3 (R^2 forest plot) cannot be built. Run "
+              f"scripts/6j_fig6_ood_evaluate.py --mode merge.")
+
+    return out
 
 
 def build_MESM_baseline_eval_sets(eval_dir: str = "data/MESM/emis_driven/zonal_data_mean/") -> dict:
@@ -3707,7 +4175,7 @@ def load_fig7_emic_data() -> dict:
                  r'$\it{AA}$', r'$\it{CT}$']
     legend_labels = ['Const.', 'Sine', 'Both']
     separator_indices = [6, 11, 13]
-    group_labels = ['Priority 1', 'Prioriity 2', 'DECK', 'CS3']
+    group_labels = ['Priority 1', 'Priority 2', 'DECK', 'CS3']
 
     return {
         "baseline_results": baseline_MESM,
@@ -3720,6 +4188,131 @@ def load_fig7_emic_data() -> dict:
         "separator_indices": separator_indices,
         "group_labels": group_labels,
     }
+
+
+# Figure 7 v2 (Stage 6o) loaders. The cache these read is written by
+# scripts/6o_fig7_MESM_opt_evaluate.py --mode collect.
+FIG7V2_CACHE_PATH = 'data/SI_results/seed_uncertainty/fig7v2_seed_spread_MESM_tier1.pkl'
+FIG7V2_INIT_CONDS = ['constant', 'sine', 'gaussian']
+FIG7V2_IC_TITLES = {
+    'constant': r'Constant IC',
+    'sine': r'Sinusoidal IC',
+    'gaussian': r'Gaussian IC',
+}
+FIG7V2_QUANTILES = (25, 50, 75)
+
+
+def pick_percentile_seeds(scores: dict[int, float],
+                          quantiles: tuple = FIG7V2_QUANTILES) -> dict[int, int]:
+    """
+    Which seed sits at each requested percentile of `scores` ({seed: skill}).
+
+    Returns {quantile: seed}. Selection is nearest-value, not interpolated: the
+    seed whose own score is closest to the percentile of the score
+    distribution. This deliberately returns a real run's trajectory - a
+    pointwise 25th/50th/75th percentile across trajectories would be a curve no
+    optimization ever produced, and (being a per-timestep mixture of different
+    seeds) would not even be a valid emissions pathway.
+
+    `scores` is an error metric, so lower is better and the 25th percentile is
+    a good-performing seed, the 75th a poor one. Ties break toward the lower
+    seed index via argmin's own convention, which keeps the pick reproducible.
+    """
+    seeds = np.array(sorted(scores))
+    vals = np.array([scores[s] for s in seeds], dtype=float)
+    out = {}
+    for q in quantiles:
+        target = np.percentile(vals, q)
+        out[int(q)] = int(seeds[np.argmin(np.abs(vals - target))])
+    return out
+
+
+def load_fig7_v2_data(cache_path: str = FIG7V2_CACHE_PATH,
+                      init_conds: list[str] = None,
+                      quantiles: tuple = FIG7V2_QUANTILES) -> dict:
+    """
+    kwargs for utils_plotting.plot_fig7_v2_ic_panels and
+    plot_ic_convergence_seed_spread, plus the seed selection behind them.
+
+    Reads Stage 6o's collected cache and, for each initial condition,
+    identifies the seeds at `quantiles` of that IC's weighted-NRMSE
+    distribution (Tier 1:7 / Tier 2:5 / DECK:2 / CS3:2 - see
+    6o_fig7_MESM_opt_evaluate.weighted_score) and pulls their trajectories.
+
+    Returns {'panels_kwargs', 'convergence_kwargs', 'selection', 'scores'}.
+    'selection'/'scores' are returned alongside the plot kwargs so the notebook
+    can report which seeds were picked and how they scored - the figure itself
+    only shows the curves.
+    """
+    init_conds = list(init_conds or FIG7V2_INIT_CONDS)
+
+    with open(cache_path, 'rb') as f:
+        cache = pickle.load(f)
+
+    missing = [ic for ic in init_conds if ic not in cache or not cache[ic]]
+    if missing:
+        raise KeyError(
+            f"{cache_path} has no entries for {missing} - run "
+            f"scripts/6o_fig7_MESM_opt_evaluate.py --mode collect after Stage 6o's "
+            f"eval array finishes")
+
+    panels, selection, scores = [], {}, {}
+    seed_errors_list, seed_baseline_error_list, labels = [], [], []
+
+    for i, ic in enumerate(init_conds):
+        entries = cache[ic]
+        ic_scores = {s: float(entries[s]['weighted_optimal']) for s in entries}
+        picked = pick_percentile_seeds(ic_scores, quantiles)
+
+        scores[ic] = ic_scores
+        selection[ic] = picked
+
+        panels.append({
+            'title': FIG7V2_IC_TITLES.get(ic, ic),
+            'emissions': {q: entries[picked[q]]['emissions'] for q in quantiles},
+            'delT': {q: entries[picked[q]]['delT'] for q in quantiles},
+            'seeds': dict(picked),
+            'scores': {q: ic_scores[picked[q]] for q in quantiles},
+        })
+
+        seeds_sorted = sorted(entries)
+        seed_errors_list.append([entries[s]['nrmse_traj'] for s in seeds_sorted])
+        # The convergence curve is the bilevel objective's own NRMSE over the
+        # group being optimized ('all' -> the 'All' eval set), so its baseline
+        # reference has to be that same quantity - NOT 'weighted_baseline',
+        # which is the Tier1:7/Tier2:5/DECK:2/CS3:2 aggregate used only to rank
+        # seeds for the percentile pick. Plotting the weighted score against
+        # this curve would put two different metrics on one axis.
+        seed_baseline_error_list.append([float(entries[s]['baseline_results']['All']['mean'])
+                                         for s in seeds_sorted])
+        labels.append(f"({'abcdefgh'[i]}) {FIG7V2_IC_TITLES.get(ic, ic)}")
+
+    # Both series are anchored to end at 2500 and their length is read off the
+    # data rather than assumed. They are the same length here (T=751, 1750-2500):
+    # the SCM temperature response is defined on every emissions year. Note this
+    # differs from load_fig7_emic_data, whose `global_mean_temp` is 750 long
+    # (1751-2500) - that is a property of the real MESM ensemble output, not of
+    # the SCM, so the two must not be assumed to share a time axis.
+    n_emis = np.asarray(panels[0]['emissions'][quantiles[0]]).reshape(-1).shape[0]
+    n_temp = np.asarray(panels[0]['delT'][quantiles[0]]).reshape(-1).shape[0]
+    years_emis = np.arange(2501 - n_emis, 2501)
+    years_temp = np.arange(2501 - n_temp, 2501)
+
+    return {
+        'panels_kwargs': {
+            'panels': panels,
+            'years_emis': years_emis,
+            'years_temp': years_temp,
+        },
+        'convergence_kwargs': {
+            'seed_errors_list': seed_errors_list,
+            'seed_baseline_error_list': seed_baseline_error_list,
+            'labels': labels,
+        },
+        'selection': selection,
+        'scores': scores,
+    }
+
 
 # ==================================================================
 # Part 5b: notebook-facing data-prep for supplementary_notebooks/SI_plots.ipynb
@@ -3781,6 +4374,142 @@ def load_SI_feature_sensitivity_data(IC: str = 'sine') -> dict:
         "result_paths": [f'data/SI_results/sensitivity_features/inverse_{feat}_co2_only_{IC}.pkl' for feat in feat_list],
         "column_titles": ['(a) Short', '(b) Medium', '(c) Long'],
         "baseline_errors": baseline_errors,
+        "active_agents": ("CO2",),
+        "save_path": f'SI_feat_{IC}',
+    }
+
+
+def load_SI_ic_sensitivity_data_seed_sweep(
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str = 'data/SI_results/sensitivity_initial_condition/seed_sweep',
+    baseline_dir: str = 'checkpoints/co2_retuned/seed_sweep',
+) -> dict:
+    """
+    Multi-seed companion to load_SI_ic_sensitivity_data: kwargs for
+    utils_plotting.plot_comparison_results' seed mode - CO2-only
+    initial-condition sensitivity sweep (constant/gaussian/sine), retuned
+    unified hyperparameters, 50 seeds
+    (scripts/SIf_sensitivity_seed_sweep.py --sweep ic).
+
+    The IC sweep's baseline is structurally identical to the mainline CO2
+    baseline (hidden_sizes=[16], default EMA windows), so it reuses
+    checkpoints/co2_retuned/seed_sweep/'s existing 50-seed baseline cache
+    rather than a sweep-specific one.
+
+    Raises FileNotFoundError naming the first missing seed, rather than
+    silently plotting partial data.
+    """
+    IC_list = ['constant', 'gaussian', 'sine']
+    seed_result_paths, seed_baseline_errors = [], []
+    for IC in IC_list:
+        ckpt_paths, base_errs = [], []
+        for seed in seeds:
+            ckpt_path = f'{checkpoint_dir}/inverse_{IC}_all_co2_only_seed{seed}.pkl'
+            baseline_path = f'{baseline_dir}/baseline_co2_only_seed{seed}.pkl'
+            if not Path(ckpt_path).exists() or not Path(baseline_path).exists():
+                raise FileNotFoundError(
+                    f"{ckpt_path} or {baseline_path} missing - run "
+                    f"scripts/SIf_sensitivity_seed_sweep.py --sweep ic --seed {seed} first"
+                )
+            ckpt_paths.append(ckpt_path)
+            with open(baseline_path, "rb") as f:
+                base_errs.append(pickle.load(f)['All']['mean'])
+        seed_result_paths.append(ckpt_paths)
+        seed_baseline_errors.append(base_errs)
+
+    return {
+        "seed_result_paths": seed_result_paths,
+        "seed_baseline_errors": seed_baseline_errors,
+        "column_titles": ['(a) Constant', '(b) Gaussian', '(c) Sinusoid'],
+        "active_agents": ("CO2",),
+        "save_path": 'SI_IC',
+    }
+
+
+def load_SI_architecture_sensitivity_data_seed_sweep(
+    IC: str = 'sine',
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str = 'data/SI_results/sensitivity_architecture/seed_sweep',
+) -> dict:
+    """
+    Multi-seed companion to load_SI_architecture_sensitivity_data - CO2-only
+    MLP-hidden-layer-architecture sensitivity sweep, retuned unified
+    hyperparameters (fixed across every architecture - only the structural
+    knob varies), 50 seeds (scripts/SIf_sensitivity_seed_sweep.py
+    --sweep architecture).
+
+    Each architecture is trained with its own baseline (baseline depends on
+    hidden_sizes), but the same fixed IC across all four columns.
+
+    Raises FileNotFoundError naming the first missing seed, rather than
+    silently plotting partial data.
+    """
+    arch_list = ['8', '16', '32', '16_16']
+    seed_result_paths, seed_baseline_errors = [], []
+    for arch in arch_list:
+        ckpt_paths, base_errs = [], []
+        for seed in seeds:
+            ckpt_path = f'{checkpoint_dir}/inverse_{IC}_all_co2_only_{arch}_seed{seed}.pkl'
+            baseline_path = f'{checkpoint_dir}/baseline_co2_only_{arch}_seed{seed}.pkl'
+            if not Path(ckpt_path).exists() or not Path(baseline_path).exists():
+                raise FileNotFoundError(
+                    f"{ckpt_path} or {baseline_path} missing - run "
+                    f"scripts/SIf_sensitivity_seed_sweep.py --sweep architecture "
+                    f"--condition {arch} --seed {seed} first"
+                )
+            ckpt_paths.append(ckpt_path)
+            with open(baseline_path, "rb") as f:
+                base_errs.append(pickle.load(f)['All']['mean'])
+        seed_result_paths.append(ckpt_paths)
+        seed_baseline_errors.append(base_errs)
+
+    return {
+        "seed_result_paths": seed_result_paths,
+        "seed_baseline_errors": seed_baseline_errors,
+        "column_titles": ['(a) [8]', '(b) [16]', '(c) [32]', '(d) [16, 16]'],
+        "active_agents": ("CO2",),
+        "save_path": f'SI_arch_{IC}',
+    }
+
+
+def load_SI_feature_sensitivity_data_seed_sweep(
+    IC: str = 'sine',
+    seeds: list[int] = tuple(range(50)),
+    checkpoint_dir: str = 'data/SI_results/sensitivity_features/seed_sweep',
+) -> dict:
+    """
+    Multi-seed companion to load_SI_feature_sensitivity_data - CO2-only
+    EMA-feature-window sensitivity sweep, retuned unified hyperparameters
+    (fixed across every feature-window set - only the structural knob
+    varies), 50 seeds (scripts/SIf_sensitivity_seed_sweep.py
+    --sweep features).
+
+    Raises FileNotFoundError naming the first missing seed, rather than
+    silently plotting partial data.
+    """
+    feat_list = ['short', 'medium', 'long']
+    seed_result_paths, seed_baseline_errors = [], []
+    for feat in feat_list:
+        ckpt_paths, base_errs = [], []
+        for seed in seeds:
+            ckpt_path = f'{checkpoint_dir}/inverse_{IC}_all_co2_only_{feat}_seed{seed}.pkl'
+            baseline_path = f'{checkpoint_dir}/baseline_co2_only_{feat}_seed{seed}.pkl'
+            if not Path(ckpt_path).exists() or not Path(baseline_path).exists():
+                raise FileNotFoundError(
+                    f"{ckpt_path} or {baseline_path} missing - run "
+                    f"scripts/SIf_sensitivity_seed_sweep.py --sweep features "
+                    f"--condition {feat} --seed {seed} first"
+                )
+            ckpt_paths.append(ckpt_path)
+            with open(baseline_path, "rb") as f:
+                base_errs.append(pickle.load(f)['All']['mean'])
+        seed_result_paths.append(ckpt_paths)
+        seed_baseline_errors.append(base_errs)
+
+    return {
+        "seed_result_paths": seed_result_paths,
+        "seed_baseline_errors": seed_baseline_errors,
+        "column_titles": ['(a) Short', '(b) Medium', '(c) Long'],
         "active_agents": ("CO2",),
         "save_path": f'SI_feat_{IC}',
     }
@@ -3892,10 +4621,19 @@ def load_SI_extended_results_data_seed_sweep(
     simply "more certain" than others when it's really just missing data.
     """
     _agent_map = {'co2': 'CO2', 'ch4': 'CH4', 'n2o': 'N2O', 'Sulfur': 'Sulfur', 'BC': 'BC'}
+    # Sulfur's deployed arm is the w=0.02 normalized-penalty one, so its cache is
+    # the _smooth variant. Same reasoning as _FIG3_AGENT_DIRS: reading the plain
+    # cache here would put the control arm in the SI while the paper deploys the
+    # smoothed one. Skill is unchanged (0.0129 -> 0.0131); roughness is not
+    # (R 0.937 -> 0.132).
+    _cache_overrides = {
+        'Sulfur': 'data/SI_results/seed_uncertainty/SI_extended_seed_spread_Sulfur_smooth.pkl',
+    }
     seed_baseline_results_list, seed_optimized_results_list = [], []
     for agent_lower in agent_lower_list:
         agent = _agent_map[agent_lower]
-        cache_path = co2_cache_path if agent == 'CO2' else other_cache_path_template.format(agent=agent)
+        cache_path = (co2_cache_path if agent == 'CO2'
+                      else _cache_overrides.get(agent, other_cache_path_template.format(agent=agent)))
         if not Path(cache_path).exists():
             raise FileNotFoundError(
                 f"{cache_path} missing for agent {agent} - run "
@@ -3921,4 +4659,137 @@ def load_SI_extended_results_data_seed_sweep(
         "weights": [7, 5, 2, 2],
         "titles": None,
         "figname": 'SI_extended_results_seed_spread',
+    }
+
+
+# ==================================================================
+# SI: representative-seed emissions comparison (CO2-only + multi-forcing)
+# ==================================================================
+
+def _pick_representative_seeds(final_errors_by_seed: dict) -> dict:
+    """Pick the seeds whose final NRMSE lands closest to the 25th percentile,
+    the median, and the 75th percentile of the across-seed distribution -
+    the same median+IQR convention Figures 3/4/5 already use for
+    seed-uncertainty bands, rather than the true min/max (which can be
+    single-seed outliers).
+
+    Each of 'q25'/'median'/'q75' is the seed whose own final NRMSE is
+    closest to that percentile's value, since the percentile statistic
+    itself generally doesn't land exactly on any one seed.
+    """
+    values = list(final_errors_by_seed.values())
+    q25_val, median_val, q75_val = (float(v) for v in np.percentile(values, [25, 50, 75]))
+    q25 = min(final_errors_by_seed, key=lambda s: abs(final_errors_by_seed[s] - q25_val))
+    median = min(final_errors_by_seed, key=lambda s: abs(final_errors_by_seed[s] - median_val))
+    q75 = min(final_errors_by_seed, key=lambda s: abs(final_errors_by_seed[s] - q75_val))
+    return {"q25": q25, "median": median, "q75": q75}
+
+
+def _load_final_emissions_state(checkpoint_dir: str, tag: str, seed: int, group: str = 'tier1') -> dict:
+    """Load just the converged (final-iteration) emissions state U_traj[-1]
+    for one seed/group checkpoint, keyed by agent (e.g. 'CO2', 'CH4', ...).
+
+    `group` selects which trained checkpoint to read - e.g. 'tier1' (the
+    Figure 3/5 training target) or 'all' (the Figure-4-style "Opt. All"
+    checkpoint, trained on the full DAMIP/GeoMIP-exclusive scenario mix -
+    see regenerate_fig4_co2_only_cache_seed_sweep/
+    regenerate_fig4_all_agents_cache_seed_sweep's own `groups` list).
+
+    Mirrors load_inverse_ckpt_nrmse_only's memory-light contract: the pickle
+    still has to be fully deserialized, but only U_traj[-1] is kept, so
+    preds_traj/train_temp_traj/opt_state don't linger in memory afterward.
+    """
+    path = f'{checkpoint_dir}/inverse_constant_{group}_{tag}_seed{seed}.pkl'
+    with open(path, "rb") as f:
+        raw = pickle.load(f)
+    return _tree_to_jnp(raw["U_traj"][-1])
+
+
+def _final_errors_from_fig4_cache(cache_path: str, seeds: list[int], train_scenario: str) -> dict:
+    """{seed: NRMSE} for one training column of a Figure-4 seed-spread cache
+    (data/SI_results/seed_uncertainty/fig4_seed_spread_{co2_only,
+    all_agents_smooth}.pkl, built by regenerate_fig4_{co2_only,all_agents}_
+    cache_seed_sweep) - `cache[seed]['optimal'][train_scenario]['All']['mean']`,
+    the retrain-and-evaluate NRMSE for that seed's `train_scenario`-trained
+    emulator, averaged (sample-size-weighted) across every scenario in the
+    pooled 'All' evaluation set. This is out-of-sample skill (a fresh MLP
+    retrained on the checkpoint's converged emissions, then evaluated), not
+    the in-sample training-objective curve load_fig3/5_*_seed_sweep return.
+    """
+    if not Path(cache_path).exists():
+        raise FileNotFoundError(
+            f"{cache_path} missing - run scripts/build_fig4_seed_spread_cache_"
+            f"{'co2.py' if 'co2' in cache_path else 'multi.py --checkpoint-dir checkpoints/multi_fig4_smooth/seed_sweep --suffix _smooth'} first"
+        )
+    with open(cache_path, "rb") as f:
+        cache = pickle.load(f)
+    missing = [s for s in seeds if s not in cache]
+    if missing:
+        raise FileNotFoundError(f"{cache_path} missing {len(missing)} of {len(seeds)} seeds (first few: {missing[:5]})")
+    return {s: float(cache[s]['optimal'][train_scenario]['All']['mean']) for s in seeds}
+
+
+def load_SI_seed_emissions_comparison_data(
+    seeds: list[int] = tuple(range(50)),
+    co2_checkpoint_dir: str = 'checkpoints/co2_retuned/seed_sweep',
+    co2_tag: str = 'co2_only',
+    co2_seed_spread_cache: str = 'data/SI_results/seed_uncertainty/fig4_seed_spread_co2_only.pkl',
+    multi_checkpoint_dir: str = 'checkpoints/multi_fig4_smooth/seed_sweep',
+    multi_tag: str = 'multi_fig4',
+    multi_seed_spread_cache: str = 'data/SI_results/seed_uncertainty/fig4_seed_spread_all_agents_smooth.pkl',
+    multi_agents: list[str] = ('CO2', 'CH4', 'N2O', 'Sulfur', 'BC'),
+    train_scenario: str = 'Opt. All',
+    group: str = 'all',
+) -> dict:
+    """
+    Data for the SI seed-emissions-comparison figure
+    (utils_plotting.plot_seed_emissions_comparison): for the CO2-only
+    single-forcing experiment and the multi-forcing experiment, both trained
+    on the full ("Opt. All") scenario mix, selects the seed closest to the
+    25th percentile, the median, and the 75th percentile of that "Opt.
+    All"-trained emulator's average out-of-sample NRMSE across every
+    evaluation scenario (Figure 4's retrain-and-evaluate methodology, read
+    from its own seed-spread caches - see _final_errors_from_fig4_cache) and
+    loads each selected seed's converged (U_traj[-1]) 'all'-group emissions
+    trajectory.
+
+    For the multi-forcing experiment, seed selection is done once using the
+    experiment's overall (all-agent) average NRMSE - the same 3 seeds are
+    then read out per agent, rather than re-selecting q25/median/q75
+    separately for each agent.
+
+    Raises FileNotFoundError naming what's missing, rather than silently
+    ranking a partial sweep.
+
+    Returns:
+        {
+          'co2_emissions': {'q25': arr, 'median': arr, 'q75': arr},
+          'multi_emissions': {'CO2': {...}, 'CH4': {...}, 'N2O': {...},
+                               'Sulfur': {...}, 'BC': {...}},
+          'co2_seed_info': {'q25': (seed, nrmse), 'median': (...), 'q75': (...)},
+          'multi_seed_info': {same shape as co2_seed_info},
+        }
+    """
+    co2_final = _final_errors_from_fig4_cache(co2_seed_spread_cache, seeds, train_scenario)
+    co2_pick = _pick_representative_seeds(co2_final)
+
+    multi_final = _final_errors_from_fig4_cache(multi_seed_spread_cache, seeds, train_scenario)
+    multi_pick = _pick_representative_seeds(multi_final)
+
+    co2_emissions = {}
+    for label, seed in co2_pick.items():
+        state = _load_final_emissions_state(co2_checkpoint_dir, co2_tag, seed, group=group)
+        co2_emissions[label] = np.asarray(state['CO2'])
+
+    multi_emissions = {a: {} for a in multi_agents}
+    for label, seed in multi_pick.items():
+        state = _load_final_emissions_state(multi_checkpoint_dir, multi_tag, seed, group=group)
+        for a in multi_agents:
+            multi_emissions[a][label] = np.asarray(state[a])
+
+    return {
+        "co2_emissions": co2_emissions,
+        "multi_emissions": multi_emissions,
+        "co2_seed_info": {label: (seed, co2_final[seed]) for label, seed in co2_pick.items()},
+        "multi_seed_info": {label: (seed, multi_final[seed]) for label, seed in multi_pick.items()},
     }

@@ -16,6 +16,7 @@ Usage:
     python scripts/submit_fig4_seed_spread_multi.py
 """
 import sys
+import argparse
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -27,12 +28,34 @@ N_SEEDS = 50
 
 
 def main():
-    script = PROJECT_ROOT / "scripts/_gen_fig4_seed_spread_multi_array.slurm"
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--checkpoint-dir", default=None,
+        help="passed through to build_fig4_seed_spread_cache_multi.py; defaults "
+             "to checkpoints/multi_fig4/seed_sweep.")
+    parser.add_argument(
+        "--suffix", default="",
+        help="passed through to build_fig4_seed_spread_cache_multi.py; required "
+             "whenever --checkpoint-dir is given.")
+    args = parser.parse_args()
+
+    # Mirror the builder's own guard here so a bad submission fails before it
+    # costs 50 array tasks rather than after each one exits.
+    if args.checkpoint_dir is not None and not args.suffix:
+        raise SystemExit("--checkpoint-dir requires --suffix")
+
+    extra = ""
+    if args.checkpoint_dir is not None:
+        extra += f' --checkpoint-dir {args.checkpoint_dir}'
+    if args.suffix:
+        extra += f' --suffix {args.suffix}'
+
+    script = PROJECT_ROOT / f"scripts/_gen_fig4_seed_spread_multi_array{args.suffix}.slurm"
     out_dir = Path("data/SI_results/seed_uncertainty/slurm_logs")
     write_slurm(
-        script, "fig4_seedspread_multi", out_dir, "00:20:00",
+        script, f"fig4_seedspread_multi{args.suffix}", out_dir, "00:20:00",
         f'conda run -n project2 python -u scripts/build_fig4_seed_spread_cache_multi.py '
-        f'--mode run-one --seed "$SLURM_ARRAY_TASK_ID"'
+        f'--mode run-one --seed "$SLURM_ARRAY_TASK_ID"{extra}'
     )
     sbatch(script, array=f"0-{N_SEEDS - 1}%50")
 

@@ -90,6 +90,49 @@ FAMILIES = {
         "unified_cfg": "data/SI_results/hp_retune/best_config_unified.json",
         "baseline_cfg": "data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json",
     },
+    # Single-forcing agents. Mirrors regenerate_SI_extended_results_cache_seed_sweep
+    # exactly: setup gets [agent]/(agent,), and evaluate_optimal_emulator gets
+    # active_agents=(agent,) but NO `agents` kwarg - so the feature space stays
+    # all five with the others zeroed, the same asymmetry documented for co2.
+    # Directory names are deliberately mixed-case in this repo (ch4/n2o lower,
+    # Sulfur/BC capitalised); they are written out rather than derived because
+    # agent.lower() is wrong for two of the four.
+    "CH4": {
+        "checkpoint_dir": "checkpoints/ch4_retuned/seed_sweep",
+        "tag": "ch4_only",
+        "setup_agents": ["CH4"],
+        "eval_agents": None,
+        "active": ("CH4",),
+        "unified_cfg": "data/SI_results/hp_retune/CH4/best_config_unified.json",
+        "baseline_cfg": "data/SI_results/baseline_hp/k400_search_CH4/best_baseline_config_K400.json",
+    },
+    "N2O": {
+        "checkpoint_dir": "checkpoints/n2o_retuned/seed_sweep",
+        "tag": "n2o_only",
+        "setup_agents": ["N2O"],
+        "eval_agents": None,
+        "active": ("N2O",),
+        "unified_cfg": "data/SI_results/hp_retune/N2O/best_config_unified.json",
+        "baseline_cfg": "data/SI_results/baseline_hp/k400_search_N2O/best_baseline_config_K400.json",
+    },
+    "Sulfur": {
+        "checkpoint_dir": "checkpoints/Sulfur_retuned/seed_sweep",
+        "tag": "Sulfur_only",
+        "setup_agents": ["Sulfur"],
+        "eval_agents": None,
+        "active": ("Sulfur",),
+        "unified_cfg": "data/SI_results/hp_retune/Sulfur/best_config_unified.json",
+        "baseline_cfg": "data/SI_results/baseline_hp/k400_search_Sulfur/best_baseline_config_K400.json",
+    },
+    "BC": {
+        "checkpoint_dir": "checkpoints/BC_retuned/seed_sweep",
+        "tag": "BC_only",
+        "setup_agents": ["BC"],
+        "eval_agents": None,
+        "active": ("BC",),
+        "unified_cfg": "data/SI_results/hp_retune/BC/best_config_unified.json",
+        "baseline_cfg": "data/SI_results/baseline_hp/k400_search_BC/best_baseline_config_K400.json",
+    },
     "multi": {
         # mirrors utils_inverse.regenerate_fig4_all_agents_cache_seed_sweep
         "checkpoint_dir": "checkpoints/multi_fig4/seed_sweep",

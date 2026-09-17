@@ -111,6 +111,55 @@ MESM_PARAMS = {
   "C0_PI": 286.4 # Preindustrial CO2 [ppm]
 }
 
+# The revised MESM calibration adopted in 2c_calibrate_MESM_both.ipynb (see
+# MESM_SCM_CALIBRATION.md for the full procedure). Kept SEPARATE from
+# MESM_PARAMS rather than replacing it, so every existing mode='MESM' result in
+# this repo stays reproducible - select it with mode='MESM_tier1'.
+#
+# What differs from MESM_PARAMS:
+#   - Carbon cycle (a, tau): Phase 1's emissions->concentration fit against
+#     MESM's 1pctCO2 ramp alone. MESM_PARAMS' own carbon block came from an
+#     earlier snapshot of the same fit and is close but not identical.
+#   - Thermal response (d, q): Phase 2b, fit against 1pctCO2 + all seven Tier 1
+#     scenarios, with sum(q) pinned so ECS = F_2xCO2 * sum(q) = 3.205 K, MESM's
+#     own measured value. MESM_PARAMS implies 3.568 K, ~11% too warm.
+# Everything else (r0/rC/rT, the CH4/N2O cycles, the aerosol terms, C0_PI) is
+# untuned and identical to MESM_PARAMS by construction.
+#
+# Values are transcribed from the calibration checkpoint rather than loaded at
+# import time, matching FAIR_PARAMS/MESM_PARAMS above and keeping this module
+# import free of filesystem side effects. To regenerate:
+#   theta = pickle.load(open('data/JAX_calibration/calib_MESM_tier1_augmented.pkl','rb'))
+#   params_from_theta(theta, MESM_PARAMS)
+MESM_TIER1_PARAMS = dict(
+  MESM_PARAMS,
+  a=jnp.array([0.04143052, 0.04895801, 0.12931278, 0.7802987]),
+  tau=jnp.array([2.51205047e+05, 1.23081726e+02, 7.80528259e+00, 8.81245494e-01]),
+  d=jnp.array([0.5329649, 70.098694, 89.4626]),
+  q=jnp.array([0.24169858, 0.29202616, 0.3152725]),
+)
+
+# Which SCM parameter set each `mode` string selects. Adding a calibration here
+# is all it takes to make it usable end-to-end: `mode` is threaded through
+# utils_inverse's whole setup/optimize/evaluate path as an opaque string and is
+# never interpreted anywhere except the three lookups against this table.
+PARAMS_BY_MODE = {
+  'FaIR': FAIR_PARAMS,
+  'MESM': MESM_PARAMS,
+  'MESM_tier1': MESM_TIER1_PARAMS,
+}
+
+
+def params_for_mode(mode: str) -> dict:
+  """The SCM parameter dict `mode` names, or a ValueError listing the valid ones."""
+  try:
+    return PARAMS_BY_MODE[mode]
+  except KeyError:
+    raise ValueError(
+      f'Error, mode {mode} not recognized. Expected one of {sorted(PARAMS_BY_MODE)}.'
+    ) from None
+
+
 # Constants
 SPY        = 3600.0 * 24.0 * 365.25     # Seconds per year
 EARTHAREA  = 5.1e14                     # Surface area of Earth m^2
@@ -363,7 +412,8 @@ def simulate_temp(
   emissions_by_agent: jnp.ndarray,   # (N_agents, N_t)
   mode: str = 'FaIR',
   params: dict | None = None,
-  dt: float = 0.1
+  dt: float = 0.1,
+  use_checkpoint: bool = False,
 ) -> dict:
   """
   Forward-integrate the JAX SCM (carbon/CH4/N2O cycles + thermal response) from
@@ -372,14 +422,19 @@ def simulate_temp(
   emissions_by_agent rows follow (CO2, CH4, N2O, Sulfur, BC) order (see idx_* constants).
   Returns a dict with keys "years", "Catm_ppm", "Matm_ppb", "Natm_ppb", "RF_*", "GMST",
   plus cumulative-emissions diagnostics and sub-annual ("_sub") series.
+
+  use_checkpoint: when True, wraps the scan step in jax.checkpoint (gradient
+  checkpointing) - trades recomputing each step's forward pass during
+  backprop for not storing every step's intermediate state, which matters
+  when this function is used inside jax.grad over a long trajectory (dt=0.1
+  over a multi-century scenario is thousands of scan steps). False (default)
+  preserves existing behaviour and cost exactly - only scripts/
+  2d_calibrate_MESM_alt.py (a differentiated, multi-scenario, full-pipeline
+  calibration - see its module docstring) currently opts in; every existing
+  evaluation-only caller is unaffected.
   """
   if params is None:
-    if mode == 'FaIR':
-      params = FAIR_PARAMS
-    elif mode == 'MESM':
-      params = MESM_PARAMS
-    else:
-      raise ValueError(f'Error, mode {mode} not recognized.')
+    params = params_for_mode(mode)
 
   years = jnp.asarray(years, dtype=jnp.float32)
   start = years[0]
@@ -395,6 +450,20 @@ def simulate_temp(
   n_agents, T_em = emissions_by_agent.shape
   if T_em != years.shape[0]:
     raise ValueError("Time dimension of emissions must match `years` length")
+  if n_agents <= idx_BC:
+    # Without this guard the step function below reads rows idx_CH4=1 ..
+    # idx_BC=4, and JAX SILENTLY CLAMPS out-of-bounds row indices to the last
+    # valid row - so a CO2-only (1, T) array would be interpreted as having the
+    # CO2 series in every agent slot at once, adding large spurious CH4/N2O/
+    # aerosol forcing with no error. That bug was live in
+    # scripts/2d_calibrate_MESM_alt.py; fail loudly instead of silently.
+    raise ValueError(
+      f"emissions_by_agent has {n_agents} rows, but simulate_temp indexes rows "
+      f"0..{idx_BC} (CO2, CH4, N2O, Sulfur, BC). Pass a zero-filled "
+      f"({idx_BC + 1}, T) array - e.g. leave utils_inverse.simulate_targets_gmst's "
+      f"`agents` at its 5-agent default, which zero-fills absent agents - rather "
+      f"than a truncated one."
+    )
 
   # Initial states
   cpool0  = jnp.zeros((4,), dtype=jnp.float32) # carbon pool (ppm)
@@ -463,7 +532,8 @@ def simulate_temp(
     return new_carry, y
 
   carry0 = (cpool0, m_anom0, n_anom0, S0, RF_prev0, cumulative_GtC0)
-  carry_f, Y = lax.scan(step_fn, carry0, tvec[:-1])  # (nsteps, 6)
+  scan_step_fn = jax.checkpoint(step_fn) if use_checkpoint else step_fn
+  carry_f, Y = lax.scan(scan_step_fn, carry0, tvec[:-1])  # (nsteps, 6)
 
   Catm_full = Y[:, 0]   # ppm
   Matm_full = Y[:, 1]   # ppb
@@ -885,12 +955,7 @@ def make_theta0(mode: str = 'FaIR') -> jnp.ndarray:
     [8:11] log(q_j)
   """
 
-  if mode == 'FaIR':
-    params = FAIR_PARAMS
-  elif mode == 'MESM':
-    params = MESM_PARAMS
-  else:
-    raise ValueError(f'Error, mode {mode} not recognized.')
+  params = params_for_mode(mode)
 
   r0   = jnp.float32(params["r0"])
   rC   = jnp.float32(params["rC"])
@@ -1079,6 +1144,7 @@ def calibrate_carbon_cycle(
     learning_rate: float = 1e-2,
     mode: str = 'FaIR',
     base_params: dict = FAIR_PARAMS,
+    normalize_per_scenario: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Calibrates 'r0', 'rC', 'rT', 'a', 'tau' to match target CO2 concentrations.
@@ -1086,10 +1152,27 @@ def calibrate_carbon_cycle(
     Non-tuned theta fields (everything outside the "Carbon" mask) are pulled from
     `base_params` - typically FAIR_PARAMS; pass MESM_PARAMS explicitly when this
     is one step of an MESM calibration (see scripts/2c_calibrate_MESM.py).
+
+    normalize_per_scenario: if True, each scenario's concentration MSE is divided
+    by that scenario's own max(|target|)**2 before summing into the loss - the
+    same normalization convention as scripts/6d_scm_mesm_fidelity.py's nrmse_r2
+    (rmse / max(|truth|)), squared here since this loss is an MSE rather than an
+    RMSE. Without this, scenarios on very different absolute concentration scales
+    (e.g. an idealized abrupt-2xCO2 step vs. a 1pctCO2 ramp) don't contribute
+    comparably to the loss - the larger-magnitude scenario dominates the shared
+    gradient and can destabilize the other scenario's fit (see
+    2c_calibrate_MESM_both.ipynb, where this was diagnosed). Default False
+    preserves the original single-scenario loss exactly.
     Returns (theta_opt, final_loss).
     """
     # Pre-pad data for JAX (similar to run_scenarios)
     scen_names = list(emis_dict_JAX.keys())
+
+    if normalize_per_scenario:
+        scen_norm = {
+            scen: jnp.max(jnp.abs(target_conc_dict[scen][0, :])) ** 2 + 1e-8
+            for scen in scen_names
+        }
 
     def loss_carbon(theta):
         params = params_from_theta(theta, base_params)
@@ -1101,10 +1184,21 @@ def calibrate_carbon_cycle(
         for scen in scen_names:
             pred_co2 = res_dict[scen]["Catm_ppm"]
             true_co2 = target_conc_dict[scen][0,:] # Expecting array of shape (T,)
-            total_mse += jnp.mean((pred_co2 - true_co2)**2)
+            scen_mse = jnp.mean((pred_co2 - true_co2)**2)
+            if normalize_per_scenario:
+                scen_mse = scen_mse / scen_norm[scen]
+            total_mse += scen_mse
         return total_mse
 
-    loss_and_grad = jax.value_and_grad(loss_carbon)
+    # jit is required, not just an optimization: run_scenarios() constructs a
+    # fresh jax.vmap(simulate_temp, ...) wrapper on every call, and calling
+    # that un-jitted inside this training loop leaks a new compiled XLA
+    # program per step - harmless for a handful of steps, but it OOMs the
+    # process by ~750-1000 steps (verified while diagnosing the joint
+    # 1pctCO2+2xCO2 fit in 2c_calibrate_MESM_both.ipynb). Wrapping in jax.jit
+    # traces/compiles loss_carbon once and reuses that single program for
+    # every step, which also happens to be ~15-20x faster.
+    loss_and_grad = jax.jit(jax.value_and_grad(loss_carbon))
     optimizer = optax.adam(learning_rate=learning_rate)
     opt_state = optimizer.init(theta0)
     theta = theta0
@@ -1138,6 +1232,7 @@ def calibrate_climate_sensitivity(
     n_steps: int,
     learning_rate: float = 1e-2,
     base_params: dict = FAIR_PARAMS,
+    sum_q_target: float | None = None,
 ) -> tuple[jnp.ndarray, dict]:
     """
     Calibrates the thermal response params (d, q) to match target GMST given
@@ -1146,13 +1241,34 @@ def calibrate_climate_sensitivity(
     "Climate" mask) are pulled from `base_params` - typically FAIR_PARAMS; pass
     MESM_PARAMS explicitly when this is one step of an MESM calibration (see
     scripts/2c_calibrate_MESM.py). Checkpoints theta to `filepath`.
+
+    sum_q_target: if given, q is projected onto sum(q) == sum_q_target at every
+    step, so the fit determines only the *partition* of q across the three boxes
+    and their timescales d - not the total. Since ECS = F_2xCO2 * sum(q), this
+    pins ECS to a value measured independently (e.g. from an abrupt-2xCO2
+    equilibrium) while the transient timescales are fitted to a ramp experiment.
+    Motivation: a 150-year 1pctCO2 ramp alone cannot constrain ECS - the third
+    box runs off to the integrator limit (d3 -> 1e6 yr, ECS -> 1e4 K) with an
+    equally good RMSE - so without this constraint the fit is only regularized
+    by early stopping from its initialization. See 2c_calibrate_MESM_both.ipynb.
+    The projection is differentiable, so gradients flow through it normally.
+    None (default) preserves the original unconstrained behaviour exactly.
     Returns (theta_opt, params_opt).
     """
     scen_names = list(emis_dict_JAX.keys())
 
+    def _project_q(theta):
+        """Rescale theta's log_q entries (8:11) so sum(q) == sum_q_target,
+        leaving the partition between boxes free. Identity if unconstrained."""
+        if sum_q_target is None:
+            return theta
+        q = jnp.exp(theta[8:11])
+        q = q * (sum_q_target / jnp.sum(q))
+        return theta.at[8:11].set(jnp.log(q))
+
     # Helper to vmap the new prescribed function
     def run_prescribed_batch(theta):
-        params = params_from_theta(theta, base_params)
+        params = params_from_theta(_project_q(theta), base_params)
         losses = []
         for scen in scen_names:
             # We need both Emis (for Aerosols) and Conc (for GHGs)
@@ -1165,7 +1281,9 @@ def calibrate_climate_sensitivity(
             losses.append(jnp.mean((pred_T - target)**2))
         return jnp.sum(jnp.array(losses))
 
-    loss_and_grad = jax.value_and_grad(run_prescribed_batch)
+    # jit for the same reason calibrate_carbon_cycle jits its step - retracing
+    # the forward model every iteration is both slow and memory-leaky.
+    loss_and_grad = jax.jit(jax.value_and_grad(run_prescribed_batch))
     optimizer = optax.adam(learning_rate=learning_rate)
     opt_state = optimizer.init(theta0)
     theta = theta0
@@ -1183,6 +1301,9 @@ def calibrate_climate_sensitivity(
         if step % 100 == 0 or step == n_steps - 1:
             print(f"Step {step} | Loss (Temp MSE): {loss:.4f}")
 
+    # Bake the constraint into the returned/saved theta, so every downstream
+    # params_from_theta sees the pinned sum(q) the loss was actually optimizing.
+    theta = _project_q(theta)
     with open(filepath, 'wb') as f: pickle.dump(theta, f)
     return theta, params_from_theta(theta, base_params)
 

@@ -110,6 +110,19 @@ AGENT_CONFIG = {
                "checkpoint_dir": "checkpoints/BC_retuned/seed_sweep",
                "unified_config_path": "data/SI_results/hp_retune/BC/best_config_unified.json",
                "module": "SId_inverse_BC_only.py"},
+    # Added for Table S2's Multi row (tab:supp_opt_v_dyn): the blocker noted
+    # in the module docstring above (multi-agent tier1 hyperparameters
+    # unknown) is resolved now that Figure 4/5's multi-agent panels have
+    # their own dedicated 0c_regenerate_checkpoints_multi_fig4.py config -
+    # reused verbatim here (tag/checkpoint_dir/unified_config_path all copied
+    # from that script) so the (a)-extract Opt.Iter.0/Opt.Final numbers and
+    # this script's (b)-control Unopt.Rich number come from the exact same
+    # smoothed-arm checkpoints Figures 4/5 themselves report.
+    "Multi":  {"agents": ["CO2", "CH4", "N2O", "Sulfur", "BC"],
+               "active_agents": ("CO2", "CH4", "N2O", "Sulfur", "BC"), "tag": "multi_fig4",
+               "checkpoint_dir": "checkpoints/multi_fig4_smooth/seed_sweep",
+               "unified_config_path": "data/SI_results/hp_retune/multi/best_config_unified.json",
+               "group_defs": {"tier1": {"init_cond": "constant", "T": 751, "filter_hist": False}}},
 }
 GROUPS = ['H-ext', 'tier1', 'tier2', 'DECK', 'CS3', 'all']
 
@@ -121,13 +134,36 @@ FIG_GROUPS = {
     "N2O": ["tier1"],               # Fig 3
     "Sulfur": ["tier1"],            # Fig 3
     "BC": ["tier1"],                # Fig 3
+    "Multi": ["tier1"],             # Table S2 (tab:supp_opt_v_dyn)
 }
 
-# Multi-agent checkpoints (checkpoints/multi/) referenced by Figs 4/5 -
-# (a)-only, read verbatim, never regenerated (see module docstring).
-MULTI_CHECKPOINTS = {
-    "Fig4_all_agents_subset": "checkpoints/multi/inverse_constant_all_all_agents_subset.pkl",
-    "Fig5_tier1_all_agents_subset2": "checkpoints/multi/inverse_constant_tier1_all_agents_subset2.pkl",
+# Multi-agent checkpoints referenced by Figs 4/5 - (a)-only, read verbatim,
+# never regenerated (see module docstring).
+#
+# 2026-08-27: repointed. The old single-run files (checkpoints/multi/inverse_
+# constant_{all,tier1}_all_agents_subset{,2}.pkl) no longer exist - Figures 4/5
+# moved to the 50-seed sweeps during the 2000-iteration migration, and this
+# block had been silently printing "not found, skipping" ever since, leaving
+# the multi-agent panels with no iteration-0 comparand at all.
+#
+# Both arms are extracted because they answer different questions and the
+# choice belongs at plot time, not here: the unsmoothed families back the SI
+# "pure noise as forcing" argument, the smoothed ones back Figures 5/6.
+# Extracting both is free (these files are already on disk) and avoids
+# guessing which arm a given panel will end up reporting.
+MULTI_FAMILIES = {
+    "Fig4_multi":        {"dir": "checkpoints/multi_fig4/seed_sweep",
+                          "tag": "multi_fig4",
+                          "groups": ["tier1", "tier2", "DECK", "CS3", "all"]},
+    "Fig4_multi_smooth": {"dir": "checkpoints/multi_fig4_smooth/seed_sweep",
+                          "tag": "multi_fig4",
+                          "groups": ["tier1", "tier2", "DECK", "CS3", "all"]},
+    "Fig5_multi":        {"dir": "checkpoints/multi_retuned/seed_sweep",
+                          "tag": "all_agents",
+                          "groups": ["tier1", "H-ext", "all"]},
+    "Fig5_multi_smooth": {"dir": "checkpoints/multi_retuned_smooth/seed_sweep",
+                          "tag": "all_agents",
+                          "groups": ["tier1", "H-ext", "all"]},
 }
 
 
@@ -170,6 +206,7 @@ def extract():
         for group in groups:
             native_ic = gdefs[group]["init_cond"]
             iter0, final = [], []
+            iter0_obj, final_obj = [], []
             missing = []
             for seed in range(N_SEEDS):
                 p = ckpt_dir / f"inverse_{native_ic}_{group}_{tag}_seed{seed}.pkl"
@@ -177,28 +214,55 @@ def extract():
                     missing.append(seed)
                     continue
                 ckpt = utils_inverse.load_inverse_ckpt(str(p))
-                iter0.append(float(ckpt["errors"][0]))
-                final.append(float(ckpt["errors"][-1]))
+                # errors[] stores the FULL objective (NRMSE + w * penalty(U)),
+                # not the error term. At iteration 0 a constant IC has dU=0 so
+                # the two coincide, but the final entry does not whenever w>0
+                # (CO2 1e-6, N2O 3e-6, BC 3e-5, Sulfur/multi smoothed arms).
+                # Reading errors[-1] as NRMSE therefore understates the
+                # improvement for exactly the penalized agents. Same root cause
+                # as the 6c OOD self-check bug (REVISIONS.md, 2026-08-27).
+                nrmse = utils_inverse.recover_nrmse_trajectory(ckpt)
+                iter0.append(float(nrmse[0]))
+                final.append(float(nrmse[-1]))
+                iter0_obj.append(float(ckpt["errors"][0]))
+                final_obj.append(float(ckpt["errors"][-1]))
             results["single_forcing"][(agent, group)] = {
                 "iteration0_errors": iter0, "final_errors": final, "missing_seeds": missing,
+                "iteration0_objective": iter0_obj, "final_objective": final_obj,
             }
             print(f"[extract] {agent}/{group}: {len(iter0)}/{N_SEEDS} seeds "
                   f"(iter0 mean={sum(iter0)/len(iter0):.4f}, final mean={sum(final)/len(final):.4f})"
                   if iter0 else f"[extract] {agent}/{group}: no seeds found yet")
 
-    for name, path in MULTI_CHECKPOINTS.items():
-        p = Path(path)
-        if not p.exists():
-            print(f"[extract] {name}: {path} not found, skipping")
+    for name, fam in MULTI_FAMILIES.items():
+        ckpt_dir = Path(fam["dir"])
+        if not ckpt_dir.is_dir():
+            print(f"[extract] {name}: {ckpt_dir} not found, skipping family")
             continue
-        ckpt = utils_inverse.load_inverse_ckpt(str(p))
-        results["multi"][name] = {
-            "iteration0_error": float(ckpt["errors"][0]),
-            "final_error": float(ckpt["errors"][-1]),
-            "path": path,
-        }
-        print(f"[extract] {name}: iter0={results['multi'][name]['iteration0_error']:.4f} "
-              f"final={results['multi'][name]['final_error']:.4f}")
+        for group in fam["groups"]:
+            iter0, final, iter0_obj, final_obj, missing = [], [], [], [], []
+            for seed in range(N_SEEDS):
+                p = ckpt_dir / f"inverse_constant_{group}_{fam['tag']}_seed{seed}.pkl"
+                if not p.exists():
+                    missing.append(seed)
+                    continue
+                ckpt = utils_inverse.load_inverse_ckpt(str(p))
+                nrmse = utils_inverse.recover_nrmse_trajectory(ckpt)
+                iter0.append(float(nrmse[0]))
+                final.append(float(nrmse[-1]))
+                iter0_obj.append(float(ckpt["errors"][0]))
+                final_obj.append(float(ckpt["errors"][-1]))
+            if not iter0:
+                print(f"[extract] {name}/{group}: no seeds found, skipping")
+                continue
+            results["multi"][(name, group)] = {
+                "iteration0_errors": iter0, "final_errors": final, "missing_seeds": missing,
+                "iteration0_objective": iter0_obj, "final_objective": final_obj,
+                "checkpoint_dir": str(ckpt_dir),
+            }
+            print(f"[extract] {name}/{group}: {len(iter0)}/{N_SEEDS} seeds "
+                  f"(iter0 mean={sum(iter0)/len(iter0):.4f}, "
+                  f"final mean={sum(final)/len(final):.4f})")
 
     out_path = OUT_DIR / "extract_results.pkl"
     with open(out_path, "wb") as f:
@@ -226,10 +290,16 @@ def control(agent, group, ic, seed=0):
     # NOT transfer to the other four agents - see REVISIONS.md - so there is
     # no cross-agent fallback here: an agent with no search of its own yet
     # raises rather than silently substituting CO2's untransferable config).
-    baseline_cfg_path = (
-        Path("data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json") if agent == "CO2"
-        else Path(f"data/SI_results/baseline_hp/k400_search_{agent}/best_baseline_config_K400.json")
-    )
+    # k400_search_{agent} preserves each single-forcing agent's own casing
+    # (k400_search_CH4/N2O/Sulfur/BC) but the multi-agent search directory is
+    # lowercase (k400_search_multi) - matches 0c_regenerate_checkpoints_
+    # multi_fig4.py's BASELINE_CONFIG_PATH exactly.
+    if agent == "CO2":
+        baseline_cfg_path = Path("data/SI_results/baseline_hp/k400_search/best_baseline_config_K400.json")
+    elif agent == "Multi":
+        baseline_cfg_path = Path("data/SI_results/baseline_hp/k400_search_multi/best_baseline_config_K400.json")
+    else:
+        baseline_cfg_path = Path(f"data/SI_results/baseline_hp/k400_search_{agent}/best_baseline_config_K400.json")
     if not baseline_cfg_path.exists():
         raise FileNotFoundError(
             f"{baseline_cfg_path} missing - {agent}'s own K=400 baseline search "
@@ -280,10 +350,22 @@ def control(agent, group, ic, seed=0):
         preds_every=50,
         key=jax.random.PRNGKey(seed),
     )
+    # errors[0] is the OBJECTIVE (NRMSE + w * penalty(U_init)), not the error
+    # term. For ic="constant" dU=0 so the two coincide, but for sine/gaussian
+    # they do not. Files written before 2026-08-27 stored `errors` alone, so
+    # that contamination is unrecoverable from disk after the fact (there is no
+    # U_traj and no meta to reconstruct the penalty from). It is small - roughly
+    # 1% for CO2 at w=1e-6, negligible for BC at w=3e-5 - so the existing
+    # controls were kept rather than re-run. Persist enough to correct it from
+    # now on.
     with open(out_path, "wb") as f:
         pickle.dump({
             "errors": np.asarray(result["errors"]),
             "agent": agent, "group": group, "ic": ic, "seed": seed,
+            "smoothness_weight": unified_cfg["smoothness_weight"],
+            "penalty_form": unified_cfg.get("penalty_form", "legacy"),
+            "U_init": jax.tree_util.tree_map(np.asarray, result["U_traj"][0])
+                      if result.get("U_traj") else None,
         }, f)
     print(f"[control] {agent}/{group}/{ic}/seed{seed} -> {out_path} "
           f"(iteration0 error={float(result['errors'][0]):.4f})")
@@ -319,7 +401,20 @@ def collect():
     with open(extract_path, "rb") as f:
         results = pickle.load(f)
 
+    # Carry forward any controls already collected. checkpoints/iteration0_
+    # controls/ is scratch and gets cleaned between sessions, but the (b)-mode
+    # results it produced cost real compute and live only in this output file.
+    # Without this, re-running collect purely to refresh the (a)-mode extract
+    # half - which is exactly why it is re-run after a migration - would
+    # silently replace 20 populated control entries with empty lists.
+    out_path = OUT_DIR / "iteration0_ablation_results.pkl"
+    prior_controls = {}
+    if out_path.exists():
+        with open(out_path, "rb") as f:
+            prior_controls = (pickle.load(f) or {}).get("controls", {}) or {}
+
     control_results = {}
+    carried = 0
     for agent, group, ic in all_control_group_combos():
         errs, missing_seeds = [], []
         for seed in range(N_SEEDS):
@@ -331,16 +426,26 @@ def collect():
             with open(p, "rb") as f:
                 ckpt = pickle.load(f)
             errs.append(float(ckpt["errors"][0]))
-        control_results[(agent, group, ic)] = {"iteration0_errors": errs, "missing_seeds": missing_seeds}
+        key = (agent, group, ic)
+        prior = prior_controls.get(key)
+        if not errs and prior and prior.get("iteration0_errors"):
+            control_results[key] = dict(prior)
+            control_results[key]["carried_forward"] = True
+            carried += 1
+            print(f"[collect] {agent}/{group}/{ic}: no checkpoints on disk - "
+                  f"carried forward {len(prior['iteration0_errors'])} prior seeds")
+            continue
+        control_results[key] = {"iteration0_errors": errs, "missing_seeds": missing_seeds}
         status = f"{len(errs)}/{N_SEEDS} seeds"
         if errs:
             status += f" (mean={sum(errs)/len(errs):.4f})"
         print(f"[collect] {agent}/{group}/{ic}: {status}")
 
-    out_path = OUT_DIR / "iteration0_ablation_results.pkl"
     with open(out_path, "wb") as f:
         pickle.dump({"extract": results, "controls": control_results}, f)
-    print(f"[collect] wrote {out_path}")
+    print(f"[collect] wrote {out_path}"
+          + (f" ({carried} control entries carried forward from the previous "
+             f"collect, not recomputed)" if carried else ""))
 
 
 def main():

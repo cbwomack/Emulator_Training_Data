@@ -484,3 +484,173 @@ def test_ragged_seed_trajectories_raise_a_diagnostic_error(monkeypatch):
             seed_errors_list=[seed_errs],
             seed_baseline_error_list=[[0.05, 0.05]],
         )
+
+
+# ---------------------------------------------------------------------------
+# Stage D: reference-normalized smoothness penalty
+# ---------------------------------------------------------------------------
+def test_sigma_ref_reproduces_from_the_committed_emissions_file():
+    """SIGMA_REF_SCENARIOMIP must be derivable, not a magic number."""
+    import pickle
+    import numpy as np
+    import utils_inverse as ui
+    path = "data/FaIR_IO/emissions/ScenarioMIP_tier1_CO2_CH4_N2O_Sulfur_BC.pkl"
+    with open(path, "rb") as f:
+        d = pickle.load(f)
+    for a, expected in ui.SIGMA_REF_SCENARIOMIP.items():
+        pooled = np.concatenate([np.asarray(d[s][a], dtype=float) for s in d])
+        assert abs(float(pooled.std()) - expected) < 5e-4, f"{a} sigma_ref drifted"
+
+
+def test_normalized_penalty_is_scale_free_across_agents():
+    """The whole point: one weight must apply comparable pressure to agents
+    whose native units differ by ~100x. The legacy form cannot do this."""
+    import numpy as np
+    import utils_inverse as ui
+    rng = np.random.default_rng(0)
+    T = 500
+    # Same RELATIVE roughness for each agent, scaled to its own sigma_ref.
+    U, active = {}, tuple(ui.SIGMA_REF_SCENARIOMIP)
+    for a, sig in ui.SIGMA_REF_SCENARIOMIP.items():
+        U[a] = np.cumsum(rng.normal(0, 0.01 * sig, T))
+    norm = [float(np.mean(np.diff(U[a]) ** 2) / ui.SIGMA_REF_SCENARIOMIP[a] ** 2)
+            for a in active]
+    legacy = [float(np.sum(np.diff(U[a]) ** 2)) for a in active]
+    # normalized: every agent lands within a factor of ~2 of the others
+    assert max(norm) / min(norm) < 3.0, f"normalized still scale-dependent: {norm}"
+    # legacy: spans orders of magnitude on the very same profiles
+    assert max(legacy) / min(legacy) > 1e3, f"legacy unexpectedly flat: {legacy}"
+
+
+def test_penalty_form_round_trips_through_a_real_optimization(tmp_path, synthetic_inverse_setup):
+    """A normalized-penalty run must record its form and recover true NRMSE.
+
+    Without penalty_form in meta, recover_nrmse_trajectory would subtract a
+    legacy-shaped penalty from a normalized-shaped objective and return a
+    wrong NRMSE, silently.
+    """
+    import numpy as np
+    import utils_inverse as ui
+    s = synthetic_inverse_setup
+    ckpt = os.path.join(tmp_path, "norm.pkl")
+    w = 1e-3
+    ui.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=4,
+        step_size=1e2, K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=s["agents"], active_agents=s["agents"], init_cond="constant",
+        T=s["T"], checkpoint_path=ckpt, checkpoint_every=2, preds_every=2,
+        resume_if_exists=False,
+        smoothness_weight=w, penalty_form="normalized",
+    )
+    import pickle
+    with open(ckpt, "rb") as f:
+        raw = pickle.load(f)
+    assert raw["meta"]["penalty_form"] == "normalized"
+    assert raw["meta"]["sigma_ref"] == ui.SIGMA_REF_SCENARIOMIP
+
+    nrmse = ui.recover_nrmse_trajectory(raw)
+    errors = np.asarray(raw["errors"], dtype=float)
+    assert np.all(nrmse > 0)
+    assert np.all(nrmse <= errors + 1e-9), "recovered NRMSE exceeds the objective"
+    # the subtracted amount must equal w * the NORMALIZED penalty, not the legacy one
+    k = len(errors) - 1
+    U_prev = raw["U_traj"][k - 1]
+    active = tuple(raw["meta"]["active_agents"])
+    p_norm = ui.smoothness_penalty(U_prev, "normalized", active)
+    assert abs((errors[k] - nrmse[k]) - w * p_norm) < 1e-6 * max(abs(errors[k]), 1.0)
+
+
+def test_legacy_remains_the_default_and_is_unchanged():
+    """Existing checkpoints carry no penalty_form; they must stay legacy."""
+    import numpy as np
+    import utils_inverse as ui
+    U = {"CO2": np.array([1.0, 3.0, 6.0]), "BC": np.array([0.0, 1.0, 1.5])}
+    assert ui._penalty_form_of({}) == "legacy"
+    assert ui._penalty_form_of({"meta": {}}) == "legacy"
+    assert ui._penalty_form_of({"meta": {"penalty_form": "normalized"}}) == "normalized"
+    # default arg == legacy sum over all agents
+    expected = float(np.sum(np.diff(U["CO2"]) ** 2) + np.sum(np.diff(U["BC"]) ** 2))
+    assert abs(ui.smoothness_penalty(U) - expected) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Resume config validation (added 2026-08-27, ahead of the smoothed-arm runs).
+# Resume applies the caller's step_size/momentum to the RESTORED momentum trace
+# and appends to the existing error curve, so resuming with a changed objective
+# silently splices two different problems into one trajectory. These pin the
+# guard that now refuses it.
+# ---------------------------------------------------------------------------
+
+def test_resume_refuses_a_changed_smoothness_weight(tmp_path, synthetic_inverse_setup):
+    s = synthetic_inverse_setup
+    common = dict(
+        step_size=1e2, K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=s["agents"], active_agents=s["agents"], init_cond="constant",
+        T=s["T"], checkpoint_every=1, preds_every=1,
+    )
+    path = os.path.join(tmp_path, "arm.pkl")
+    utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=2, checkpoint_path=path,
+        resume_if_exists=False, smoothness_weight=0.0, **common)
+
+    with pytest.raises(ValueError, match="refusing to resume"):
+        utils_inverse.optimize_emissions_inverse(
+            s["emis_dict"], s["params0"], num_updates=4, checkpoint_path=path,
+            resume_if_exists=True, smoothness_weight=0.1,
+            penalty_form="normalized", **common)
+
+
+def test_resume_refuses_a_changed_step_size(tmp_path, synthetic_inverse_setup):
+    s = synthetic_inverse_setup
+    common = dict(
+        K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=s["agents"], active_agents=s["agents"], init_cond="constant",
+        T=s["T"], checkpoint_every=1, preds_every=1,
+    )
+    path = os.path.join(tmp_path, "arm.pkl")
+    utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=2, checkpoint_path=path,
+        resume_if_exists=False, step_size=1e2, **common)
+
+    with pytest.raises(ValueError, match="step_size"):
+        utils_inverse.optimize_emissions_inverse(
+            s["emis_dict"], s["params0"], num_updates=4, checkpoint_path=path,
+            resume_if_exists=True, step_size=5e2, **common)
+
+
+def test_resume_still_allowed_when_only_num_updates_changes(tmp_path, synthetic_inverse_setup):
+    # The guard must not break Stage C's whole premise: extending num_updates is
+    # exactly what resuming is for, so it is deliberately not an invariant key.
+    s = synthetic_inverse_setup
+    common = dict(
+        step_size=1e2, K_inner=3, lr_inner=5e-2, wd_inner=1e-2,
+        agents=s["agents"], active_agents=s["agents"], init_cond="constant",
+        T=s["T"], checkpoint_every=1, preds_every=1,
+    )
+    path = os.path.join(tmp_path, "arm.pkl")
+    utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=2, checkpoint_path=path,
+        resume_if_exists=False, **common)
+    out = utils_inverse.optimize_emissions_inverse(
+        s["emis_dict"], s["params0"], num_updates=4, checkpoint_path=path,
+        resume_if_exists=True, **common)
+    assert out["updates_done"] == 4
+
+
+def test_resume_mismatch_helper_ignores_keys_absent_from_old_meta():
+    # Checkpoints written before a field existed carry no entry for it; those
+    # must not be reported as mismatches, or every pre-meta artifact becomes
+    # unresumable.
+    stored = {"step_size": 100.0, "momentum": 0.9}
+    incoming = {"step_size": 100.0, "momentum": 0.9,
+                "penalty_form": "normalized", "smoothness_weight": 0.1}
+    assert utils_inverse._resume_config_mismatches(stored, incoming) == []
+
+
+def test_resume_mismatch_helper_compares_dict_step_sizes_structurally():
+    a = {"CO2": 10.0, "CH4": 500.0}
+    assert utils_inverse._resume_config_mismatches(
+        {"step_size": a}, {"step_size": dict(a)}) == []
+    bad = utils_inverse._resume_config_mismatches(
+        {"step_size": a}, {"step_size": {"CO2": 10.0, "CH4": 501.0}})
+    assert len(bad) == 1 and "step_size" in bad[0]
