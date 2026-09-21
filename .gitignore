@@ -1,17 +1,40 @@
-*spatial_anomaly.nc4
-/archive/
-/data/*
-/emulator_training/
+# Large artifacts - not distributed via git.
+# data/ is published separately; see the download link in README.md.
+/data/
 /checkpoints/
 /Figures/
+/archive/
+/emulator_training/
 /docs/
+*spatial_anomaly.nc4
 
-# Exceptions
-!/data/CS3_outlook25/
-!/data/FaIR/
-!/data/FaIR_IO/
-!/data/GeoMIP/
-!/data/saved_emissions/
+# Development history kept on disk but out of the published tree.
+/Deprecated/
+
+# Working notes.
+/PROGRESS.md
+/REVISIONS.md
+/MISSING_DATA.md
+/REVIEWER_COMMENTS.md
+/OOD.md
+/SCENARIOS.md
+/MESM_SCM_CALIBRATION.md
+/CODE_RULES.md
+/SUPPLEMENT_TABLES_*.md
+/AUDIT.md
+
+# LaTeX build products (the sources in Paper/ are tracked).
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+/main.tex
+/supplement.tex
+/supplement_revision.tex
 
 # Python
 __pycache__/
@@ -42,9 +65,6 @@ env/
 venv/
 ENV/
 
-# Distribution / packaging
-.Python
-
 # Unit test / coverage
 htmlcov/
 .tox/
@@ -72,17 +92,13 @@ dmypy.json
 # OS
 .DS_Store
 
-*.tex
-*.md
-PROGRESS.md
-REVISIONS.md
-MISSING_DATA.md
-main.tex
-supplement.tex
-
 # VSCode
 *.code-workspace
 .vscode/
 
 # Dev Containers
 .devcontainer/
+
+.claude/
+
+Paper/

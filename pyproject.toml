@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emulator-training-data"
+version = "1.0.0"
+description = "Companion code to 'Optimal scenario design for climate emulation'"
+requires-python = ">=3.13"
+
+[tool.setuptools]
+# The five shared modules live in src/ but are imported by their bare names
+# (`import utils_inverse`), so they are exposed as top-level modules rather
+# than as a package.
+package-dir = {"" = "src"}
+py-modules = [
+    "paths",
+    "run_fair",
+    "utils_FaIR_JAX",
+    "utils_inverse",
+    "utils_plotting",
+]

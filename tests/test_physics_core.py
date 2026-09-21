@@ -1,15 +1,13 @@
 # ============================================================
 # Author: Christopher B. Womack
-# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Coding assistance provided by Claude Opus 5, Claude Sonnet 5, and Gemini 3.1 Pro.
 # Responsibility for the final manuscript/code lies entirely with the authors.
 # GAI tools are not listed as authors and do not bear responsibility for the
 # final outcomes.
 # ============================================================
 
 """
-Tier 1: pure JAX SCM physics-core functions (utils_FaIR_JAX.py). No I/O,
-deterministic, and the load-bearing numerical building blocks under every
-downstream pipeline function - highest value per the Phase 4 test plan.
+Tier 1: pure JAX SCM physics-core functions (utils_FaIR_JAX.py).
 
 Each test checks one of: zero-forcing/zero-emissions steady state (no
 spurious constant term in the reservoir ODEs), a single-step response against

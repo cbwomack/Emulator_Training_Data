@@ -1,6 +1,6 @@
 # ============================================================
 # Author: Christopher B. Womack
-# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Coding assistance provided by Claude Opus 5, Claude Sonnet 5, and Gemini 3.1 Pro.
 # Responsibility for the final manuscript/code lies entirely with the authors.
 # GAI tools are not listed as authors and do not bear responsibility for the
 # final outcomes.
@@ -8,21 +8,14 @@
 
 """
 Tier 2: the most-reused notebook-facing pipeline functions in utils_inverse.py
-(reuse counts from the Phase 4 planning pass: generate_eval_data in 12 files,
-generate_init_params_and_train_data in 11, generate_and_eval_baseline_emulator
-in 10, optimize_emissions_inverse in 9). These are expensive to run at full
-scale, so:
+These are expensive to run at full scale, so:
   - generate_eval_data/generate_init_params_and_train_data/generate_and_eval_
     baseline_emulator are exercised once each (module-scoped fixture) against
-    real repo data, restricted to a single agent (CO2) to keep runtime down -
-    they wrap real FaIR/JAX data loading and don't expose a "small T" knob.
+    real repo data, restricted to a single agent (CO2) to keep runtime down
   - optimize_emissions_inverse is exercised with fully synthetic emissions and
     tiny num_updates/K_inner/T, since it only needs an emis_dict shaped
     correctly, not real scenario data.
 
-These are regression/characterization tests of current behavior (output
-shape, type, and invariants like "loss stays finite" or "checkpoint round-
-trips exactly"), not correctness proofs.
 """
 import os
 
@@ -178,13 +171,6 @@ def test_optimize_emissions_inverse_checkpoint_roundtrip(tmp_path, synthetic_inv
 # ---------------------------------------------------------------
 # Resume equivalence
 # ---------------------------------------------------------------
-# The 1000 -> 2000 iteration migration resumes every existing checkpoint rather
-# than rerunning from scratch, which is only sound if resuming is EXACTLY
-# equivalent to a longer fresh run. Nothing exercised the resume_if_exists
-# branch before this. These are bit-exactness assertions, not tolerance checks:
-# the momentum trace round-trips through float32 numpy, and the inner-loop PRNG
-# key is a pure function of the seed with no step dependence, so any difference
-# at all would indicate a real defect rather than accumulated error.
 
 def test_resume_is_bit_exact_with_a_longer_fresh_run(tmp_path, synthetic_inverse_setup):
     s = synthetic_inverse_setup
@@ -250,10 +236,6 @@ def test_resume_preserves_the_pre_resume_history(tmp_path, synthetic_inverse_set
 # ---------------------------------------------------------------
 # Recovering true NRMSE from a checkpoint's recorded objective
 # ---------------------------------------------------------------
-# 'errors' stores nrmse + smoothness_weight * sum(dU)^2, so Figures 3 and 5
-# have to subtract the penalty back out. These round-trip the recovery against
-# runs whose smoothness_weight is known by construction, rather than only
-# against the frozen real checkpoints it was developed on.
 
 def _run_with_smoothness(setup, tmp_path, weight, num_updates=3):
     ckpt_path = os.path.join(tmp_path, f"ckpt_w{weight}.pkl")
@@ -407,7 +389,7 @@ def test_checkpoint_meta_records_run_config(tmp_path, synthetic_inverse_setup):
 
 
 # ---------------------------------------------------------------------------
-# Iteration-length independence of the plotting highlights (Stage E)
+# Iteration-length independence of the plotting highlights (the per-seed cache build)
 # ---------------------------------------------------------------------------
 def _sel(n_all, max_lines=11):
     """Reproduce the selection utils_plotting builds for a fading history."""
@@ -477,7 +459,7 @@ def test_ragged_seed_trajectories_raise_a_diagnostic_error(monkeypatch):
 
     seed_errs = [{"errors": [0.1] * 2001}, {"errors": [0.1] * 1401}]
     with pytest.raises(ValueError, match="partially migrated|different trajectory lengths"):
-        up.plot_rmse_comparison_single(
+        up.plot_fig03_single_forcing(
             results_list=[None],
             baseline_error_list=[None],
             agents=["CO$_2$-only"],
@@ -574,11 +556,7 @@ def test_legacy_remains_the_default_and_is_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Resume config validation (added 2026-08-27, ahead of the smoothed-arm runs).
-# Resume applies the caller's step_size/momentum to the RESTORED momentum trace
-# and appends to the existing error curve, so resuming with a changed objective
-# silently splices two different problems into one trajectory. These pin the
-# guard that now refuses it.
+# Resume config validation.
 # ---------------------------------------------------------------------------
 
 def test_resume_refuses_a_changed_smoothness_weight(tmp_path, synthetic_inverse_setup):
@@ -619,7 +597,7 @@ def test_resume_refuses_a_changed_step_size(tmp_path, synthetic_inverse_setup):
 
 
 def test_resume_still_allowed_when_only_num_updates_changes(tmp_path, synthetic_inverse_setup):
-    # The guard must not break Stage C's whole premise: extending num_updates is
+    # The guard must not break the transfer check's whole premise: extending num_updates is
     # exactly what resuming is for, so it is deliberately not an invariant key.
     s = synthetic_inverse_setup
     common = dict(

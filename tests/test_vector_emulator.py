@@ -1,24 +1,13 @@
 # ============================================================
 # Author: Christopher B. Womack
-# Coding assistance provided by Claude Sonnet 5 and Gemini 3.1 Pro.
+# Coding assistance provided by Claude Opus 5, Claude Sonnet 5, and Gemini 3.1 Pro.
 # Responsibility for the final manuscript/code lies entirely with the authors.
 # GAI tools are not listed as authors and do not bear responsibility for the
 # final outcomes.
 # ============================================================
 
 """
-Tier 3: vector-target (zonal-output) emulator coverage, converted from the
-old root-level test_vector_emulator.py (a #%%-cell script, not a real pytest
-module) into real pytest test functions.
-
-Fixes one real bug along the way: the original file's final cell called
-utils_inverse.generate_and_eval_baseline_emulator_vector, which does not
-exist anywhere in utils_inverse.py (confirmed via grep - zero definitions).
-The function that actually exists and matches every call site elsewhere in
-the codebase (e.g. 4c_evaluate_MESM_emulator.ipynb) is
-generate_and_eval_emulator_vector - same kwargs, but it also returns a 5th
-value (stats_X) when precomp_stats_X isn't supplied. This was a drop-in
-call-site fix, not a deeper API mismatch.
+Tier 3: vector-target (zonal-output) emulator 
 """
 import jax
 import jax.numpy as jnp

@@ -1,27 +1,14 @@
 # ============================================================
 # Author: Christopher B. Womack
-# Coding assistance provided by Claude Opus 5.
+# Coding assistance provided by Claude Opus 5 and Claude Sonnet 5.
 # Responsibility for the final manuscript/code lies entirely with the authors.
 # GAI tools are not listed as authors and do not bear responsibility for the
 # final outcomes.
 # ============================================================
 
 """
-Stage 6i (Figure 6 OOD extension), Phase A: the scenario registry and its two
+the out-of-objective build (Figure 6 OOD extension), Phase A: the scenario registry and its two
 constructions - the CMIP7 cross and the RCMIP loader.
-
-These pin the properties that a silent regression would otherwise destroy:
-  - the CMIP7 cross really takes GHGs from one parent and aerosols from the
-    other, and the parents it is given are pairwise distinct in aerosols (the
-    CMIP7 set has only FOUR distinct aerosol pathways, not seven - verylow and
-    verylow-overshoot differ only in CO2 FFI, so a careless donor choice
-    silently produces two identical "rungs");
-  - the RCMIP loader reads CO2 FFI, not total CO2 (the repo's 'CO2' agent is
-    CO2 FFI - see SCENARIOS.md);
-  - the RCMIP loader refuses to apply a unit divisor to an unexpected unit;
-  - piControl-branched scenarios are built with NO historical context.
-
-Everything here is emulator-free: no checkpoint, no hyperparameter file.
 """
 import importlib.util
 from pathlib import Path
@@ -34,8 +21,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture(scope="module")
 def ood():
-    """The Stage 6i script, imported by path (its filename is not an identifier)."""
-    path = PROJECT_ROOT / "scripts" / "6i_fig6_ood_extension.py"
+    """The the out-of-objective build script, imported by path (its filename is not an identifier)."""
+    path = PROJECT_ROOT / "pipeline" / "07_results" / "07h_fig6_ood_extension.py"
     spec = importlib.util.spec_from_file_location("ood_ext", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -72,8 +59,7 @@ def test_cmip7_cross_takes_ghgs_and_aerosols_from_the_right_parents(ood, eval_se
 
 
 def test_cmip7_aerosol_donors_are_pairwise_distinct(ood, eval_sets):
-    """The CMIP7 set has only four distinct aerosol pathways. If a future edit
-    picks two donors from the same group, the rungs become duplicates."""
+    """The CMIP7 set has only four distinct aerosol pathways."""
     donors = {d: ood._cmip7_agent_arrays(eval_sets, d) for d in ood.CMIP7_AEROSOL_DONORS}
     names = list(donors)
     for i in range(len(names)):
@@ -108,8 +94,7 @@ def test_cmip7_cross_rejects_length_mismatched_parents(ood, eval_sets):
 # ---------------------------
 
 def test_rcmip_reads_co2_ffi_not_total_co2(ood):
-    """The repo's 'CO2' agent is CO2 FFI. Reading the bare 'Emissions|CO2' total
-    overstates it by several percent - the bug this stage fixed."""
+    """The repo's 'CO2' agent is CO2 FFI."""
     assert ood.RCMIP_VARIABLES["CO2"] == "Emissions|CO2|MAGICC Fossil and Industrial"
 
     years = np.arange(2024, 2101)
@@ -134,7 +119,7 @@ def test_rcmip_missing_row_raises(ood):
 
 
 def test_co2_only_scenarios_have_zero_non_co2_emissions(ood):
-    """esm-bell-* is CO2-only in the source data - asserted, not assumed."""
+    """esm-bell-* is CO2-only in the source data."""
     years = np.arange(1850, 2050)
     for agent in ("CH4", "N2O", "Sulfur", "BC"):
         v = ood.interp_rcmip("esm-bell-1000PgC", "idealised", agent, years)
@@ -171,9 +156,8 @@ def test_no_historical_scenario_starts_from_a_clean_slate(ood, eval_sets):
 
 
 def test_historical_prepended_scenario_does_not_start_from_zero(ood, eval_sets):
-    """The contrapositive: a scenario that prepends historical must carry the
-    accumulated context, or build_dataset_from_runfair_dict's allowlist trap has
-    silently dropped it."""
+    """A scenario that prepends historical must carry the
+    accumulated context"""
     entry = next(e for e in ood.SCENARIOS if e["tag"] == "ssp370-lowNTCF")
     d = ood.build_features(entry, eval_sets)
     cum_col = ood.AGENTS.index("CO2") * 5 + 4
@@ -246,8 +230,7 @@ def test_method_choice_uses_offset_only_where_the_pathway_crosses_zero(ood):
 
 
 def test_method_choice_refuses_unverified_branches(ood):
-    """aneris' tree has branches this roster never reaches; guessing there is worse
-    than failing loudly."""
+    """aneris' tree has branches this roster never reaches"""
     years = np.arange(2023, 2101)
     model = np.linspace(40.0, 5.0, len(years))
     with pytest.raises(ValueError, match="history is zero"):
@@ -272,17 +255,6 @@ def test_ssp534_over_co2_is_the_one_offset_case(ood, eval_sets):
 
 
 def test_harmonization_closes_the_inventory_step(ood, eval_sets):
-    """The point of the exercise. Note what is and is not claimed.
-
-    The method pins the pathway to the historical inventory AT THE HARMONIZATION
-    YEAR (2023); it says nothing directly about the year-over-year step into 2024.
-    Those usually move together, but not always: rcp45's raw CO2 happens to cross
-    the historical value between 2023 and 2024, so its raw 2024 step is 0.2% by
-    coincidence and harmonization takes it to 1.0%. That is not a regression - the
-    2023 inventory mismatch it removes is real and the 2024 step stays negligible.
-    So: every species must land within 5% at the handoff, and every species whose
-    raw step was actually large must shrink.
-    """
     _yh, eh = ood.utils_inverse.extract_years_and_emis(
         eval_sets["Tier 1"]["historical"], agents=ood.AGENTS
     )
