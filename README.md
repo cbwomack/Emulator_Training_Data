@@ -1,8 +1,10 @@
 # Optimal scenario design for climate emulation
 
-Companion code to "Optimal scenario design for climate emulation" to answer the question, "What is the optimal set of training data for a climate emulator?" quantitatively.
+Companion code to "Optimal scenario design for climate emulation" to answer the question, "What is the optimal set of training data for a climate emulator?"
 
-We use a differentiable Simple Climate Model (SCM) to compute the optimal set of training data for a neural-network climate emulator. The SCM is written in [JAX](https://docs.jax.dev/en/latest/quickstart.html), so the loss of an emulator trained on a set of emissions can be differentiated with respect to those emissions, and the training data itself optimized by gradient descent.
+We use a differentiable Simple Climate Model (SCM) to compute the optimal set of training data for a neural-network climate emulator of that SCM. The SCM is written in [JAX](https://docs.jax.dev/en/latest/quickstart.html) and based on FaIRv2.0.0 [(Leach et al., 2020)](https://gmd.copernicus.org/articles/14/3007/2021/). The model being written in JAX makes it automatically differentiable, i.e., we can calculate gradients through the entire chain from data generation/simulation through to emulator training and evaluation. We use this to calculate the sensitivity of the emulator evaluation loss with respect to the input training emissions for the emulator. We take this gradient and optimize the training data itself via gradient descent, maximizing emulator performance on the evaluation dataset. See Figure 1 of the [preprint manuscript](https://arxiv.org/abs/2606.19302) for a graphical overview of the optimization process.
+
+Our results indicate that the optimization process yields a new set of emissions scenarios that are extremely distinct from any standard climate scenarios (e.g., ScenarioMIP). Training an emulator with these optimized scenarios gives widespread extrapolative performance improvements, suggesting that the optimized emissions pathways may isolate more physically salient features than standard scenarios. You can check out the full results [here]((https://arxiv.org/abs/2606.19302))!
 
 ## Setup
 
@@ -83,9 +85,7 @@ Unit tests for the following components: the pure JAX SCM physics core, the most
 
 ## Data
 
-`data/` (required to run this project) and `checkpoints/` (saved output from this project) are not hosted on git. Download the archive and unpack it at the repository root:
-
-**Data archive: [ZENODO DOI — to be added on publication]**
+Only a few, small files from `data/` (required to run this project) are hosted on git. The rest of the data, along with `checkpoints/` (saved output from this project), can be found on [Zenodo](doi.org/10.5281/zenodo.22875971):
 
 ```
 data/
