@@ -2,7 +2,7 @@
 # data/ is published separately; see the download link in README.md.
 /data/
 /checkpoints/
-/Figures/
+/Figures/*
 /archive/
 /emulator_training/
 /docs/
@@ -102,3 +102,20 @@ dmypy.json
 .claude/
 
 Paper/
+!/Figures/fig02_co2_example.pdf
+!/Figures/fig03_single_forcing.pdf
+!/Figures/fig04_scm_summary.pdf
+!/Figures/fig05_multi_forcing.pdf
+!/Figures/fig06_individual_effects.pdf
+!/Figures/fig07_emic_summary.pdf
+!/Figures/SI_baseline_convergence.png
+!/Figures/SI_SCM_MESM.pdf
+!/Figures/SI_IC.pdf
+!/Figures/SI_arch_constant.pdf
+!/Figures/SI_arch_sine.pdf
+!/Figures/SI_feat_constant.pdf
+!/Figures/SI_feat_sine.pdf
+!/Figures/SI_extended_results.pdf
+!/Figures/SI_seed_emissions_comparison.pdf
+!/Figures/fig01_optimization_ABCD.pdf
+/pipeline/08_plotting/cover/

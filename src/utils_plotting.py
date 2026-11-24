@@ -1135,7 +1135,7 @@ def _fig07_top_panel_data() -> tuple[list[np.ndarray], list[np.ndarray]]:
 
 
 def plot_fig07_emic_summary(seed_idx: list[int] | None = None, save: bool = False,
-                            figname: str = "fig07_emic_summary"):
+                            figname: str = "fig07_emic_summary", improved_bars: str = "solid"):
     """
     Figure 7: optimized emissions and MESM temperature response for the constant
     and sine initial guesses (a, b), over a bar chart of emulator skill change
@@ -1146,6 +1146,10 @@ def plot_fig07_emic_summary(seed_idx: list[int] | None = None, save: bool = Fals
             sweep - an arbitrary, unselected sample rather than a chosen subset.
         save: write the figure to Figures/ as both PDF and PNG.
         figname: stem of the output file.
+        improved_bars: how to draw the (c) bars whose median beats the baseline:
+            "solid" like every other bar (paper), "only" draws just those bars and
+            leaves the other slots empty, "faded" draws every bar with those at 30%
+            opacity. Axes, labels and legend are the same in every mode.
 
     Returns:
         (fig, axd) from plt.subplot_mosaic, so a notebook cell can display it.
@@ -1258,15 +1262,23 @@ def plot_fig07_emic_summary(seed_idx: list[int] | None = None, save: bool = Fals
         q3 = np.percentile(per_seed, 75, axis=0)
         diff_err = np.vstack([diff_values - q1, q3 - diff_values])
 
+        # (bars to draw, alpha) per bar() call; NaN draws nothing but keeps the bar's slot.
+        improved = diff_values > 0
+        layers = {"solid": [(np.full(n_total, True), None)],
+                  "only": [(improved, None)],
+                  "faded": [(~improved, None), (improved, 0.3)]}[improved_bars]
+
         offset = (opt_idx - n_opts / 2) * bar_width + (bar_width / 2)
-        bars = ax_bar.bar(x_positions + offset, diff_values, yerr=diff_err,
-                          error_kw=dict(capsize=2, elinewidth=1),
-                          label=legend_labels[opt_idx], width=bar_width,
-                          color=colors[opt_idx], edgecolor='black', linewidth=0.7, zorder=3)
-        # Bars past the y-limit are hatched rather than clipped silently.
-        for bar, val in zip(bars, diff_values):
-            if val < bar_ylim[0] or val > bar_ylim[1]:
-                bar.set_hatch('//')
+        for shown, alpha in layers:
+            values = np.where(shown, diff_values, np.nan)
+            bars = ax_bar.bar(x_positions + offset, values, yerr=np.where(shown, diff_err, np.nan),
+                              error_kw=dict(capsize=2, elinewidth=1, alpha=alpha),
+                              label=legend_labels[opt_idx], width=bar_width, alpha=alpha,
+                              color=colors[opt_idx], edgecolor='black', linewidth=0.7, zorder=3)
+            # Bars past the y-limit are hatched rather than clipped silently.
+            for bar, val in zip(bars, values):
+                if val < bar_ylim[0] or val > bar_ylim[1]:
+                    bar.set_hatch('//')
 
     ax_bar.set_xticks(x_positions)
     ax_bar.set_xticklabels(labels, rotation=90, ha='center', va='top', fontsize=10)
@@ -1316,6 +1328,56 @@ def plot_fig07_emic_summary(seed_idx: list[int] | None = None, save: bool = Fals
 
     return fig, axd
 
+
+def plot_fig07_presentation(seed_idx: list[int] | None = None, save: bool = False,
+                            figname: str = "fig07_ppt") -> None:
+    """Figure 7 as two slide builds with (a), (b) and every axis of (c) unchanged:
+    1_improved shows only the (c) bars where the optimized emulator beats the baseline,
+    2_all adds every other bar, with the bars from 1_improved faded to 30% opacity.
+    Frames go to Figures/presentation/{figname}_{build}.{png,pdf}.
+    """
+    out_dir = FIGURES_DIR / "presentation"
+    for build, improved_bars in [("1_improved", "only"), ("2_all", "faded")]:
+        fig, _ = plot_fig07_emic_summary(seed_idx, improved_bars=improved_bars)
+        if save:
+            out_dir.mkdir(exist_ok=True)
+            fig.savefig(out_dir / f"{figname}_{build}.pdf", bbox_inches="tight")
+            fig.savefig(out_dir / f"{figname}_{build}.png", bbox_inches="tight", dpi=300)
+
+# Figure 6 configuration, shared by the paper figure and its slide version.
+_FIG6_COLOR_MAP = {'Opt. Tier 1': cm.bamakoS(15), 'Opt. DAMIP': cm.hawaiiS(3),
+                   'Opt. GeoMIP': cm.budaS(3), 'Opt. All': cm.osloS(2)}
+_FIG6_BASELINE_COLOR = cm.lipariS(5)
+_FIG6_DISPLAY_LABEL = {'Opt. Tier 1': 'Opt. Prio. 1', 'Baseline Em.': 'Baseline Em.',
+                       'Opt. DAMIP': 'Opt. DAMIP', 'Opt. GeoMIP': 'Opt. GeoMIP', 'Opt. All': 'Opt. All'}
+_FIG6_SKIP_TRAIN = ('Opt. Tier 2', 'Opt. DECK', 'Opt. CS3')
+
+_FIG6_PANEL_KIND = {"Left1": "in_obj", "Left2": "in_obj", "Left3": "in_obj",
+                    "Left4": "ood", "Left5": "ood", "Left6": "ood"}
+_FIG6_PANEL_SCENARIO = {"Left1": "M_GHG", "Left2": "M_AER", "Left3": "G6sulfur",
+                        "Left4": "H-ext-VLaer", "Left5": "ssp534-over", "Left6": "esm-bell-2000PgC"}
+_FIG6_OOD_XLIM = {"H-ext-VLaer": (2024, 2100), "ssp534-over": (2024, 2100),
+                  "esm-bell-2000PgC": (0, 200)}
+_FIG6_OOD_RELATIVE_X = {"esm-bell-2000PgC"}
+_FIG6_PANEL_LABELS = {
+    "Left1": r"(a) Medium GHG emissions, greenhouse gases only (DAMIP: $\it{M}$-$\it{GHG}$)",
+    "Left2": r"(b) Medium GHG emissions, aerosols only (DAMIP: $\it{M}$-$\it{aer}$)",
+    "Left3": r"(c) High GHG emissions with sulfur injection (GeoMIP: $\it{G6sulfur}$)",
+    "Left4": r"(d) High GHG emissions, very-low aerosols (RAMIP analog: $\it{H}$-$\it{ext}$-$\it{VL}$-$\it{aer}$)",
+    "Left5": r"(e) Overshoot scenario (ScenarioMIP-CMIP6: $\it{ssp534}$-$\it{over}$)",
+    "Left6": r"(f) piControl-branched CO$_2$-only bell-shaped emissions (ZECMIP: $\it{esm}$-$\it{bell}$-$\it{2000PgC}$)",
+}
+# (group name, scenarios, row shading) for the R^2 forest plot, top to bottom.
+_FIG6_SCENARIO_GROUPS = [
+    ("DAMIP",                 ["M_GHG", "M_AER"],                                  "dark"),
+    ("GeoMIP",                ["G6sulfur"],                                        "dark"),
+    ("RAMIP analogs (CMIP7)", ["H-ext-Maer", "H-ext-VLaer", "H-ext-Laer"],         "light"),
+    ("CMIP5",                 ["rcp45", "rcp85"],                                  None),
+    ("CMIP6",                 ["ssp370-lowNTCF", "ssp370-126aer", "ssp534-over"],  None),
+    ("ZECMIP",                ["esm-bell-1000PgC", "esm-bell-2000PgC"],            None),
+]
+
+
 def _fig6_seed_stack(seed_cache, getter, scen_plot, lo_idx, hi_idx):
     """Stack one trajectory across seeds -> (n_seeds, n_times).
 
@@ -1338,6 +1400,140 @@ def _fig6_ood_seed_stack(ood_seed_traj, tag, label):
     return ood_seed_traj.get(tag, {}).get(label)
 
 
+def _fig6_draw_panel(
+    ax_plot,
+    ax_label: str,
+    y_true_ind_effects: dict,
+    y_hat_baseline: dict,
+    y_hat_ind_effects: dict,
+    train_scenarios_ind_effects: list[str],
+    seed_cache: dict | None = None,
+    aggregation: str = AGGREGATION_DEFAULT,
+    ood_scenarios: dict | None = None,
+    ood_seed_traj: dict | None = None,
+) -> tuple[dict, tuple[float, float]]:
+  """Draw one Figure 6 trajectory panel (SCM truth, baseline and optimized emulators).
+
+  Returns ({series key: [artists]}, (y_min, y_max)). Series keys are 'SCM-projected',
+  'Baseline Em.' or a train-scenario key, so callers can toggle each series.
+  """
+  scen_plot = _FIG6_PANEL_SCENARIO[ax_label]
+  artists: dict[str, list] = {}
+  y_min, y_max = np.inf, -np.inf
+
+  def _track(*arrays):
+      nonlocal y_min, y_max
+      for arr in arrays:
+          arr = np.asarray(arr)
+          if arr.size == 0:
+              continue
+          y_min = min(y_min, float(np.nanmin(arr)))
+          y_max = max(y_max, float(np.nanmax(arr)))
+
+  def _add(key, *new):
+      artists.setdefault(key, []).extend(new)
+
+  if _FIG6_PANEL_KIND[ax_label] == "in_obj":
+      plot_len = len(y_true_ind_effects["All"]["M_GHG"])
+      x_vals = np.arange(1850, 2151)
+
+      truth = y_true_ind_effects['All'][scen_plot][100:plot_len]
+      _add('SCM-projected', *ax_plot.plot(x_vals, truth, label='SCM-projected', c='black', ls='--', lw=2, alpha = 0.8))
+      _track(truth)
+
+      b_stack = (_fig6_seed_stack(seed_cache, lambda r: r['y_hat_baseline'], scen_plot, 100, plot_len)
+                 if seed_cache else None)
+      if b_stack is not None:
+          b_c, b_lo, b_hi = _aggregate_seeds(b_stack, aggregation, mean_band="minmax")
+          _add('Baseline Em.',
+               ax_plot.fill_between(x_vals, b_lo, b_hi, color=_FIG6_BASELINE_COLOR, alpha=0.18,
+                                    lw=0, zorder=1),
+               *ax_plot.plot(x_vals, b_c, label='Baseline Em.', lw=2, ls="-", c=_FIG6_BASELINE_COLOR))
+          _track(b_lo, b_hi)
+      else:
+          base = y_hat_baseline['All'][scen_plot][100:plot_len]
+          _add('Baseline Em.',
+               *ax_plot.plot(x_vals, base, label='Baseline Em.', lw=2, ls="-", c=_FIG6_BASELINE_COLOR))
+          _track(base)
+
+      for train in reversed(train_scenarios_ind_effects):
+          if train in _FIG6_SKIP_TRAIN:
+              continue
+          train_label = _FIG6_DISPLAY_LABEL.get(train, train)
+          alpha = 0.6
+          zorder = 0
+          ls = (0, (5, 4))
+          if train == 'Opt. All':
+              alpha = 1
+              zorder = 10
+              ls = '-'
+          o_stack = (_fig6_seed_stack(seed_cache, lambda r: r['y_hat'].get(train),
+                                      scen_plot, 100, plot_len)
+                     if seed_cache else None)
+          if o_stack is not None:
+              o_c, o_lo, o_hi = _aggregate_seeds(o_stack, aggregation, mean_band="minmax")
+              _add(train,
+                   ax_plot.fill_between(x_vals, o_lo, o_hi, color=_FIG6_COLOR_MAP[train],
+                                        alpha=0.18, lw=0, zorder=zorder),
+                   *ax_plot.plot(x_vals, o_c, alpha=alpha, label=train_label, zorder=zorder + 1,
+                                 lw=2, ls=ls, color=_FIG6_COLOR_MAP[train]))
+              _track(o_lo, o_hi)
+          else:
+              opt = y_hat_ind_effects[train]['All'][scen_plot][100:plot_len]
+              _add(train, *ax_plot.plot(x_vals, opt, alpha=alpha, label=train_label, zorder=zorder,
+                                        lw=2, ls=ls, color=_FIG6_COLOR_MAP[train]))
+              _track(opt)
+
+      ax_plot.set_xlim([1850, 2150])
+
+  else:  # kind == "ood"
+      tag = scen_plot
+      scen = ood_scenarios.get(tag)
+      if scen is None:
+          return artists, (y_min, y_max)
+      years = scen["years"]
+      x_plot = (years - years.min()) if tag in _FIG6_OOD_RELATIVE_X else years
+      xlim = _FIG6_OOD_XLIM[tag]
+      vis = (x_plot >= xlim[0]) & (x_plot <= xlim[1])
+
+      _add('SCM-projected', *ax_plot.plot(x_plot, scen["y_scm"], label='SCM-projected', c='black',
+                                          ls='--', lw=2, alpha=0.8))
+      _track(scen["y_scm"][vis])
+
+      b_stack = _fig6_ood_seed_stack(ood_seed_traj, tag, "Baseline Em.")
+      if b_stack is not None:
+          b_c, b_lo, b_hi = _aggregate_seeds(b_stack, aggregation, mean_band="minmax")
+          _add('Baseline Em.',
+               ax_plot.fill_between(x_plot, b_lo, b_hi, color=_FIG6_BASELINE_COLOR, alpha=0.18, lw=0, zorder=1),
+               *ax_plot.plot(x_plot, b_c, label='Baseline Em.', lw=2, ls="-", c=_FIG6_BASELINE_COLOR))
+          _track(b_lo[vis], b_hi[vis])
+
+      for train in reversed(train_scenarios_ind_effects):
+          if train in _FIG6_SKIP_TRAIN:
+              continue
+          train_label = _FIG6_DISPLAY_LABEL.get(train, train)
+          alpha, zorder, ls = (1, 10, '-') if train == 'Opt. All' else (0.85, 5, (0, (5, 4)))
+          o_stack = _fig6_ood_seed_stack(ood_seed_traj, tag, train)
+          if o_stack is None:
+              continue
+          o_c, o_lo, o_hi = _aggregate_seeds(o_stack, aggregation, mean_band="minmax")
+          _add(train,
+               ax_plot.fill_between(x_plot, o_lo, o_hi, color=_FIG6_COLOR_MAP[train], alpha=0.18, lw=0, zorder=zorder),
+               *ax_plot.plot(x_plot, o_c, alpha=alpha, label=train_label, zorder=zorder + 1,
+                             lw=2, ls=ls, color=_FIG6_COLOR_MAP[train]))
+          _track(o_lo[vis], o_hi[vis])
+
+      ax_plot.set_xlim(xlim)
+
+  ax_plot.grid(linestyle='--', alpha=0.3, zorder=0)
+  ax_plot.text(
+          0.015, 0.915, _FIG6_PANEL_LABELS[ax_label], transform=ax_plot.transAxes,
+          ha="left", va="top", fontsize=11, fontweight="bold", zorder=20,
+          bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+        )
+  return artists, (y_min, y_max)
+
+
 def plot_ood_r2_forest(
     ax,
     r2_table: list[dict],
@@ -1354,8 +1550,12 @@ def plot_ood_r2_forest(
     legend_valign_group: str | None = None,
     within_group_gap: float = 0.8,
     between_group_gap: float = 1.4,
-) -> None:
+    legend: bool = True,
+    title_fontsize: float = 14,
+) -> dict:
   """Median R^2 + IQR forest plot across scenarios x emulator configs.
+
+  Returns {emulator: [artists]} so callers can toggle each configuration.
   """
   baseline_color = baseline_color if baseline_color is not None else cm.lipariS(5)
   display_label = display_label or {}
@@ -1372,6 +1572,7 @@ def plot_ood_r2_forest(
 
   n_emu = len(emulators)
   dodge = np.linspace(-0.32, 0.32, n_emu)
+  artists = {emu: [] for emu in emulators}
 
   def _clip(v):
       return max(dmin, min(dmax, v))
@@ -1415,15 +1616,15 @@ def plot_ood_r2_forest(
           y = row_y + dodge[j]
           color = series_color[emu]
           if med >= dmin:
-              ax.plot([_clip(lo), _clip(hi)], [y, y], color=color, lw=2.5,
-                      alpha=0.55, solid_capstyle="round", zorder=2)
-              ax.plot(_clip(med), y, "o", color=color, ms=5.5, zorder=3,
-                      markeredgecolor="white", markeredgewidth=0.5)
+              artists[emu] += ax.plot([_clip(lo), _clip(hi)], [y, y], color=color, lw=2.5,
+                                      alpha=0.55, solid_capstyle="round", zorder=2)
+              artists[emu] += ax.plot(_clip(med), y, "o", color=color, ms=5.5, zorder=3,
+                                      markeredgecolor="white", markeredgewidth=0.5)
           else:
-              ax.plot(_clip(med), y, "o", color=color, ms=5.5, zorder=3,
-                      markeredgecolor="white", markeredgewidth=0.5)
-              ax.text(_clip(med) + 0.03, y, f"{med:.1f}", fontsize=7,
-                      va="center", ha="left", color=color)
+              artists[emu] += ax.plot(_clip(med), y, "o", color=color, ms=5.5, zorder=3,
+                                      markeredgecolor="white", markeredgewidth=0.5)
+              artists[emu].append(ax.text(_clip(med) + 0.03, y, f"{med:.1f}", fontsize=7,
+                                          va="center", ha="left", color=color))
 
   if group_labels:
       for i in range(1, len(scenarios)):
@@ -1459,6 +1660,16 @@ def plot_ood_r2_forest(
                        fontsize=11, fontweight="bold", color="#333333")
           idx += n_rows
 
+  if title is not None:
+      title_artist = ax.text(
+              0.03, 0.985, title, transform=ax.transAxes,
+              ha="left", va="top", fontsize=title_fontsize, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
+            )
+
+  if not legend:
+      return artists
+
   handles = [Line2D([0], [0], marker="o", color=series_color[emu], lw=2.5,
                     label=display_label.get(emu, emu), markersize=5.5)
              for emu in emulators]
@@ -1468,12 +1679,6 @@ def plot_ood_r2_forest(
 
   legend_x, legend_y_below_title = 0.03, 0.90
   if title is not None:
-      title_artist = ax.text(
-              0.03, 0.985, title, transform=ax.transAxes,
-              ha="left", va="top", fontsize=14, fontweight="bold",
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
-
       ax.figure.canvas.draw()
       renderer = ax.figure.canvas.get_renderer()
       bbox_disp = title_artist.get_bbox_patch().get_window_extent(renderer=renderer)
@@ -1497,6 +1702,7 @@ def plot_ood_r2_forest(
   ax.legend(handles=handles, loc=legend_loc, bbox_to_anchor=legend_anchor,
             fontsize=11, title="Emulator configuration",
             title_fontsize=11, framealpha=0.85)
+  return artists
 
 
 def plot_fig06_individual_effects(
@@ -1527,31 +1733,6 @@ def plot_fig06_individual_effects(
       ["YLabel", "Left6", "Right", "Text"],
   ]
 
-
-  color_map = {'Opt. Tier 1':cm.bamakoS(15), 'Opt. DAMIP':cm.hawaiiS(3), 'Opt. GeoMIP': cm.budaS(3), 'Opt. All':cm.osloS(2)}
-  baseline_color = cm.lipariS(5)
-  display_label = {'Opt. Tier 1': 'Opt. Prio. 1', 'Baseline Em.': 'Baseline Em.',
-                    'Opt. DAMIP': 'Opt. DAMIP', 'Opt. GeoMIP': 'Opt. GeoMIP', 'Opt. All': 'Opt. All'}
-
-  panel_kind = {"Left1": "in_obj", "Left2": "in_obj", "Left3": "in_obj",
-                "Left4": "ood", "Left5": "ood", "Left6": "ood"}
-  panel_scenario = {"Left1": "M_GHG", "Left2": "M_AER", "Left3": "G6sulfur",
-                     "Left4": "H-ext-VLaer", "Left5": "ssp534-over", "Left6": "esm-bell-2000PgC"}
-
-  ood_xlim = {"H-ext-VLaer": (2024, 2100), "ssp534-over": (2024, 2100),
-              "esm-bell-2000PgC": (0, 200)}
-  ood_relative_x = {"esm-bell-2000PgC"}
-  panel_labels = {
-      "Left1": r"(a) Medium GHG emissions, greenhouse gases only (DAMIP: $\it{M}$-$\it{GHG}$)",
-      "Left2": r"(b) Medium GHG emissions, aerosols only (DAMIP: $\it{M}$-$\it{aer}$)",
-      "Left3": r"(c) High GHG emissions with sulfur injection (GeoMIP: $\it{G6sulfur}$)",
-      "Left4": r"(d) High GHG emissions, very-low aerosols (RAMIP analog: $\it{H}$-$\it{ext}$-$\it{VL}$-$\it{aer}$)",
-      "Left5": r"(e) Overshoot scenario (ScenarioMIP-CMIP6: $\it{ssp534}$-$\it{over}$)",
-      "Left6": r"(f) piControl-branched CO$_2$-only bell-shaped emissions (ZECMIP: $\it{esm}$-$\it{bell}$-$\it{2000PgC}$)",
-  }
-  plot_len = len(y_true_ind_effects["All"]["M_GHG"])
-  x_vals = np.arange(1850, 2151)
-
   if ppt:
       figsize = (16.81, 7)
   else:
@@ -1577,130 +1758,25 @@ def plot_fig06_individual_effects(
             "Pass ood_scenarios/ood_seed_traj from utils_inverse.load_fig6_ood_data.")
 
   y_min, y_max = np.inf, -np.inf
-  def _track(*arrays):
-      nonlocal y_min, y_max
-      for arr in arrays:
-          arr = np.asarray(arr)
-          if arr.size == 0:
-              continue
-          y_min = min(y_min, float(np.nanmin(arr)))
-          y_max = max(y_max, float(np.nanmax(arr)))
-
-  for ax_label, scen_plot in panel_scenario.items():
-      ax_plot = ax_dict[ax_label]
-      kind = panel_kind[ax_label]
-
-      if kind == "ood" and not has_ood:
+  for ax_label in _FIG6_PANEL_SCENARIO:
+      if _FIG6_PANEL_KIND[ax_label] == "ood" and not has_ood:
           continue
-
-      if kind == "in_obj":
-          truth = y_true_ind_effects['All'][scen_plot][100:plot_len]
-          ax_plot.plot(x_vals, truth, label='SCM-projected', c='black', ls='--', lw=2, alpha = 0.8)
-          _track(truth)
-
-          if seed_cache:
-              b_stack = _fig6_seed_stack(
-                  seed_cache, lambda r: r['y_hat_baseline'], scen_plot, 100, plot_len)
-              if b_stack is not None:
-                  b_c, b_lo, b_hi = _aggregate_seeds(b_stack, aggregation, mean_band="minmax")
-                  ax_plot.fill_between(x_vals, b_lo, b_hi, color=cm.lipariS(5), alpha=0.18,
-                                       lw=0, zorder=1)
-                  ax_plot.plot(x_vals, b_c, label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
-                  _track(b_lo, b_hi)
-              else:
-                  base = y_hat_baseline['All'][scen_plot][100:plot_len]
-                  ax_plot.plot(x_vals, base, label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
-                  _track(base)
-          else:
-              base = y_hat_baseline['All'][scen_plot][100:plot_len]
-              ax_plot.plot(x_vals, base, label='Baseline Em.', lw=2, ls="-", c=cm.lipariS(5))
-              _track(base)
-
-          for train in reversed(train_scenarios_ind_effects):
-              train_label = train
-              if train in ['Opt. Tier 2','Opt. DECK', 'Opt. CS3']:
-                  continue
-              alpha = 0.6
-              zorder = 0
-              ls = (0, (5, 4))
-              if train == 'Opt. All':
-                  alpha = 1
-                  zorder = 10
-                  ls = '-'
-              elif train == 'Opt. Tier 1':
-                  train_label = 'Opt. Prio. 1'
-              o_stack = (_fig6_seed_stack(seed_cache, lambda r: r['y_hat'].get(train),
-                                          scen_plot, 100, plot_len)
-                         if seed_cache else None)
-              if o_stack is not None:
-                  o_c, o_lo, o_hi = _aggregate_seeds(o_stack, aggregation, mean_band="minmax")
-                  ax_plot.fill_between(x_vals, o_lo, o_hi, color=color_map[train],
-                                       alpha=0.18, lw=0, zorder=zorder)
-                  ax_plot.plot(x_vals, o_c, alpha=alpha, label=train_label, zorder=zorder + 1,
-                               lw=2, ls=ls, color=color_map[train])
-                  _track(o_lo, o_hi)
-              else:
-                  opt = y_hat_ind_effects[train]['All'][scen_plot][100:plot_len]
-                  ax_plot.plot(x_vals, opt, alpha=alpha, label=train_label, zorder=zorder, lw=2, ls=ls, color=color_map[train])
-                  _track(opt)
-
-          ax_plot.set_xlim([1850, 2150])
-          if ax_label in ("Left1", "Left2"):
-              ax_plot.sharex(ax_dict["Left3"])
-              ax_plot.tick_params(axis="x", bottom=False, labelbottom=False)
-
-      else:  # kind == "ood"
-          tag = scen_plot
-          scen = ood_scenarios.get(tag)
-          if scen is None:
-              continue
-          years = scen["years"]
-          x_plot = (years - years.min()) if tag in ood_relative_x else years
-          xlim = ood_xlim[tag]
-          vis = (x_plot >= xlim[0]) & (x_plot <= xlim[1])
-
-          ax_plot.plot(x_plot, scen["y_scm"], label='SCM-projected', c='black',
-                       ls='--', lw=2, alpha=0.8)
-          _track(scen["y_scm"][vis])
-
-          b_stack = _fig6_ood_seed_stack(ood_seed_traj, tag, "Baseline Em.")
-          if b_stack is not None:
-              b_c, b_lo, b_hi = _aggregate_seeds(b_stack, aggregation, mean_band="minmax")
-              ax_plot.fill_between(x_plot, b_lo, b_hi, color=baseline_color, alpha=0.18, lw=0, zorder=1)
-              ax_plot.plot(x_plot, b_c, label='Baseline Em.', lw=2, ls="-", c=baseline_color)
-              _track(b_lo[vis], b_hi[vis])
-
-          for train in reversed(train_scenarios_ind_effects):
-              if train in ['Opt. Tier 2', 'Opt. DECK', 'Opt. CS3']:
-                  continue
-              train_label = display_label.get(train, train)
-              alpha, zorder, ls = (1, 10, '-') if train == 'Opt. All' else (0.85, 5, (0, (5, 4)))
-              o_stack = _fig6_ood_seed_stack(ood_seed_traj, tag, train)
-              if o_stack is None:
-                  continue
-              o_c, o_lo, o_hi = _aggregate_seeds(o_stack, aggregation, mean_band="minmax")
-              ax_plot.fill_between(x_plot, o_lo, o_hi, color=color_map[train], alpha=0.18, lw=0, zorder=zorder)
-              ax_plot.plot(x_plot, o_c, alpha=alpha, label=train_label, zorder=zorder + 1,
-                           lw=2, ls=ls, color=color_map[train])
-              _track(o_lo[vis], o_hi[vis])
-
-          ax_plot.set_xlim(xlim)
-          if ax_label == "Left4":
-              ax_plot.tick_params(axis="x", bottom=False, labelbottom=False)
-
-      ax_plot.grid(linestyle='--', alpha=0.3, zorder=0)
-      ax_plot.text(
-              0.015, 0.915, panel_labels[ax_label], transform=ax_plot.transAxes,
-              ha="left", va="top", fontsize=11, fontweight="bold", zorder=20,
-              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.9)
-            )
+      _, (lo, hi) = _fig6_draw_panel(
+          ax_dict[ax_label], ax_label, y_true_ind_effects, y_hat_baseline, y_hat_ind_effects,
+          train_scenarios_ind_effects, seed_cache, aggregation, ood_scenarios, ood_seed_traj)
+      y_min, y_max = min(y_min, lo), max(y_max, hi)
+      if ax_label in ("Left1", "Left2"):
+          ax_dict[ax_label].sharex(ax_dict["Left3"])
+          ax_dict[ax_label].tick_params(axis="x", bottom=False, labelbottom=False)
+      elif ax_label == "Left4":
+          ax_dict[ax_label].tick_params(axis="x", bottom=False, labelbottom=False)
 
   if np.isfinite(y_min) and np.isfinite(y_max):
       data_range = y_max - y_min
       bottom_pad = 0.04 * data_range
       top_pad = 0.16 * data_range
       shared_ylim = [y_min - bottom_pad, y_max + top_pad]
-      for ax_label in panel_scenario:
+      for ax_label in _FIG6_PANEL_SCENARIO:
           ax_dict[ax_label].set_ylim(shared_ylim)
 
 
@@ -1727,24 +1803,16 @@ def plot_fig06_individual_effects(
 
   # -- Right column: median R^2 + IQR forest plot across all scenarios/configs --
   if r2_table:
-      scenario_groups = [
-          ("DAMIP",                 ["M_GHG", "M_AER"],                            "dark"),
-          ("GeoMIP",                ["G6sulfur"],                                  "dark"),
-          ("RAMIP analogs (CMIP7)", ["H-ext-Maer", "H-ext-VLaer", "H-ext-Laer"], "light"),
-          ("CMIP5",                 ["rcp45", "rcp85"],                            None),
-          ("CMIP6",                 ["ssp370-lowNTCF", "ssp370-126aer", "ssp534-over"], None),
-          ("ZECMIP",                ["esm-bell-1000PgC", "esm-bell-2000PgC"],      None),
-      ]
-      ood_forest_scenarios = [s for _, scens, _ in scenario_groups for s in scens]
-      scenario_shade = {s: shade for _, scens, shade in scenario_groups if shade is not None for s in scens}
+      ood_forest_scenarios = [s for _, scens, _ in _FIG6_SCENARIO_GROUPS for s in scens]
+      scenario_shade = {s: shade for _, scens, shade in _FIG6_SCENARIO_GROUPS if shade is not None for s in scens}
       plot_ood_r2_forest(
-          ax_dict['Right'], r2_table, color_map,
+          ax_dict['Right'], r2_table, _FIG6_COLOR_MAP,
           scenarios=ood_forest_scenarios,
           scenario_shade=scenario_shade,
-          baseline_color=baseline_color, display_label=display_label,
+          baseline_color=_FIG6_BASELINE_COLOR, display_label=_FIG6_DISPLAY_LABEL,
           title='(g) Emulator skill summary',
           text_ax=ax_dict['Text'],
-          group_labels=[(name, len(scens)) for name, scens, _ in scenario_groups],
+          group_labels=[(name, len(scens)) for name, scens, _ in _FIG6_SCENARIO_GROUPS],
           legend_valign_group="CMIP5",
       )
   else:
@@ -1753,6 +1821,168 @@ def plot_fig06_individual_effects(
 
   if save:
       plt.savefig(FIGURES_DIR / f'{figname}.pdf')
+
+
+def plot_fig06_presentation(
+    y_true_ind_effects: dict,
+    y_hat_baseline: dict,
+    y_hat_ind_effects: dict,
+    train_scenarios_ind_effects: list[str],
+    save: bool = False,
+    figname: str = 'fig06_ppt',
+    figsize: tuple[float, float] = (40 / 3, 5.6),  # full 16:9 slide width (13.33 in)
+    seed_cache: dict | None = None,
+    aggregation: str = AGGREGATION_DEFAULT,
+    ood_scenarios: dict | None = None,
+    ood_seed_traj: dict | None = None,
+    r2_table: list[dict] | None = None,
+) -> None:
+  """Figure 6 split over two 16:9 slides, each sized for the area below a slide title.
+
+  Slide A: panels (a)-(c) + the DAMIP/GeoMIP rows of (g), saved as four builds
+  (SCM-projected -> + Baseline Em. -> + Opt. All -> all configurations).
+  Slide B: panels (d)-(f) + the remaining rows of (g), as SCM-projected + Baseline Em.
+  + Opt. All, then all configurations.
+  Every series is drawn once and each build only toggles visibility, so nothing moves
+  between builds. Frames go to Figures/presentation/{figname}_{build}.{png,pdf}.
+  """
+  # Series in the order they are revealed; each build shows the first n.
+  reveal = ['SCM-projected', 'Baseline Em.', 'Opt. All'] + [
+      t for t in train_scenarios_ind_effects if t != 'Opt. All' and t not in _FIG6_SKIP_TRAIN]
+  slides = {
+      # name: (panels top to bottom, forest groups, forest row gaps, [(build, n revealed)])
+      "A": (["Left1", "Left2", "Left3"], _FIG6_SCENARIO_GROUPS[:2],
+            {"within_group_gap": 1.0, "between_group_gap": 1.0},  # three equal rows
+            [("A1_scm", 1), ("A2_baseline", 2), ("A3_opt_all", 3), ("A4_all_configs", len(reveal))]),
+      "B": (["Left4", "Left5", "Left6"], _FIG6_SCENARIO_GROUPS[2:], {},
+            [("B_opt_all", 3), ("B_all_configs", len(reveal))]),
+  }
+  xlabels = {"Left3": "Year", "Left5": "Year", "Left6": "Years since piControl branch"}
+  legend_band = 0.4  # inches kept free above the panels for the shared legend
+  panel_gap = 0.15   # inches between stacked panels, on top of any x tick labels
+  iqr_handle = Line2D([0], [0], color="0.5", lw=2.5, alpha=0.55,
+                      solid_capstyle="round", label="Interquartile range")
+
+  has_ood = bool(ood_scenarios and ood_seed_traj)
+  if not has_ood:
+      print("plot_fig06_presentation: no OOD data supplied - slide B panels left blank. "
+            "Pass ood_scenarios/ood_seed_traj from utils_inverse.load_fig6_ood_data.")
+
+  figs = {}
+  y_min, y_max = np.inf, -np.inf
+  for name, (panels, groups, forest_gaps, _) in slides.items():
+      fig, ax_dict = plt.subplot_mosaic(
+          [["YLabel", p, "Right", "Text"] for p in panels],
+          figsize=figsize,
+          constrained_layout=True,
+          gridspec_kw={"width_ratios": [0.35, 4.75, 3, 0.25]},
+      )
+      fig.get_layout_engine().set(w_pad=0.0, h_pad=0.0, wspace=0.0, hspace=0.02,
+                                  rect=(0, 0, 1, 1 - legend_band / figsize[1]))
+      ax_dict["YLabel"].axis("off")
+      ax_dict["Text"].axis("off")
+
+      artists = {}
+      for ax_label in panels:
+          if xlabels.get(ax_label):
+              ax_dict[ax_label].set_xlabel(xlabels[ax_label])
+          else:
+              ax_dict[ax_label].tick_params(axis="x", bottom=False, labelbottom=False)
+          if _FIG6_PANEL_KIND[ax_label] == "ood" and not has_ood:
+              continue
+          panel_artists, (lo, hi) = _fig6_draw_panel(
+              ax_dict[ax_label], ax_label, y_true_ind_effects, y_hat_baseline, y_hat_ind_effects,
+              train_scenarios_ind_effects, seed_cache, aggregation, ood_scenarios, ood_seed_traj)
+          for key, arts in panel_artists.items():
+              artists.setdefault(key, []).extend(arts)
+          y_min, y_max = min(y_min, lo), max(y_max, hi)
+
+      ax_dict["YLabel"].text(0.3, 0.5, r'Temperature anomaly [$^\circ$C]',
+                              transform=ax_dict["YLabel"].transAxes,
+                              rotation=90, ha='center', va='center', fontsize=16)
+
+      if r2_table:
+          forest_artists = plot_ood_r2_forest(
+              ax_dict['Right'], r2_table, _FIG6_COLOR_MAP,
+              scenarios=[s for _, scens, _ in groups for s in scens],
+              scenario_shade={s: shade for _, scens, shade in groups if shade is not None for s in scens},
+              baseline_color=_FIG6_BASELINE_COLOR, display_label=_FIG6_DISPLAY_LABEL,
+              title='(g) Emulator skill summary', title_fontsize=12,
+              text_ax=ax_dict['Text'],
+              group_labels=[(group.replace(" (", "\n("), len(scens)) for group, scens, _ in groups],
+              legend=False,
+              **forest_gaps,
+          )
+          ax_dict['Right'].tick_params(axis="y", labelsize=13)
+          for key, arts in forest_artists.items():
+              artists.setdefault(key, []).extend(arts)
+      else:
+          print("plot_fig06_presentation: no r2_table supplied - right column left blank. "
+                "Pass r2_table from utils_inverse.load_fig6_ood_data.")
+
+      handles, legend_labels = ax_dict[panels[0]].get_legend_handles_labels()
+      figs[name] = (fig, ax_dict, artists, dict(zip(legend_labels, handles)))
+
+  # One y-range across all six panels (as in the paper figure), fixed before any build is drawn.
+  if np.isfinite(y_min) and np.isfinite(y_max):
+      data_range = y_max - y_min
+      shared_ylim = [y_min - 0.04 * data_range, y_max + 0.16 * data_range]
+      for fig, ax_dict, _, _ in figs.values():
+          for ax_label in _FIG6_PANEL_SCENARIO:
+              if ax_label in ax_dict:
+                  ax_dict[ax_label].set_ylim(shared_ylim)
+
+  def _legends(fig, x0, forest, handle_of, keys):
+      y = 1 - legend_band / 2 / figsize[1]
+      style = dict(frameon=False, fontsize=12, handlelength=2.0, columnspacing=1.5)
+      handles = [handle_of[label] for label in (_FIG6_DISPLAY_LABEL.get(k, k) for k in keys)
+                 if label in handle_of]
+      legends = [fig.legend(handles=handles, loc="center left", bbox_to_anchor=(x0, y),
+                            ncol=len(handles), **style)]
+      if len(keys) > 1:
+          # The IQR entry describes the bars in (g), so it sits over the forest's top-right corner.
+          legends.append(fig.legend(handles=[iqr_handle], loc="center right",
+                                    bbox_to_anchor=(forest.get_position().x1, y), **style))
+      return legends
+
+  def _fill_forest_height(fig, axes, forest):
+      # Constrained layout copies the largest inner row gap (an x-axis label) into every
+      # row of the row-spanning forest, so restack the panels by hand: equal heights
+      # spanning the forest, with each gap just fitting the tick labels above it.
+      renderer = fig.canvas.get_renderer()
+      to_fig = fig.transFigure.inverted()
+      gap = panel_gap / figsize[1]
+      below = [ax.get_position().y0 - ax.get_tightbbox(renderer).transformed(to_fig).y0
+               for ax in axes[:-1]]
+      span = forest.get_position()
+      height = (span.height - sum(below) - gap * (len(axes) - 1)) / len(axes)
+      top = span.y1
+      for ax, labels_below in zip(axes, below + [0]):
+          pos = ax.get_position()
+          ax.set_position([pos.x0, top - height, pos.width, height])
+          top -= height + labels_below + gap
+
+  out_dir = FIGURES_DIR / "presentation"
+  for name, (fig, ax_dict, artists, handle_of) in figs.items():
+      panels, _, _, builds = slides[name]
+      # Lay out once with every series visible, then freeze it so builds line up exactly.
+      fig.canvas.draw()
+      fig.set_layout_engine("none")
+      _fill_forest_height(fig, [ax_dict[p] for p in panels], ax_dict["Right"])
+      x0 = ax_dict[panels[0]].get_position().x0
+      legends = []
+      for build, n_revealed in builds:
+          visible = reveal[:n_revealed]
+          for key, arts in artists.items():
+              for artist in arts:
+                  artist.set_visible(key in visible)
+          for legend in legends:
+              legend.remove()
+          legends = _legends(fig, x0, ax_dict["Right"], handle_of, visible)
+          if save:
+              out_dir.mkdir(exist_ok=True)
+              fig.savefig(out_dir / f"{figname}_{build}.png", dpi=300)
+              fig.savefig(out_dir / f"{figname}_{build}.pdf")
 
 # ==================================================================
 # Part 1: FaIR scenario plots (moved from run_fair.py)
